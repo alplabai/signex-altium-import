@@ -8,6 +8,7 @@
 //! Conventions this crate bridges are written up in
 //! `docs/CONVERSION.md`.
 
+pub mod library;
 pub mod pcb;
 pub mod report;
 pub mod sch;

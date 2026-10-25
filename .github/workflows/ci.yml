@@ -24,8 +24,11 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # The vendored signex-library / signex-sketch tests need dev-dependencies
+      # the trimmed manifests drop; the main repo runs them.
+      - run: cargo clippy --workspace --exclude signex-library --exclude signex-sketch --all-targets -- -D warnings
+      - run: cargo clippy -p signex-library -p signex-sketch -- -D warnings
+      - run: cargo test --workspace --exclude signex-library --exclude signex-sketch
 
   license:
     name: licence guard

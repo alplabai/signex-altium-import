@@ -132,6 +132,20 @@ index 0 for the top layer.
 | 73 | drill drawing |
 | 74 | multi-layer |
 
+**`LayerKindMapping`** assigns roles to mechanical layers. It holds a
+length-prefixed UTF-16 version string, a `u32` checksum and a `u32` count,
+then that many `(u32 layer id, u32 kind)` pairs. The samples confirm these
+kinds, by matching them against layer names:
+
+| Kind | Role |
+|---|---|
+| 1 | assembly top |
+| 2 | assembly bottom |
+| 11 | courtyard top |
+| 12 | courtyard bottom |
+| 26 | 3D body top |
+| 27 | 3D body bottom |
+
 **Library footprints.** Each footprint is a storage whose `Data` stream
 starts with `[u32 len][length-prefixed name]` and is followed by
 primitive records of any type.

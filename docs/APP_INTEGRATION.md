@@ -34,6 +34,7 @@ status 0 on success, non-zero on failure.
 }
 ```
 
-`project` is `null` when the input is a single document; Signex then
-opens the first entry of `files`. Fields may be added; existing fields
+`project` is `null` when the input is a single document or library;
+Signex then opens the first entry of `files` (a `.snxsch`, `.snxpcb`,
+`.snxsym` or `.snxfpt`). Fields may be added; existing fields
 keep their meaning.

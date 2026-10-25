@@ -2,8 +2,9 @@ signex-altium-import
 Copyright 2026 alplab and contributors
 
 This product includes software developed by the Signex project
-(crates/signex-types, vendored from https://github.com/alplabai/signex),
-licensed under the Apache License, Version 2.0.
+(crates/signex-types, crates/signex-sketch and crates/signex-library,
+vendored from https://github.com/alplabai/signex), licensed under the
+Apache License, Version 2.0.
 
 The sample design files in tests/samples/ come from the "altium" crate
 (https://github.com/pluots/altium), Copyright Trevor Gross and

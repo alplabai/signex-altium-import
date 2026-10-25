@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use altium_format::pcb::{self as apcb, Layer, PadShape as APadShape, PcbDoc, Vertex};
+use altium_format::pcb::{self as apcb, Layer, LayerKind, PadShape as APadShape, PcbDoc, Vertex};
 use altium_format::sch::Pt;
 use signex_types::pcb::{
     BoardGraphic, BoardText, DrillDef, Footprint, FpGraphic, LayerDef, NetDef, Pad, PadNet,
@@ -360,22 +360,35 @@ impl Frame {
 }
 
 /// Altium layer -> the layer name `.snxpcb` files use.
-struct LayerNames {
+pub(crate) struct LayerNames {
     mech_names: HashMap<u8, String>,
+    kinds: HashMap<u8, LayerKind>,
 }
 
 impl LayerNames {
     fn new(doc: &PcbDoc) -> Self {
+        Self::from_params(&doc.board.params, &doc.layer_kinds)
+    }
+
+    /// From a header carrying `LAYERnNAME` (`Board6`, or a PcbLib's
+    /// `Library/Data`) and the file's layer-kind table.
+    pub(crate) fn from_params(
+        params: &altium_format::Params,
+        kinds: &HashMap<u8, LayerKind>,
+    ) -> Self {
         let mech_names = (1..=16u8)
             .filter_map(|n| {
-                let name = doc.board.params.string(&format!("LAYER{}NAME", n + 56));
+                let name = params.string(&format!("LAYER{}NAME", n + 56));
                 (!name.is_empty()).then_some((n, name))
             })
             .collect();
-        Self { mech_names }
+        Self {
+            mech_names,
+            kinds: kinds.clone(),
+        }
     }
 
-    fn of(&self, l: Layer) -> String {
+    pub(crate) fn of(&self, l: Layer) -> String {
         match l {
             Layer::TOP => "TopCopper".into(),
             Layer::BOTTOM => "BottomCopper".into(),
@@ -403,8 +416,15 @@ impl LayerNames {
         }
     }
 
-    /// A mechanical layer's role lives only in its user-facing name.
+    /// A mechanical layer's role: the kind table first, else its name.
     fn mechanical(&self, n: u8) -> String {
+        match self.kinds.get(&(n + 56)) {
+            Some(LayerKind::CourtyardTop) => return "TopCourtyard".into(),
+            Some(LayerKind::CourtyardBottom) => return "BottomCourtyard".into(),
+            Some(LayerKind::AssemblyTop) => return "TopFab".into(),
+            Some(LayerKind::AssemblyBottom) => return "BottomFab".into(),
+            Some(LayerKind::BodyTop | LayerKind::BodyBottom) | None => {}
+        }
         let name = self
             .mech_names
             .get(&n)
@@ -455,7 +475,7 @@ fn outline(vertices: &[Vertex]) -> Vec<Pt> {
     out
 }
 
-fn is_full(start: f64, end: f64) -> bool {
+pub(crate) fn is_full(start: f64, end: f64) -> bool {
     let s = (end - start).rem_euclid(360.0);
     s < 1e-6 || (s - 360.0).abs() < 1e-6
 }
@@ -479,7 +499,7 @@ fn arc_points(c: Pt, r: f64, start: f64, end: f64) -> (Pt, Pt, Pt) {
     )
 }
 
-fn arc_polyline(c: Pt, r: f64, start: f64, end: f64) -> Vec<Pt> {
+pub(crate) fn arc_polyline(c: Pt, r: f64, start: f64, end: f64) -> Vec<Pt> {
     let s = sweep(start, end);
     let n = (s / ARC_STEP_DEG).ceil().max(1.0) as usize;
     (0..=n)

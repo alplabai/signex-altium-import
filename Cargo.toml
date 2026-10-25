@@ -5,11 +5,13 @@ members = [
     "crates/signex-altium-convert",
     "crates/cli",
     "crates/signex-types",
+    "crates/signex-sketch",
+    "crates/signex-library",
 ]
 
 [workspace.package]
-# signex-types is vendored from the main repo and keeps the main repo's
-# version line; the three importer crates carry their own.
+# The vendored signex-* crates keep the main repo's version line; the
+# three importer crates carry their own.
 version = "0.15.0"
 edition = "2024"
 rust-version = "1.97"
@@ -22,6 +24,9 @@ serde_json = "1"
 toml = "0.8"
 uuid = { version = "1.23.1", features = ["v4", "v7", "serde"] }
 thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+tracing = "0.1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # Compound File Binary (OLE2) container reader. MIT.
@@ -31,6 +36,8 @@ flate2 = "1"
 encoding_rs = "0.8"
 
 signex-types = { path = "crates/signex-types" }
+signex-sketch = { path = "crates/signex-sketch" }
+signex-library = { path = "crates/signex-library" }
 altium-format = { path = "crates/altium-format" }
 signex-altium-convert = { path = "crates/signex-altium-convert" }
 

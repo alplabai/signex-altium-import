@@ -47,6 +47,32 @@ so connectivity survives and the drawing stays exactly as it was.
 (Signex draws its own title block), rounded-rectangle corner radii
 (imported square), and alternate display modes other than the one in use.
 
+## Libraries
+
+A `.SchLib` becomes one `.snxsym` holding every symbol, and a `.PcbLib`
+becomes one `.snxfpt` holding every footprint. Both keep the library's own
+order and names.
+
+- **Symbols** stay Y up, local to their origin:
+  - **Pins:** at their electrical end, facing the body.
+  - **Units:** one per Altium part (part -1 is shared).
+  - **Fields:** designator and comment, with their positions. The other
+    parameters, plus the current footprint model, become schematic
+    parameters.
+  - **Decorations:** the dot and clock IEEE marks map. Other IEEE codes
+    are reported.
+- **Footprints** flip to the footprint editor's Y-down frame, so rotations
+  negate:
+  - **Pads:** each keeps its own rotation. Layers use the editor's
+    new-pad names (`F.Cu` / `F.Mask` / `F.Paste`, `*.Cu` for through-hole).
+  - **Graphics:** overlay goes to silkscreen. Assembly layers go to fab.
+  - **Courtyard:** the courtyard layer becomes the courtyard outline. If it
+    doesn't close, its bounding box is used, and that is reported.
+  - **Layer roles:** the file's `LayerKindMapping` decides each mechanical
+    layer's role first, and the layer's name second.
+- **Not imported:** copper drawn inside a footprint, custom pad shapes
+  (regions), fills, 3D bodies.
+
 ## PCB
 
 | Altium | Signex |

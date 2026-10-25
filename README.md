@@ -4,10 +4,11 @@ One-way converter from Altium Designer files to Signex native files.
 
 | Altium | Signex | Status |
 |---|---|---|
-| `.PrjPcb` | `.snxprj` + one `.snxsch` per sheet + `.snxpcb` | supported |
+| `.PrjPcb` | `.snxprj`, one `.snxsch` per sheet, `.snxpcb`, and a `.snxsym` / `.snxfpt` per listed library | supported |
 | `.SchDoc` | `.snxsch` (symbols embedded) | supported |
 | `.PcbDoc` | `.snxpcb` | supported |
-| `.SchLib` / `.PcbLib` | — | read and listed; library export not yet implemented |
+| `.SchLib` | `.snxsym` (every symbol in one file) | supported |
+| `.PcbLib` | `.snxfpt` (every footprint in one file) | supported |
 
 **Apache-2.0**, like [Signex](https://github.com/alplabai/signex). The reader
 is a clean-room implementation; see [docs/PROVENANCE.md](docs/PROVENANCE.md).
@@ -53,7 +54,9 @@ crates/
                           SchDoc / SchLib / PcbDoc / PcbLib / PrjPcb models
   signex-altium-convert/  mapping onto signex-types, with a loss report
   cli/                    the signex-altium-import binary
-  signex-types/           vendored from alplabai/signex (scripts/sync-signex-types.sh)
+  signex-types/           vendored from alplabai/signex
+  signex-sketch/          (scripts/sync-signex-crates.sh; the last two
+  signex-library/          trimmed to their file formats)
 tests/samples/            Altium sample files (see tests/samples/NOTICE.md)
 docs/                     format notes, conversion rules, app contract
 ```
@@ -71,8 +74,8 @@ for c in &doc.components {
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --exclude signex-library --exclude signex-sketch --all-targets -- -D warnings
+cargo test --workspace --exclude signex-library --exclude signex-sketch
 cargo run -p altium-format --example dump -- file.SchDoc [stream] [sch|pcbbin|pcbtext|hex]
 ```
 

@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 altium-format = { workspace = true }
 signex-types = { workspace = true }
+signex-library = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 

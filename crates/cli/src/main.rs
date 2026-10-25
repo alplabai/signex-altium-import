@@ -27,10 +27,10 @@ use signex_types::project::{ProjectData, SheetEntry};
 #[command(
     name = "signex-altium-import",
     version,
-    about = "Convert Altium Designer files (.PrjPcb / .SchDoc / .PcbDoc) to Signex native files"
+    about = "Convert Altium Designer files (.PrjPcb / .SchDoc / .PcbDoc / .SchLib / .PcbLib) to Signex native files"
 )]
 struct Cli {
-    /// A .PrjPcb, .SchDoc or .PcbDoc file. .SchLib / .PcbLib are listed only.
+    /// A .PrjPcb, .SchDoc, .PcbDoc, .SchLib or .PcbLib file.
     input: PathBuf,
 
     /// Output directory. Defaults to the input file's directory.
@@ -138,30 +138,45 @@ fn run(cli: &Cli) -> Result<Summary> {
         }
         "schlib" => {
             let lib = SchLib::open(&input)?;
-            list(
-                "symbols",
-                lib.components.iter().map(|c| c.lib_reference.as_str()),
-                cli.json,
-            );
-            bail!(
-                "library conversion is not implemented yet; import a design that uses \
-                 these symbols and they come along embedded in its sheets"
-            );
+            let name = format!("{}.snxsym", stem(&input));
+            out.check_free(std::slice::from_ref(&name))?;
+            write_symbols(&lib, &stem(&input), &name, &mut out, &mut summary.report)?;
         }
         "pcblib" => {
             let lib = PcbLib::open(&input)?;
-            list(
-                "footprints",
-                lib.footprints.iter().map(|f| f.name.as_str()),
-                cli.json,
-            );
-            bail!("footprint library conversion is not implemented yet");
+            let name = format!("{}.snxfpt", stem(&input));
+            out.check_free(std::slice::from_ref(&name))?;
+            write_footprints(&lib, &stem(&input), &name, &mut out, &mut summary.report)?;
         }
-        "" => bail!("input has no extension; expected .PrjPcb, .SchDoc or .PcbDoc"),
-        other => bail!("unsupported input .{other}; expected .PrjPcb, .SchDoc or .PcbDoc"),
+        "" => bail!("input has no extension; expected {SUPPORTED}"),
+        other => bail!("unsupported input .{other}; expected {SUPPORTED}"),
     }
     summary.files = out.written;
     Ok(summary)
+}
+
+const SUPPORTED: &str = ".PrjPcb, .SchDoc, .PcbDoc, .SchLib or .PcbLib";
+
+fn write_symbols(
+    lib: &SchLib,
+    display: &str,
+    name: &str,
+    out: &mut Output,
+    report: &mut Report,
+) -> Result<()> {
+    let file = signex_altium_convert::library::symbol_file(lib, display, report);
+    out.write(name, &file.to_toml_string()?)
+}
+
+fn write_footprints(
+    lib: &PcbLib,
+    display: &str,
+    name: &str,
+    out: &mut Output,
+    report: &mut Report,
+) -> Result<()> {
+    let file = signex_altium_convert::library::footprint_file(lib, display, report);
+    out.write(name, &file.to_toml_string()?)
 }
 
 fn port_scope(ports: Ports, has_sheet_symbols: bool) -> PortScope {
@@ -170,16 +185,6 @@ fn port_scope(ports: Ports, has_sheet_symbols: bool) -> PortScope {
         Ports::Global => PortScope::Global,
         Ports::Auto if has_sheet_symbols => PortScope::Hierarchical,
         Ports::Auto => PortScope::Global,
-    }
-}
-
-fn list<'a>(what: &str, names: impl Iterator<Item = &'a str>, json: bool) {
-    if json {
-        return;
-    }
-    println!("{what}:");
-    for n in names {
-        println!("  {n}");
     }
 }
 
@@ -231,8 +236,18 @@ fn convert_project(
         let doc = PcbDoc::open(&p).with_context(|| format!("reading {}", p.display()))?;
         boards.push((p, doc));
     }
-    if sheets.is_empty() && boards.is_empty() {
-        bail!("{} lists no .SchDoc or .PcbDoc documents", input.display());
+    let mut sym_libs = Vec::new();
+    for p in prj.documents_with_ext(project_dir, "SchLib") {
+        let lib = SchLib::open(&p).with_context(|| format!("reading {}", p.display()))?;
+        sym_libs.push((p, lib));
+    }
+    let mut fp_libs = Vec::new();
+    for p in prj.documents_with_ext(project_dir, "PcbLib") {
+        let lib = PcbLib::open(&p).with_context(|| format!("reading {}", p.display()))?;
+        fp_libs.push((p, lib));
+    }
+    if sheets.is_empty() && boards.is_empty() && sym_libs.is_empty() && fp_libs.is_empty() {
+        bail!("{} lists no documents this importer reads", input.display());
     }
 
     // Output names, unique even when two documents share a stem.
@@ -254,8 +269,22 @@ fn convert_project(
         .iter()
         .map(|(p, _)| unique(stem(p), "snxpcb"))
         .collect();
+    let sym_names: Vec<String> = sym_libs
+        .iter()
+        .map(|(p, _)| unique(stem(p), "snxsym"))
+        .collect();
+    let fp_names: Vec<String> = fp_libs
+        .iter()
+        .map(|(p, _)| unique(stem(p), "snxfpt"))
+        .collect();
     let project_name = unique(stem(input), "snxprj");
-    let mut targets: Vec<String> = sheet_names.iter().chain(&board_names).cloned().collect();
+    let mut targets: Vec<String> = sheet_names
+        .iter()
+        .chain(&board_names)
+        .chain(&sym_names)
+        .chain(&fp_names)
+        .cloned()
+        .collect();
     targets.push(project_name.clone());
     out.check_free(&targets)?;
 
@@ -301,6 +330,14 @@ fn convert_project(
     for ((_, doc), name) in boards.iter().zip(&board_names) {
         let board = signex_altium_convert::pcb::convert(doc, report);
         out.write(name, &SnxPcb::new(board).write_string()?)?;
+    }
+
+    // Libraries come along as Signex primitive files beside the design.
+    for ((p, lib), name) in sym_libs.iter().zip(&sym_names) {
+        write_symbols(lib, &stem(p), name, out, report)?;
+    }
+    for ((p, lib), name) in fp_libs.iter().zip(&fp_names) {
+        write_footprints(lib, &stem(p), name, out, report)?;
     }
 
     let data = ProjectData {

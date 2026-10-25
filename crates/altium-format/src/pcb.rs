@@ -274,6 +274,57 @@ pub struct Component {
     pub params: Params,
 }
 
+/// Mechanical-layer roles from `LayerKindMapping`: layer -> kind.
+///
+/// Layout: a length-prefixed UTF-16 version string, a `u32` checksum, a
+/// `u32` count, then `count` pairs of `u32` (layer id, kind).
+pub fn layer_kinds(data: Option<&[u8]>) -> HashMap<u8, LayerKind> {
+    let mut map = HashMap::new();
+    let Some(data) = data else { return map };
+    let mut r = Reader::new(data, "LayerKindMapping");
+    let header = |r: &mut Reader| -> Result<u32> {
+        r.block("version")?;
+        r.skip(4, "checksum")?;
+        r.u32("count")
+    };
+    let Ok(n) = header(&mut r) else { return map };
+    for _ in 0..n.min(256) {
+        let (Ok(layer), Ok(kind)) = (r.u32("layer"), r.u32("kind")) else {
+            break;
+        };
+        if let (Ok(layer), Some(kind)) = (u8::try_from(layer), LayerKind::from_code(kind)) {
+            map.insert(layer, kind);
+        }
+    }
+    map
+}
+
+/// The mechanical-layer roles this importer acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKind {
+    AssemblyTop,
+    AssemblyBottom,
+    CourtyardTop,
+    CourtyardBottom,
+    BodyTop,
+    BodyBottom,
+}
+
+impl LayerKind {
+    /// Codes confirmed against layer names in the samples.
+    fn from_code(code: u32) -> Option<Self> {
+        Some(match code {
+            1 => Self::AssemblyTop,
+            2 => Self::AssemblyBottom,
+            11 => Self::CourtyardTop,
+            12 => Self::CourtyardBottom,
+            26 => Self::BodyTop,
+            27 => Self::BodyBottom,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Board {
     pub origin: Pt,
@@ -330,6 +381,7 @@ pub struct PcbDoc {
     pub components: Vec<Component>,
     pub polygons: Vec<Polygon>,
     pub primitives: Primitives,
+    pub layer_kinds: HashMap<u8, LayerKind>,
 }
 
 impl PcbDoc {
@@ -364,12 +416,14 @@ impl PcbDoc {
             .first()
             .map(board)
             .unwrap_or_default();
+        let layer_kinds = layer_kinds(c.stream_opt("LayerKindMapping/Data")?.as_deref());
         Ok(Self {
             board,
             nets,
             components,
             polygons,
             primitives: prims,
+            layer_kinds,
         })
     }
 
@@ -390,6 +444,9 @@ pub struct Footprint {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PcbLib {
     pub footprints: Vec<Footprint>,
+    /// The library header (`Library/Data`): layer names and stack.
+    pub params: Params,
+    pub layer_kinds: HashMap<u8, LayerKind>,
 }
 
 impl PcbLib {
@@ -400,6 +457,14 @@ impl PcbLib {
 
     pub fn from_container(c: &mut Container) -> Result<Self> {
         let mut lib = PcbLib::default();
+        if let Some(data) = c.stream_opt("Library/Data")? {
+            // Only the leading text record; binary sections follow it.
+            let mut r = Reader::new(&data, "Library/Data");
+            if let Ok(block) = r.block("library header") {
+                lib.params = Params::parse(block);
+            }
+        }
+        lib.layer_kinds = layer_kinds(c.stream_opt("Library/LayerKindMapping/Data")?.as_deref());
         for storage in c.root_storages() {
             if storage == "Library" {
                 continue;
