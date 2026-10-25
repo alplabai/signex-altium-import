@@ -1,0 +1,114 @@
+name: Release
+
+# On a version tag (v0.1.0), build the signex-altium-import CLI for each
+# platform and attach the archives plus SHA256SUMS to a GitHub Release.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    name: Tag matches crate version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - shell: bash
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/cli/Cargo.toml | head -1)
+          if [ "v$crate" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match crates/cli version $crate"
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0 # keep in lockstep with rust-toolchain.toml
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p signex-altium-import
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="signex-altium-import-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
+          mkdir -p "$name"
+          cp "target/${{ matrix.target }}/release/signex-altium-import" LICENSE NOTICE README.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "signex-altium-import-$($env:GITHUB_REF_NAME.TrimStart('v'))-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/signex-altium-import.exe" $name/
+          Copy-Item LICENSE "$name/LICENSE.txt"
+          Copy-Item NOTICE "$name/NOTICE.txt"
+          Copy-Item README.md $name/
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            signex-altium-import-*.tar.gz
+            signex-altium-import-*.zip
+
+  release:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum signex-altium-import-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            One-way converter from Altium Designer files (`.PrjPcb`, `.SchDoc`,
+            `.PcbDoc`) to Signex native files. Apache-2.0, clean-room; see
+            `docs/PROVENANCE.md`.
+
+            Put `signex-altium-import` on your `PATH` (or point
+            `SIGNEX_ALTIUM_IMPORT` at it), then use File › Import › Altium
+            Project… in Signex. Every run lists what was approximated or
+            skipped; review it before fabricating an imported board.

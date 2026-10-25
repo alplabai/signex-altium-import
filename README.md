@@ -37,7 +37,9 @@ before trusting an imported board for fabrication.
 
 ## Install
 
-From source:
+Download the archive for your platform from
+[Releases](https://github.com/alplabai/signex-altium-import/releases) and put
+`signex-altium-import` on your `PATH`. Or build from source:
 
 ```bash
 cargo install --git https://github.com/alplabai/signex-altium-import signex-altium-import
