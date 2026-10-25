@@ -1,0 +1,14 @@
+# LF in the repository and in every checkout, Windows included: the vendored
+# signex-types corpus is byte-for-byte goldens, and a CRLF checkout fails its
+# round-trip tests.
+* text=auto eol=lf
+
+# Altium design files are OLE compound documents: never convert.
+*.SchDoc binary
+*.SchLib binary
+*.PcbDoc binary
+*.PcbLib binary
+*.IntLib binary
+*.png binary
+
+crates/signex-types/tests/corpus/** text eol=lf
