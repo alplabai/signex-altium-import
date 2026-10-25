@@ -9,6 +9,9 @@
 *.PcbDoc binary
 *.PcbLib binary
 *.IntLib binary
+# Altium writes CRLF project files; keep the samples byte-identical to upstream.
+*.PrjPcb -text
+*.prjpcb -text
 *.png binary
 
 crates/signex-types/tests/corpus/** text eol=lf
