@@ -1,0 +1,17 @@
+[package]
+name = "signex-altium-convert"
+description = "Map Altium design data onto Signex native types"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+altium-format = { workspace = true }
+signex-types = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

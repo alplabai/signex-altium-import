@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0 # keep in lockstep with rust-toolchain.toml
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  license:
+    name: licence guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: No AGPL/GPL-derivation markers
+        run: |
+          set -e
+          # docs/PROVENANCE.md names these projects to say they were NOT used.
+          if git grep -niE 'altium_monkey|altium-monkey|altium_cruncher|wavenumber' -- ':!docs/PROVENANCE.md' ':!.github/workflows/ci.yml'; then
+            echo "::error::Reference to an AGPL-3.0 Altium project outside docs/PROVENANCE.md."
+            echo "::error::This repo is a clean-room Apache-2.0 implementation; see docs/PROVENANCE.md."
+            exit 1
+          fi
+      - run: cargo install cargo-deny --locked
+      - run: cargo deny check licenses

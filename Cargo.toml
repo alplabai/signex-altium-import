@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/altium-format",
+    "crates/signex-altium-convert",
+    "crates/cli",
+    "crates/signex-types",
+]
+
+[workspace.package]
+# signex-types is vendored from the main repo and keeps the main repo's
+# version line; the three importer crates carry their own.
+version = "0.15.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+repository = "https://github.com/alplabai/signex-altium-import"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+toml = "0.8"
+uuid = { version = "1.23.1", features = ["v4", "v7", "serde"] }
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# Compound File Binary (OLE2) container reader. MIT.
+cfb = "0.10"
+# Raw-DEFLATE for the embedded-model / packed streams. MIT OR Apache-2.0.
+flate2 = "1"
+encoding_rs = "0.8"
+
+signex-types = { path = "crates/signex-types" }
+altium-format = { path = "crates/altium-format" }
+signex-altium-convert = { path = "crates/signex-altium-convert" }
+
+[workspace.lints.rust]
+unused_must_use = "deny"

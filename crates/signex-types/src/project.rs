@@ -1,0 +1,571 @@
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::path::PathBuf;
+use thiserror::Error;
+use uuid::Uuid;
+
+mod unknown;
+pub use unknown::UnknownJson;
+
+/// Format token written into every saved `.snxprj` (`"format"` key). Files
+/// without it predate the token and are read as version 1.
+pub const SNXPRJ_FORMAT_V1: &str = "snxprj/1";
+
+const FORMAT_KEY: &str = "format";
+
+// ---------------------------------------------------------------------------
+// Document type
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentType {
+    Schematic,
+    Pcb,
+    Library,
+    OutputJob,
+}
+
+// ---------------------------------------------------------------------------
+// Library entry (per-project library mount)
+// ---------------------------------------------------------------------------
+
+/// How a [`LibraryEntry`] resolves on disk. Project-local libraries live
+/// under the project directory and use a relative path; shared / global
+/// libraries live elsewhere on the user's machine and use an absolute
+/// path. Drives the auto-mount path resolution at project-open time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryEntryKind {
+    /// `*.snxlib/` directory inside the project directory. `path` is
+    /// relative to `ProjectData::dir`.
+    ProjectLocal,
+    /// Shared library on the user's machine — `path` is absolute.
+    Shared,
+    /// Global / system library — `path` is absolute.
+    Global,
+}
+
+/// One library reference recorded in `.snxprj`. The project loader
+/// iterates this list at open-time and mounts each library via the
+/// matching adapter (currently `LocalGitAdapter` for all three kinds).
+///
+/// See `docs/internal/docs/v0.9-library-plan.md` for the data-model
+/// rationale.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LibraryEntry {
+    /// On-disk location. Relative to the project dir for
+    /// [`LibraryEntryKind::ProjectLocal`]; absolute for the others.
+    pub path: PathBuf,
+    pub kind: LibraryEntryKind,
+    /// `library_id` from `library.toml`, populated after first open
+    /// so `.snxprj` lookups can follow the library when it moves.
+    /// `None` for entries that have never been opened yet.
+    #[serde(default)]
+    pub library_id: Option<Uuid>,
+    /// Keys written by a newer build that this one does not know; kept so a
+    /// save does not drop them (#788).
+    #[serde(default, flatten, skip_serializing_if = "UnknownJson::is_empty")]
+    pub unknown: UnknownJson,
+}
+
+// ---------------------------------------------------------------------------
+// Document handle
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Document {
+    pub id: Uuid,
+    pub name: String,
+    pub doc_type: DocumentType,
+    pub path: String,
+    #[serde(default)]
+    pub dirty: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Sheet entry (summary row for the project tree)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SheetEntry {
+    pub name: String,
+    pub filename: String,
+    #[serde(default)]
+    pub symbols_count: usize,
+    #[serde(default)]
+    pub wires_count: usize,
+    #[serde(default)]
+    pub labels_count: usize,
+    /// Keys written by a newer build that this one does not know; kept so a
+    /// save does not drop them (#788).
+    #[serde(default, flatten, skip_serializing_if = "UnknownJson::is_empty")]
+    pub unknown: UnknownJson,
+}
+
+// ---------------------------------------------------------------------------
+// Project data
+// ---------------------------------------------------------------------------
+
+/// The in-memory form of a `.snxprj` file, persisted as pretty JSON (the
+/// only native format that is not TOML+TSV; rationale and open questions in
+/// `docs/architecture/snxprj-format.md`).
+///
+/// Forward compatibility runs both ways (#788): `#[serde(default)]` lets an
+/// old file load in a new build, and keys this build does not know (top level,
+/// per sheet, per library) are carried in `unknown` and written back on save.
+/// The `format` token is handled by [`parse_project`] / [`write_project`], not
+/// stored here; a file from a newer format version is refused rather than
+/// opened and silently degraded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectData {
+    pub name: String,
+    pub dir: String,
+    pub schematic_root: Option<String>,
+    pub pcb_file: Option<String>,
+    #[serde(default)]
+    pub sheets: Vec<SheetEntry>,
+    /// Schematic-level variant definitions.
+    #[serde(default)]
+    pub variant_definitions: Vec<String>,
+    /// Currently selected variant if known from project context.
+    #[serde(default)]
+    pub active_variant: Option<String>,
+    /// Component libraries referenced by this project. Project-open
+    /// auto-mounts every entry; the project tree renders each as a
+    /// `Libraries ▸ <name>.snxlib` node. `#[serde(default)]` so old
+    /// `.snxprj` files (and `.standard_pro` files which know nothing
+    /// about Signex libraries) load with an empty list.
+    #[serde(default)]
+    pub libraries: Vec<LibraryEntry>,
+    /// v0.22 — opt-in local Git versioning for this project's design
+    /// files (`.snxsch`, `.snxpcb`, `.snxprj`, `.snxmat`,
+    /// `.snxnet`, `.snxbom`, `.snxout`). Defaults to `false`; users
+    /// flip it via Project Properties → "Enable Version Control",
+    /// which triggers `git init` + an initial commit (and writes the
+    /// project's `.gitattributes`) before subsequent saves auto-
+    /// commit through `LocalGitProjectAdapter::commit_path`.
+    ///
+    /// Backwards-compat: `#[serde(default)]` so pre-v0.22 `.snxprj`
+    /// files load with the field unset = no version control. Same
+    /// pattern as `LibrarySpec.enable_git` for `.snxlib` files.
+    #[serde(default)]
+    pub enable_git: bool,
+    /// Keys written by a newer build that this one does not know; kept so a
+    /// save does not drop them (#788).
+    #[serde(default, flatten, skip_serializing_if = "UnknownJson::is_empty")]
+    pub unknown: UnknownJson,
+}
+
+impl ProjectData {
+    /// Resolve a [`LibraryEntry`]'s `path` to an absolute path. Project-
+    /// local entries are joined against `dir`; shared/global entries
+    /// are returned as-is. Used by both the auto-mount loop and the
+    /// project-tree renderer.
+    pub fn resolve_library_path(&self, entry: &LibraryEntry) -> PathBuf {
+        match entry.kind {
+            LibraryEntryKind::ProjectLocal => PathBuf::from(&self.dir).join(&entry.path),
+            LibraryEntryKind::Shared | LibraryEntryKind::Global => entry.path.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod unknown_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `.snxprj` files written before the `libraries` field landed
+    /// must round-trip cleanly with an empty list. Backwards-compat
+    /// is the load-bearing constraint here — we cannot break
+    /// existing project files.
+    #[test]
+    fn project_data_loads_without_libraries_field() {
+        let json = r#"{
+            "name": "test",
+            "dir": "/tmp/test",
+            "schematic_root": null,
+            "pcb_file": null
+        }"#;
+        let parsed: ProjectData = serde_json::from_str(json).expect("parse");
+        assert_eq!(parsed.name, "test");
+        assert!(parsed.libraries.is_empty());
+    }
+
+    // ── Persistence robustness (issue #104) ──────────────────────────
+
+    /// True if `dir` contains a leftover atomic-write temp sibling
+    /// (`*.tmp`). `atomic_write` picks a unique per-writer name (#416),
+    /// so tests must scan for any match instead of a fixed name.
+    fn has_stray_tmp(dir: &Path) -> bool {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "tmp"))
+    }
+
+    #[test]
+    fn write_project_round_trips_atomically_leaving_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Proj.snxprj");
+        let data: ProjectData = serde_json::from_str(
+            r#"{"name":"Proj","dir":"","schematic_root":"Proj.snxsch","pcb_file":null}"#,
+        )
+        .unwrap();
+        write_project(&path, &data).unwrap();
+        // The atomic writer must not leave its temp file behind.
+        assert!(!has_stray_tmp(dir.path()));
+        let back = parse_project(&path).unwrap();
+        assert_eq!(back.schematic_root.as_deref(), Some("Proj.snxsch"));
+    }
+
+    #[test]
+    fn parse_project_errors_on_corrupt_json_instead_of_degrading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Bad.snxprj");
+        // Starts with '{' (meant to be JSON) but is truncated — must NOT
+        // silently fall back to the directory probe (which would drop
+        // libraries/variants and let the next save overwrite the file).
+        std::fs::write(&path, b"{ \"name\": \"Bad\", \"libraries\": [ ").unwrap();
+        let err = parse_project(&path).unwrap_err();
+        assert!(matches!(err, ProjectError::Corrupt { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_project_probes_directory_for_non_json_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Legacy.snxprj");
+        // Empty (non-JSON) legacy marker → directory-driven probe still
+        // recovers the schematic from disk layout.
+        std::fs::write(&path, b"").unwrap();
+        std::fs::write(dir.path().join("Legacy.snxsch"), b"sch").unwrap();
+        let data = parse_project(&path).unwrap();
+        assert_eq!(data.schematic_root.as_deref(), Some("Legacy.snxsch"));
+    }
+
+    #[test]
+    fn library_entry_round_trips_through_serde() {
+        let entry = LibraryEntry {
+            path: PathBuf::from("MyLib.snxlib"),
+            kind: LibraryEntryKind::ProjectLocal,
+            library_id: Some(Uuid::nil()),
+            unknown: Default::default(),
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let back: LibraryEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(entry, back);
+    }
+
+    #[test]
+    fn library_entry_loads_without_library_id_field() {
+        // Older snapshots may omit `library_id` when the library has
+        // never been mounted. `#[serde(default)]` on the field must
+        // keep that path working.
+        let json = r#"{
+            "path": "lib/Power.snxlib",
+            "kind": "shared"
+        }"#;
+        let parsed: LibraryEntry = serde_json::from_str(json).expect("parse");
+        assert_eq!(parsed.path, PathBuf::from("lib/Power.snxlib"));
+        assert_eq!(parsed.kind, LibraryEntryKind::Shared);
+        assert!(parsed.library_id.is_none());
+    }
+
+    #[test]
+    fn resolve_library_path_joins_project_local() {
+        let project = ProjectData {
+            name: "p".into(),
+            dir: "/projects/foo".into(),
+            schematic_root: None,
+            pcb_file: None,
+            sheets: vec![],
+            variant_definitions: vec![],
+            active_variant: None,
+            libraries: vec![],
+            enable_git: false,
+            unknown: Default::default(),
+        };
+        let local = LibraryEntry {
+            path: PathBuf::from("foo-lib.snxlib"),
+            kind: LibraryEntryKind::ProjectLocal,
+            library_id: None,
+            unknown: Default::default(),
+        };
+        assert_eq!(
+            project.resolve_library_path(&local),
+            PathBuf::from("/projects/foo").join("foo-lib.snxlib")
+        );
+    }
+
+    #[test]
+    fn resolve_library_path_keeps_absolute_for_shared() {
+        let project = ProjectData {
+            name: "p".into(),
+            dir: "/projects/foo".into(),
+            schematic_root: None,
+            pcb_file: None,
+            sheets: vec![],
+            variant_definitions: vec![],
+            active_variant: None,
+            libraries: vec![],
+            enable_git: false,
+            unknown: Default::default(),
+        };
+        let shared = LibraryEntry {
+            path: PathBuf::from("/var/signex/Power.snxlib"),
+            kind: LibraryEntryKind::Shared,
+            library_id: None,
+            unknown: Default::default(),
+        };
+        assert_eq!(
+            project.resolve_library_path(&shared),
+            PathBuf::from("/var/signex/Power.snxlib")
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Project-file parser
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum ProjectError {
+    #[error("project file not found: {0}")]
+    NotFound(String),
+    #[error("io error reading {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "unsupported project file extension: .{0} (Signex Community only opens .snxprj; convert Standard projects with the signex-standard-import companion)"
+    )]
+    UnsupportedExtension(String),
+    #[error(
+        "project file {path} looks like JSON but could not be parsed ({reason}); \
+         it was not opened so a save cannot overwrite recoverable data"
+    )]
+    Corrupt { path: String, reason: String },
+    #[error(
+        "project file {path} uses format \"{found}\", which this Signex ({supported}) cannot read; \
+         it was not opened so a save cannot drop data written by another version. \
+         Update Signex to open it"
+    )]
+    UnsupportedFormat {
+        path: String,
+        found: String,
+        supported: &'static str,
+    },
+}
+
+/// Accept a missing token (pre-#788 file) or [`SNXPRJ_FORMAT_V1`]; refuse
+/// anything else, newer versions and garbage alike.
+fn check_format_token(path: &Path, token: Option<&Value>) -> Result<(), ProjectError> {
+    let unsupported = |found: String| ProjectError::UnsupportedFormat {
+        path: path.display().to_string(),
+        found,
+        supported: SNXPRJ_FORMAT_V1,
+    };
+    match token {
+        None => Ok(()),
+        Some(Value::String(s)) if s == SNXPRJ_FORMAT_V1 => Ok(()),
+        Some(Value::String(s)) => Err(unsupported(s.clone())),
+        Some(other) => Err(unsupported(other.to_string())),
+    }
+}
+
+/// Parse a `.snxprj` project file. Two paths:
+///
+/// 1. **JSON content** — newer projects ship a serialized [`ProjectData`]
+///    inside the file. We deserialize it directly and patch `dir` to
+///    match the file's actual location (so projects keep working when
+///    copied to a different folder).
+/// 2. **Empty / legacy marker** — older `.snxprj` files were empty
+///    markers; the parser inferred everything from the directory
+///    (probe for `<name>.snxsch` / `<name>.snxpcb`). We keep that
+///    fallback so existing projects keep loading.
+///
+/// Standard project files (`.standard_pro`) are not supported in Signex
+/// Community. Users running Standard projects use the optional
+/// `signex-standard-import` GPL-3.0 companion tool to convert their files
+/// first.
+pub fn parse_project(path: &Path) -> Result<ProjectData, ProjectError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if !matches!(ext.as_str(), "snxprj") {
+        return Err(ProjectError::UnsupportedExtension(ext));
+    }
+
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let project_name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Untitled")
+        .to_string();
+
+    // JSON-backed projects: deserialize ProjectData directly. We don't
+    // care if the persisted `dir` is stale (projects move); patch it to
+    // the parent of the path the user actually opened.
+    let bytes = std::fs::read(path).map_err(|source| ProjectError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let trimmed = std::str::from_utf8(&bytes)
+        .map(|s| s.trim_start())
+        .unwrap_or("");
+    if trimmed.starts_with('{') {
+        // The file is meant to be JSON. If it parses, use it. If it does
+        // NOT, return an error instead of falling through to the
+        // directory probe: the probe returns empty libraries / variants /
+        // sheets, and the next save would then persist that loss over the
+        // file that still holds the recoverable data.
+        let corrupt = |err: serde_json::Error| ProjectError::Corrupt {
+            path: path.display().to_string(),
+            reason: err.to_string(),
+        };
+        let mut value = serde_json::from_slice::<Value>(&bytes).map_err(corrupt)?;
+        let token = value.as_object_mut().and_then(|map| map.remove(FORMAT_KEY));
+        check_format_token(path, token.as_ref())?;
+        let mut data = serde_json::from_value::<ProjectData>(value).map_err(corrupt)?;
+        data.dir = dir.to_string_lossy().to_string();
+        // Project name in the file is informational; the on-disk
+        // filename is authoritative so renaming the .snxprj outside
+        // the app doesn't desync the displayed name.
+        data.name = project_name;
+        return Ok(data);
+    }
+
+    // Non-JSON legacy/empty marker — directory-driven probe (the
+    // original pre-JSON behaviour).
+    let snx_sch_name = format!("{}.snxsch", project_name);
+    let schematic_root = if dir.join(&snx_sch_name).exists() {
+        Some(snx_sch_name)
+    } else {
+        None
+    };
+
+    let snx_pcb_name = format!("{}.snxpcb", project_name);
+    let pcb_file = if dir.join(&snx_pcb_name).exists() {
+        Some(snx_pcb_name)
+    } else {
+        None
+    };
+
+    let sheets = match &schematic_root {
+        Some(root_name) => vec![SheetEntry {
+            name: project_name.clone(),
+            filename: root_name.clone(),
+            symbols_count: 0,
+            wires_count: 0,
+            labels_count: 0,
+            unknown: UnknownJson::default(),
+        }],
+        None => Vec::new(),
+    };
+
+    Ok(ProjectData {
+        name: project_name,
+        dir: dir.to_string_lossy().to_string(),
+        schematic_root,
+        pcb_file,
+        sheets,
+        variant_definitions: Vec::new(),
+        active_variant: None,
+        libraries: Vec::new(),
+        enable_git: false,
+        unknown: UnknownJson::default(),
+    })
+}
+
+/// Serialize `data` to `path` as pretty JSON. Companion of
+/// [`parse_project`] for the JSON-backed branch — newly-added sheets,
+/// PCB, and libraries persist through this writer.
+///
+/// Written atomically (temp file + fsync + rename): the `.snxprj` is
+/// the workspace's index of sheets/PCB/libraries/variants, so a crash
+/// mid-write must never truncate it to a partial file — that would
+/// silently drop the project's contents on the next open.
+pub fn write_project(path: &Path, data: &ProjectData) -> Result<(), ProjectError> {
+    let io_err = |err: serde_json::Error| ProjectError::Io {
+        path: path.display().to_string(),
+        source: std::io::Error::other(err.to_string()),
+    };
+    // Add the format token. serde_json's map is sorted (no `preserve_order`),
+    // so keys come out alphabetically; the first save of an older file reorders it once.
+    let mut stamped = serde_json::Map::new();
+    stamped.insert(FORMAT_KEY.into(), Value::String(SNXPRJ_FORMAT_V1.into()));
+    if let Value::Object(fields) = serde_json::to_value(data).map_err(io_err)? {
+        stamped.extend(fields);
+    }
+    let json = serde_json::to_vec_pretty(&Value::Object(stamped)).map_err(io_err)?;
+    crate::atomic_io::atomic_write(path, &json).map_err(|source| ProjectError::Io {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+/// What [`retarget_library_entry`] did to the project file on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryRetarget {
+    /// Every project-local entry for the library was re-pointed and the
+    /// file rewritten atomically.
+    Patched,
+    /// There is no `.snxprj` on disk yet; nothing was written.
+    NoProjectFile,
+    /// The file on disk does not list that library (an unsaved addition,
+    /// or a legacy marker file); nothing was written.
+    NotListed,
+    /// The file on disk lists that library, but as a Shared or Global
+    /// entry rather than a project-local one; nothing was written.
+    ListedAsDifferentKind,
+}
+
+/// Re-point EVERY project-local library entry of the `.snxprj` on disk from
+/// `old_library` (absolute) to a file named `new_file_name` in the same
+/// folder, leaving every other entry as the user last saved it. Duplicate
+/// entries for one library move together in a single atomic write.
+///
+/// A relative entry stays relative. The file is parsed first, so a corrupt
+/// project is reported and never overwritten.
+pub fn retarget_library_entry(
+    project_file: &Path,
+    old_library: &Path,
+    new_file_name: &std::ffi::OsStr,
+) -> Result<LibraryRetarget, ProjectError> {
+    if !project_file.exists() {
+        return Ok(LibraryRetarget::NoProjectFile);
+    }
+    let mut data = parse_project(project_file)?;
+    let mut patched = false;
+    let mut other_kind = false;
+    for i in 0..data.libraries.len() {
+        if data.resolve_library_path(&data.libraries[i]) != old_library {
+            continue;
+        }
+        if data.libraries[i].kind == LibraryEntryKind::ProjectLocal {
+            let entry = &mut data.libraries[i];
+            entry.path = entry.path.with_file_name(new_file_name);
+            patched = true;
+        } else {
+            other_kind = true;
+        }
+    }
+    if !patched {
+        return Ok(if other_kind {
+            LibraryRetarget::ListedAsDifferentKind
+        } else {
+            LibraryRetarget::NotListed
+        });
+    }
+    write_project(project_file, &data)?;
+    Ok(LibraryRetarget::Patched)
+}

@@ -1,0 +1,931 @@
+//! Signex native file formats — `.snxsch` (schematic) and `.snxpcb` (PCB).
+//!
+//! Wire format: TOML envelope + TSV bulk-block pattern (matches
+//! `.snxlib` / `.snxsym` / `.snxfpt` from the v0.9 library refactor).
+//! The first lines of every file are a TOML manifest (`format`, IDs).
+//! For each bulk entity type, a single TOML table emits a `content`
+//! key whose value is a literal multi-line TSV string — the first row
+//! is the column header, subsequent rows are data, columns are
+//! whitespace-separated. Hierarchical or rare-field data (zone
+//! polygons, the stackup, custom properties) lives in regular TOML
+//! sub-tables alongside the TSV blocks.
+//!
+//! `.snxprj` (project) is the one native format that is not TOML+TSV: it
+//! is pretty-printed JSON (`crate::project`). The v0.9 cutover scoped
+//! itself to document formats and left the project file alone; JSON
+//! persistence for it landed afterwards (0222a07c) with no recorded reason
+//! to prefer JSON. It is a small flat pointer record with no bulk rows, so
+//! the TSV blocks would add nothing. It carries a `snxprj/1` format token
+//! and preserves unknown keys (#788). See `docs/architecture/snxprj-format.md`.
+//!
+//! These types are the canonical Signex schema. Standard I/O — when it
+//! returns via the `signex-standard-import` companion repo (GPL-3.0) —
+//! translates to/from these types at the file-format boundary; no
+//! Standard-shaped types live in this Apache codebase.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::pcb::{PcbBoard, Zone};
+use crate::schematic::SchematicSheet;
+
+mod extras;
+mod finite_toml;
+mod pcb_footprints;
+mod pcb_rows;
+mod sch_rows;
+mod tsv;
+mod units;
+mod unknown;
+mod unknown_columns;
+mod version;
+
+#[cfg(test)]
+mod net_colors_tests;
+#[cfg(test)]
+mod non_finite_tests;
+#[cfg(test)]
+mod pcb_footprints_tests;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod unknown_columns_tests;
+#[cfg(test)]
+mod unknown_tests;
+#[cfg(test)]
+mod version_tests;
+
+// Public API re-exports — preserve the `format::…` import paths that
+// signex-app / signex-engine / signex-output rely on.
+pub use pcb_rows::{PcbFootprintRow, PcbPadRow, PcbTrackRow, PcbViaRow};
+pub use sch_rows::{SchComponentRow, SchJunctionRow, SchLabelRow, SchWireRow};
+pub use tsv::{parse_tsv_block, write_tsv_block};
+pub use units::NonFiniteField;
+pub use unknown::{BoardUnknown, SheetUnknown, UnknownFields};
+pub use unknown_columns::{MAX_FOREIGN_COLUMN_NAME_BYTES, MAX_FOREIGN_COLUMNS, UnknownColumns};
+
+// Subtree-internal helpers used by the container types below.
+use extras::{
+    BoardExtras, FootprintExtras, JunctionExtras, PadExtras, PcbExtras, PcbExtrasRaw, SchExtrasRaw,
+    SheetExtras, SymbolExtras,
+};
+use pcb_rows::{footprint_to_row, pad_to_row, row_to_track, row_to_via, track_to_row, via_to_row};
+use sch_rows::{
+    junction_to_row, label_to_row, row_to_junction, row_to_label, row_to_symbol, row_to_wire,
+    symbol_to_row, wire_to_row,
+};
+use tsv::write_tsv_section;
+
+// ---------------------------------------------------------------------------
+// Format version tokens
+// ---------------------------------------------------------------------------
+
+/// Current `.snxsch` format version. The token is `<kind>/<major>[.<minor>]`;
+/// see `version.rs` for the load/save policy. A major bump is a wire-format
+/// break: older Signex versions refuse to open the file.
+pub const SNXSCH_FORMAT_V1: &str = "snxsch/1";
+
+/// Current `.snxpcb` format version. 1.1: pads are keyed to their footprint
+/// by uuid (1.0 keyed by reference designator) and the stackup carries
+/// `layer_types`. Builds that predate the policy refuse 1.1 outright.
+pub const SNXPCB_FORMAT_V1: &str = "snxpcb/1.1";
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum FormatError {
+    #[error("toml serialisation failed: {0}")]
+    TomlSerialize(#[from] toml::ser::Error),
+    #[error("toml deserialisation failed: {0}")]
+    TomlDeserialize(#[from] toml::de::Error),
+    #[error("non-finite number (nan/inf) at `{path}`; fix the value to open this file")]
+    NonFiniteNumber { path: String },
+    #[error(
+        "unsupported format version {found:?}: this build reads {expected:?} \
+         (same major version, any minor)"
+    )]
+    UnsupportedVersion { found: String, expected: String },
+    #[error(
+        "this file was written by a newer Signex ({found}); saving it with this build \
+         ({current}) would lose data -- open it in the newer version"
+    )]
+    NewerMinorReadOnly { found: String, current: String },
+    #[error(
+        "footprints {first:?} and {second:?} share uuid {uuid}; pads are keyed by footprint \
+         uuid, so their pads cannot be told apart"
+    )]
+    DuplicateFootprintUuid {
+        uuid: String,
+        first: String,
+        second: String,
+    },
+    #[error("stackup lists {types} layer_types for {layers} layers")]
+    LayerTypesExceedLayers { layers: usize, types: usize },
+    #[error(
+        "TSV block {block:?}: header has {expected} columns ({columns:?}), data row {row} has {got}"
+    )]
+    TsvCellCountMismatch {
+        block: String,
+        row: usize,
+        got: usize,
+        expected: usize,
+        columns: Vec<String>,
+    },
+    #[error(
+        "TSV block {block:?}: header has {got_count} columns, the first {} of them {got:?}, \
+         and lacks a known column of {expected:?}",
+        got.len()
+    )]
+    TsvHeaderMismatch {
+        block: String,
+        /// The first few header names, each cut to a short prefix, so a
+        /// hostile header cannot flood the Messages panel.
+        got: Vec<String>,
+        /// How many columns the header really has.
+        got_count: usize,
+        expected: Vec<String>,
+    },
+    #[error("TSV block {block:?}: header repeats column {column:?}")]
+    TsvDuplicateColumn {
+        block: String,
+        /// Cut to a short prefix; the name is untrusted.
+        column: String,
+    },
+    #[error(
+        "TSV block {block:?}: {count} foreign columns exceeds the limit of {max}; \
+         the first column over the limit is {first_over:?}...{} \
+         (refusing rather than drop columns)",
+        unknown_columns::objects_clause(objects, *more_objects)
+    )]
+    TsvTooManyForeignColumns {
+        block: String,
+        count: usize,
+        max: usize,
+        /// First characters of the first foreign column past the cap, so
+        /// the user can tell which rows to remove.
+        first_over: String,
+        /// Objects (uuid, plus designator/kind where the row has them)
+        /// carrying a column past the cap, bounded; empty on the read
+        /// side, where no object exists yet.
+        objects: Vec<String>,
+        /// Objects past the bounded list in `objects`.
+        more_objects: usize,
+    },
+    #[error(
+        "TSV block {block:?}: foreign column {column:?} has the name of a known column \
+         (refusing to write a header the loader would reject)"
+    )]
+    TsvForeignColumnShadowsKnown { block: String, column: String },
+    #[error(
+        "TSV block {block:?}: foreign column name {prefix:?}... is {len} bytes, \
+         over the limit of {max} (refusing to load rather than truncate it)"
+    )]
+    TsvForeignColumnNameTooLong {
+        block: String,
+        /// First characters of the name, for identification only.
+        prefix: String,
+        len: usize,
+        max: usize,
+    },
+    #[error("TSV block {block:?}: row {row} field {field:?} parse error: {message}")]
+    TsvFieldParse {
+        block: String,
+        row: usize,
+        field: String,
+        message: String,
+    },
+    #[error(
+        "block {block:?}: row {row} field {field:?} holds a non-finite or out-of-range number; \
+         it cannot be saved"
+    )]
+    NonFiniteField {
+        block: String,
+        row: usize,
+        field: String,
+    },
+    /// A serde-written TOML table (manifest, stackup, zones, extras) holds
+    /// NaN or infinity. `path` starts with the table: `manifest.thickness`.
+    #[error("field {path:?} holds a non-finite number (NaN or infinity); it cannot be saved")]
+    NonFiniteTomlField { path: String },
+    #[error("TSV block {block:?}: TSV body is empty — at minimum a header row is required")]
+    TsvEmpty { block: String },
+}
+
+impl From<crate::numeric::TomlFiniteError> for FormatError {
+    fn from(e: crate::numeric::TomlFiniteError) -> Self {
+        use crate::numeric::TomlFiniteError as E;
+        match e {
+            E::Toml(e) => Self::TomlDeserialize(e),
+            E::NonFinite { path } => Self::NonFiniteNumber { path },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SnxTable trait — manual row schemas (no derive macro for simplicity).
+// ---------------------------------------------------------------------------
+
+/// Name the block and row of a [`NonFiniteField`] refusal.
+fn non_finite_error(block: &str, row: usize, e: NonFiniteField) -> FormatError {
+    FormatError::NonFiniteField {
+        block: block.to_string(),
+        row,
+        field: e.0.to_string(),
+    }
+}
+
+/// Translate every item of `items` to its TSV row, failing on the first
+/// value the wire format cannot hold.
+fn build_rows<T, R>(
+    block: &str,
+    items: &[T],
+    to_row: impl Fn(&T) -> Result<R, NonFiniteField>,
+) -> Result<Vec<R>, FormatError> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| to_row(item).map_err(|e| non_finite_error(block, i, e)))
+        .collect()
+}
+
+/// A row schema for TSV bulk blocks.
+///
+/// Implementors describe the TSV column order, how to render an
+/// in-memory row to its column-cell strings, and how to parse a vector
+/// of cell `&str` slices back into a row.
+pub trait SnxTable: Sized {
+    /// Static column ordering — what gets emitted as the TSV header
+    /// row and what `from_row` expects to receive back.
+    fn columns() -> &'static [&'static str];
+
+    /// Emit one cell per declared column. Length must equal
+    /// [`SnxTable::columns`]. Empty cells use `""`. A non-finite number
+    /// is refused with the field's name (see [`FormatError::NonFiniteField`]).
+    fn to_row(&self) -> Result<Vec<String>, NonFiniteField>;
+
+    /// Parse a row of the known cells, already ordered as [`SnxTable::columns`].
+    /// Implementations report parse failures via [`FormatError::TsvFieldParse`].
+    fn from_row(values: &[&str], block: &str, row: usize) -> Result<Self, FormatError>;
+
+    /// Foreign cells this row carried (see [`UnknownColumns`]).
+    fn unknown_columns(&self) -> &UnknownColumns;
+
+    /// Attach the foreign cells captured by `parse_tsv_block`.
+    fn with_unknown_columns(self, columns: UnknownColumns) -> Self;
+}
+
+// ---------------------------------------------------------------------------
+// .snxsch — schematic file
+// ---------------------------------------------------------------------------
+
+/// On-disk representation of a `.snxsch` file.
+///
+/// Internally constructed from a [`SchematicSheet`] via
+/// [`SnxSchematic::new`] (which decomposes the sheet into bulk TSV
+/// rows + an extras-TOML auxiliary table that captures every field
+/// the row schema doesn't cover) and rebuilt via [`SnxSchematic::parse`]
+/// (which round-trips back to a fully-populated [`SchematicSheet`]).
+///
+/// Callers that just want the in-memory sheet read `self.sheet`.
+#[derive(Debug, Clone)]
+pub struct SnxSchematic {
+    pub format: String,
+    /// The reconstituted in-memory sheet. This is what callers
+    /// consume; the TOML+TSV decomposition only matters at the disk
+    /// boundary.
+    pub sheet: SchematicSheet,
+}
+
+/// `toml::from_str` that also refuses `nan` / `inf` (#924).
+fn parse_finite<T: serde::de::DeserializeOwned>(input: &str) -> Result<T, FormatError> {
+    Ok(crate::numeric::parse_toml_finite(input)?)
+}
+
+impl SnxSchematic {
+    /// Wrap a `SchematicSheet` for serialisation as the current format version.
+    pub fn new(sheet: SchematicSheet) -> Self {
+        Self {
+            format: SNXSCH_FORMAT_V1.to_string(),
+            sheet,
+        }
+    }
+
+    /// True when the file was written by a newer minor version than this
+    /// build knows: it loaded for viewing but `write_string` refuses to
+    /// save it (unknown content would be lost); the caller should warn. See `version.rs`.
+    pub fn is_from_newer_minor(&self) -> bool {
+        version::is_newer_minor(&self.format, SNXSCH_FORMAT_V1)
+    }
+
+    /// Serialise to a TOML+TSV string for writing to disk.
+    pub fn write_string(&self) -> Result<String, FormatError> {
+        version::refuse_save(&self.format, SNXSCH_FORMAT_V1)?;
+        if let Some(src) = &self.sheet.unknown.newer_minor_source {
+            version::refuse_save(src, SNXSCH_FORMAT_V1)?;
+        }
+        let mut out = String::new();
+
+        // Manifest header — emit as a small TOML document.
+        let manifest = SchManifest {
+            format: SNXSCH_FORMAT_V1.to_string(),
+            schematic_id: self.sheet.uuid,
+            version: self.sheet.version,
+            generator: self.sheet.generator.clone(),
+            generator_version: self.sheet.generator_version.clone(),
+            paper_size: self.sheet.paper_size.clone(),
+            root_sheet_page: self.sheet.root_sheet_page.clone(),
+            unknown: self.sheet.unknown.manifest.clone(),
+        };
+        finite_toml::ensure_finite_manifest(&manifest)?;
+        out.push_str(&toml::to_string_pretty(&manifest)?);
+        out.push('\n');
+
+        // Bulk TSV blocks. Each is `[sheets.<entity>]` with a single
+        // `content` key holding a literal multi-line string.
+        let component_rows = build_rows("sheets.components", &self.sheet.symbols, symbol_to_row)?;
+        let wire_rows = build_rows("sheets.wires", &self.sheet.wires, wire_to_row)?;
+        let junction_rows = build_rows("sheets.junctions", &self.sheet.junctions, junction_to_row)?;
+        let label_rows = build_rows("sheets.labels", &self.sheet.labels, label_to_row)?;
+
+        write_tsv_section(&mut out, "sheets.components", &component_rows)?;
+        write_tsv_section(&mut out, "sheets.wires", &wire_rows)?;
+        write_tsv_section(&mut out, "sheets.junctions", &junction_rows)?;
+        write_tsv_section(&mut out, "sheets.labels", &label_rows)?;
+
+        // Extras: auxiliary TOML tables for fields the bulk row
+        // doesn't carry. Wrap the whole extras tree in a single
+        // serializable struct so toml::to_string_pretty emits the
+        // correct nested-table headers (`[extras.symbols.<uuid>]`,
+        // `[extras.symbols.<uuid>.fields]`, `[extras.sheet]`, …).
+        // Hand-rolled per-section serialization breaks here because
+        // the inner HashMaps render as their own `[fields]` sub-
+        // tables which would attach to the wrong parent path.
+        let symbols_extras: BTreeMap<String, SymbolExtras> = self
+            .sheet
+            .symbols
+            .iter()
+            .map(|s| (s.uuid.to_string(), SymbolExtras::from_symbol(s)))
+            .filter(|(_, e)| !e.is_default())
+            .collect();
+
+        let junctions_extras: BTreeMap<String, JunctionExtras> = self
+            .sheet
+            .junctions
+            .iter()
+            .map(|j| (j.uuid.to_string(), JunctionExtras::from_junction(j)))
+            .filter(|(_, e)| !e.is_default())
+            .collect();
+
+        let sheet_extras = SheetExtras::from_sheet(&self.sheet);
+        let sheet_extras_opt = if sheet_extras.is_default() {
+            None
+        } else {
+            Some(sheet_extras)
+        };
+
+        if !symbols_extras.is_empty() || !junctions_extras.is_empty() || sheet_extras_opt.is_some()
+        {
+            #[derive(Serialize)]
+            struct ExtrasWrapper {
+                extras: ExtrasInner,
+            }
+            #[derive(Serialize)]
+            struct ExtrasInner {
+                #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+                symbols: BTreeMap<String, SymbolExtras>,
+                #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+                junctions: BTreeMap<String, JunctionExtras>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                sheet: Option<SheetExtras>,
+            }
+            let wrapper = ExtrasWrapper {
+                extras: ExtrasInner {
+                    symbols: symbols_extras,
+                    junctions: junctions_extras,
+                    sheet: sheet_extras_opt,
+                },
+            };
+            finite_toml::ensure_finite(&wrapper)?;
+            let body = toml::to_string_pretty(&wrapper)?;
+            out.push('\n');
+            out.push_str(&body);
+        }
+
+        Ok(out)
+    }
+
+    /// Parse a TOML+TSV string from disk.
+    pub fn parse(input: &str) -> Result<Self, FormatError> {
+        // Stage 1: deserialise the document into the raw envelope —
+        // manifest header + bulk blocks + extras.
+        let raw: SchRaw = parse_finite(input)?;
+
+        version::check(&raw.format, SNXSCH_FORMAT_V1)?;
+
+        // Stage 2: parse each TSV block into adapter rows.
+        let component_rows = match raw.sheets.components {
+            Some(b) => parse_tsv_block::<SchComponentRow>("sheets.components", &b.content)?,
+            None => Vec::new(),
+        };
+        let wire_rows = match raw.sheets.wires {
+            Some(b) => parse_tsv_block::<SchWireRow>("sheets.wires", &b.content)?,
+            None => Vec::new(),
+        };
+        let junction_rows = match raw.sheets.junctions {
+            Some(b) => parse_tsv_block::<SchJunctionRow>("sheets.junctions", &b.content)?,
+            None => Vec::new(),
+        };
+        let label_rows = match raw.sheets.labels {
+            Some(b) => parse_tsv_block::<SchLabelRow>("sheets.labels", &b.content)?,
+            None => Vec::new(),
+        };
+
+        // Stage 3: rebuild the SchematicSheet from rows + extras.
+        let extras = raw.extras.unwrap_or_default();
+        let sheet_extras = extras.sheet.unwrap_or_default();
+        let symbols = component_rows
+            .into_iter()
+            .map(|row| {
+                let key = row.uuid.to_string();
+                let extra = extras.symbols.get(&key).cloned().unwrap_or_default();
+                row_to_symbol(row, extra)
+            })
+            .collect();
+        let wires = wire_rows.into_iter().map(row_to_wire).collect();
+        let junctions = junction_rows
+            .into_iter()
+            .map(|row| {
+                let key = row.uuid.to_string();
+                let extra = extras.junctions.get(&key).cloned().unwrap_or_default();
+                row_to_junction(row, extra)
+            })
+            .collect();
+        let labels = label_rows.into_iter().map(row_to_label).collect();
+
+        let net_colors = sheet_extras.parsed_net_colors();
+        let sheet = SchematicSheet {
+            uuid: raw.schematic_id,
+            version: raw.version,
+            generator: raw.generator,
+            generator_version: raw.generator_version,
+            paper_size: raw.paper_size,
+            root_sheet_page: raw.root_sheet_page,
+            symbols,
+            wires,
+            junctions,
+            labels,
+            child_sheets: sheet_extras.child_sheets,
+            no_connects: sheet_extras.no_connects,
+            text_notes: sheet_extras.text_notes,
+            buses: sheet_extras.buses,
+            bus_entries: sheet_extras.bus_entries,
+            drawings: sheet_extras.drawings,
+            no_erc_directives: sheet_extras.no_erc_directives,
+            title_block: sheet_extras.title_block.into_iter().collect(),
+            lib_symbols: sheet_extras.lib_symbols.into_iter().collect(),
+            net_colors,
+            unknown: SheetUnknown {
+                manifest: raw.unknown,
+                extras: sheet_extras.unknown,
+                newer_minor_source: version::is_newer_minor(&raw.format, SNXSCH_FORMAT_V1)
+                    .then(|| raw.format.clone()),
+            },
+        };
+
+        Ok(SnxSchematic {
+            format: raw.format,
+            sheet,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SchManifest {
+    format: String,
+    schematic_id: Uuid,
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    generator: String,
+    #[serde(default)]
+    generator_version: String,
+    #[serde(default)]
+    paper_size: String,
+    #[serde(default)]
+    root_sheet_page: String,
+    /// Foreign manifest keys, re-emitted verbatim (see [`UnknownFields`]).
+    #[serde(flatten)]
+    unknown: UnknownFields,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TsvBody {
+    content: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct SchSheetsRaw {
+    #[serde(default)]
+    components: Option<TsvBody>,
+    #[serde(default)]
+    wires: Option<TsvBody>,
+    #[serde(default)]
+    junctions: Option<TsvBody>,
+    #[serde(default)]
+    labels: Option<TsvBody>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SchRaw {
+    format: String,
+    schematic_id: Uuid,
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    generator: String,
+    #[serde(default)]
+    generator_version: String,
+    #[serde(default)]
+    paper_size: String,
+    #[serde(default)]
+    root_sheet_page: String,
+    #[serde(default)]
+    sheets: SchSheetsRaw,
+    #[serde(default)]
+    extras: Option<SchExtrasRaw>,
+    /// Foreign manifest keys; carried onto the sheet so they survive
+    /// the codec wrapper being discarded.
+    #[serde(flatten)]
+    unknown: UnknownFields,
+}
+
+// ---------------------------------------------------------------------------
+// .snxpcb — PCB file
+// ---------------------------------------------------------------------------
+
+/// On-disk representation of a `.snxpcb` file.
+///
+/// Same shape as [`SnxSchematic`]: TOML manifest at the top, bulk
+/// TSV blocks for footprints / pads / tracks / vias, regular TOML
+/// for hierarchical or rare-field data (zone polygons, the stackup,
+/// custom properties).
+#[derive(Debug, Clone)]
+pub struct SnxPcb {
+    pub format: String,
+    pub board: PcbBoard,
+}
+
+impl SnxPcb {
+    /// Wrap a `PcbBoard` for serialisation as the current format version.
+    pub fn new(board: PcbBoard) -> Self {
+        Self {
+            format: SNXPCB_FORMAT_V1.to_string(),
+            board,
+        }
+    }
+
+    /// True when the file was written by a newer minor version than this
+    /// build knows: it loaded for viewing but `write_string` refuses to
+    /// save it (unknown content would be lost); the caller should warn. See `version.rs`.
+    pub fn is_from_newer_minor(&self) -> bool {
+        version::is_newer_minor(&self.format, SNXPCB_FORMAT_V1)
+    }
+
+    /// Serialise to a TOML+TSV string for writing to disk.
+    pub fn write_string(&self) -> Result<String, FormatError> {
+        version::refuse_save(&self.format, SNXPCB_FORMAT_V1)?;
+        if let Some(src) = &self.board.unknown.newer_minor_source {
+            version::refuse_save(src, SNXPCB_FORMAT_V1)?;
+        }
+        pcb_footprints::check_unique_footprint_uuids(&self.board.footprints)?;
+        let mut out = String::new();
+
+        // Manifest header.
+        let manifest = PcbManifest {
+            format: SNXPCB_FORMAT_V1.to_string(),
+            pcb_id: self.board.uuid,
+            version: self.board.version,
+            generator: self.board.generator.clone(),
+            thickness: self.board.thickness,
+            unknown: self.board.unknown.manifest.clone(),
+        };
+        finite_toml::ensure_finite_manifest(&manifest)?;
+        out.push_str(&toml::to_string_pretty(&manifest)?);
+        out.push('\n');
+
+        // Stackup + setup + nets — emitted as one nested wrapper so
+        // toml's serializer produces the correct `[stackup]`/`[nets]`
+        // headers and any inner sub-tables (PcbSetup) attach to the
+        // right parent path.
+        // A section holding only foreign keys is still emitted, with its
+        // known members empty, so those keys are not lost.
+        let keep_stackup = !self.board.layers.is_empty()
+            || self.board.setup.is_some()
+            || !self.board.unknown.stackup.is_empty();
+        let keep_nets = !self.board.nets.is_empty() || !self.board.unknown.nets.is_empty();
+        if keep_stackup || keep_nets {
+            #[derive(Serialize)]
+            struct StackupWrapper<'a> {
+                #[serde(skip_serializing_if = "Option::is_none")]
+                stackup: Option<StackBlock<'a>>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                nets: Option<NetsBlock<'a>>,
+            }
+            #[derive(Serialize)]
+            struct StackBlock<'a> {
+                layers: Vec<String>,
+                #[serde(skip_serializing_if = "Vec::is_empty")]
+                layer_types: Vec<String>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                setup: Option<&'a crate::pcb::PcbSetup>,
+                #[serde(flatten)]
+                unknown: &'a UnknownFields,
+            }
+            #[derive(Serialize)]
+            struct NetsBlock<'a> {
+                entries: &'a [crate::pcb::NetDef],
+                #[serde(flatten)]
+                unknown: &'a UnknownFields,
+            }
+            let stackup = keep_stackup.then(|| StackBlock {
+                layers: self.board.layers.iter().map(|l| l.name.clone()).collect(),
+                // Parallel to `layers`; omitted when every type is empty.
+                layer_types: if self.board.layers.iter().any(|l| !l.layer_type.is_empty()) {
+                    self.board
+                        .layers
+                        .iter()
+                        .map(|l| l.layer_type.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                setup: self.board.setup.as_ref(),
+                unknown: &self.board.unknown.stackup,
+            });
+            let nets = keep_nets.then(|| NetsBlock {
+                entries: &self.board.nets,
+                unknown: &self.board.unknown.nets,
+            });
+            out.push('\n');
+            let wrapper = StackupWrapper { stackup, nets };
+            finite_toml::ensure_finite(&wrapper)?;
+            out.push_str(&toml::to_string_pretty(&wrapper)?);
+        }
+
+        // TSV blocks: footprints, pads, tracks, vias.
+        let footprint_rows = build_rows("footprints", &self.board.footprints, footprint_to_row)?;
+        let mut pad_rows: Vec<PcbPadRow> = Vec::new();
+        for fp in &self.board.footprints {
+            for pad in &fp.pads {
+                let row = pad_to_row(pad, &fp.uuid.to_string())
+                    .map_err(|e| non_finite_error("pads", pad_rows.len(), e))?;
+                pad_rows.push(row);
+            }
+        }
+        let track_rows = build_rows("tracks", &self.board.segments, track_to_row)?;
+        let via_rows = build_rows("vias", &self.board.vias, via_to_row)?;
+
+        write_tsv_section(&mut out, "footprints", &footprint_rows)?;
+        write_tsv_section(&mut out, "pads", &pad_rows)?;
+        write_tsv_section(&mut out, "tracks", &track_rows)?;
+        write_tsv_section(&mut out, "vias", &via_rows)?;
+
+        // Zones — full struct array (each zone serialises naturally
+        // under `[[zones]]` with its own uuid scalar).
+        if !self.board.zones.is_empty() {
+            #[derive(Serialize)]
+            struct ZonesWrapper<'a> {
+                zones: &'a [Zone],
+            }
+            out.push('\n');
+            let wrapper = ZonesWrapper {
+                zones: &self.board.zones,
+            };
+            finite_toml::ensure_finite(&wrapper)?;
+            out.push_str(&toml::to_string_pretty(&wrapper)?);
+        }
+
+        // Footprint extras / pad extras / board extras — wrap in a
+        // single `[extras]` tree so toml's serializer produces the
+        // correct nested-table headers.
+        let extras = PcbExtras::from_board(&self.board);
+        let footprints = extras.footprints;
+        let pads = extras.pads;
+        let board_extras = if extras.outline.is_empty()
+            && extras.graphics.is_empty()
+            && extras.texts.is_empty()
+            && self.board.unknown.extras.is_empty()
+        {
+            None
+        } else {
+            Some(BoardExtras {
+                outline: extras.outline,
+                graphics: extras.graphics,
+                texts: extras.texts,
+                unknown: self.board.unknown.extras.clone(),
+            })
+        };
+        if !footprints.is_empty() || !pads.is_empty() || board_extras.is_some() {
+            #[derive(Serialize)]
+            struct ExtrasWrapper {
+                extras: ExtrasInner,
+            }
+            #[derive(Serialize)]
+            struct ExtrasInner {
+                #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+                footprints: BTreeMap<String, FootprintExtras>,
+                #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+                pads: BTreeMap<String, PadExtras>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                board: Option<BoardExtras>,
+            }
+            out.push('\n');
+            let wrapper = ExtrasWrapper {
+                extras: ExtrasInner {
+                    footprints,
+                    pads,
+                    board: board_extras,
+                },
+            };
+            finite_toml::ensure_finite(&wrapper)?;
+            out.push_str(&toml::to_string_pretty(&wrapper)?);
+        }
+
+        Ok(out)
+    }
+
+    /// Parse a TOML+TSV string from disk.
+    pub fn parse(input: &str) -> Result<Self, FormatError> {
+        let raw: PcbRaw = parse_finite(input)?;
+
+        version::check(&raw.format, SNXPCB_FORMAT_V1)?;
+
+        let footprint_rows = match raw.footprints {
+            Some(b) => parse_tsv_block::<PcbFootprintRow>("footprints", &b.content)?,
+            None => Vec::new(),
+        };
+        let pad_rows = match raw.pads {
+            Some(b) => parse_tsv_block::<PcbPadRow>("pads", &b.content)?,
+            None => Vec::new(),
+        };
+        let track_rows = match raw.tracks {
+            Some(b) => parse_tsv_block::<PcbTrackRow>("tracks", &b.content)?,
+            None => Vec::new(),
+        };
+        let via_rows = match raw.vias {
+            Some(b) => parse_tsv_block::<PcbViaRow>("vias", &b.content)?,
+            None => Vec::new(),
+        };
+
+        // Reconstruct footprints with their pads. Group pads by ref.
+        let extras = raw.extras.unwrap_or_default();
+        let board_extras = extras.board.unwrap_or_default();
+
+        let footprints = pcb_footprints::assemble_footprints(
+            footprint_rows,
+            pad_rows,
+            &extras.footprints,
+            &extras.pads,
+        )?;
+
+        let segments = track_rows.into_iter().map(row_to_track).collect();
+        let vias = via_rows.into_iter().map(row_to_via).collect();
+
+        // Reconstitute zones from `[[zones]]` array.
+        let zones = raw.zones.unwrap_or_default();
+
+        // Stackup → layers list (rebuild LayerDef with synthetic ids).
+        let (layers, setup, stackup_unknown) = match raw.stackup {
+            Some(s) => {
+                if s.layer_types.len() > s.layers.len() {
+                    return Err(FormatError::LayerTypesExceedLayers {
+                        layers: s.layers.len(),
+                        types: s.layer_types.len(),
+                    });
+                }
+                let layers: Vec<crate::pcb::LayerDef> = s
+                    .layers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, name)| crate::pcb::LayerDef {
+                        id: i as u8,
+                        name,
+                        layer_type: s.layer_types.get(i).cloned().unwrap_or_default(),
+                    })
+                    .collect();
+                (layers, s.setup, s.unknown)
+            }
+            None => (Vec::new(), None, UnknownFields::default()),
+        };
+
+        let (nets, nets_unknown) = match raw.nets {
+            Some(n) => (n.entries, n.unknown),
+            None => (Vec::new(), UnknownFields::default()),
+        };
+
+        let board = PcbBoard {
+            uuid: raw.pcb_id,
+            version: raw.version,
+            generator: raw.generator,
+            thickness: raw.thickness,
+            outline: board_extras.outline,
+            layers,
+            setup,
+            nets,
+            footprints,
+            segments,
+            vias,
+            zones,
+            graphics: board_extras.graphics,
+            texts: board_extras.texts,
+            unknown: BoardUnknown {
+                manifest: raw.unknown,
+                stackup: stackup_unknown,
+                nets: nets_unknown,
+                extras: board_extras.unknown,
+                newer_minor_source: version::is_newer_minor(&raw.format, SNXPCB_FORMAT_V1)
+                    .then(|| raw.format.clone()),
+            },
+        };
+
+        Ok(SnxPcb {
+            format: raw.format,
+            board,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PcbManifest {
+    format: String,
+    pcb_id: Uuid,
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    generator: String,
+    #[serde(default)]
+    thickness: f64,
+    /// Foreign manifest keys, re-emitted verbatim (see [`UnknownFields`]).
+    #[serde(flatten)]
+    unknown: UnknownFields,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PcbRaw {
+    format: String,
+    pcb_id: Uuid,
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    generator: String,
+    #[serde(default)]
+    thickness: f64,
+    #[serde(default)]
+    stackup: Option<StackRaw>,
+    #[serde(default)]
+    nets: Option<NetsRaw>,
+    #[serde(default)]
+    footprints: Option<TsvBody>,
+    #[serde(default)]
+    pads: Option<TsvBody>,
+    #[serde(default)]
+    tracks: Option<TsvBody>,
+    #[serde(default)]
+    vias: Option<TsvBody>,
+    #[serde(default)]
+    zones: Option<Vec<Zone>>,
+    #[serde(default)]
+    extras: Option<PcbExtrasRaw>,
+    /// Foreign manifest keys; carried onto the board so they survive
+    /// the codec wrapper being discarded.
+    #[serde(flatten)]
+    unknown: UnknownFields,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct StackRaw {
+    #[serde(default)]
+    layers: Vec<String>,
+    /// Parallel to `layers`; absent in 1.0 files.
+    #[serde(default)]
+    layer_types: Vec<String>,
+    #[serde(default)]
+    setup: Option<crate::pcb::PcbSetup>,
+    /// Foreign keys inside `[stackup]`.
+    #[serde(flatten)]
+    unknown: UnknownFields,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct NetsRaw {
+    #[serde(default)]
+    entries: Vec<crate::pcb::NetDef>,
+    /// Foreign keys inside `[nets]`.
+    #[serde(flatten)]
+    unknown: UnknownFields,
+}

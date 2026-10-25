@@ -1,0 +1,17 @@
+[package]
+name = "altium-format"
+description = "Clean-room reader for Altium Designer binary design files (SchDoc, SchLib, PcbDoc, PcbLib, PrjPcb)"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cfb = { workspace = true }
+thiserror = { workspace = true }
+encoding_rs = { workspace = true }
+flate2 = { workspace = true }
+
+[lints]
+workspace = true
