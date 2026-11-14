@@ -105,7 +105,8 @@ jobs:
           generate_release_notes: true
           body: |
             One-way converter from Altium Designer files (`.PrjPcb`, `.SchDoc`,
-            `.PcbDoc`) to Signex native files. Apache-2.0, clean-room; see
+            `.PcbDoc`) to Signex native files. FSL-1.1-ALv2 (source-available;
+            becomes Apache-2.0 two years after release), clean-room; see
             `docs/PROVENANCE.md`.
 
             Put `signex-altium-import` on your `PATH` (or point
