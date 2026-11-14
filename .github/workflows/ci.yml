@@ -43,7 +43,7 @@ jobs:
           # docs/PROVENANCE.md names these projects to say they were NOT used.
           if git grep -niE 'altium_monkey|altium-monkey|altium_cruncher|wavenumber' -- ':!docs/PROVENANCE.md' ':!.github/workflows/ci.yml'; then
             echo "::error::Reference to an AGPL-3.0 Altium project outside docs/PROVENANCE.md."
-            echo "::error::This repo is a clean-room Apache-2.0 implementation; see docs/PROVENANCE.md."
+            echo "::error::This repo is a clean-room FSL-1.1-ALv2 implementation; see docs/PROVENANCE.md."
             exit 1
           fi
       - run: cargo install cargo-deny --locked

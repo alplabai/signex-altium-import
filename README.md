@@ -10,8 +10,9 @@ One-way converter from Altium Designer files to Signex native files.
 | `.SchLib` | `.snxsym` (every symbol in one file) | supported |
 | `.PcbLib` | `.snxfpt` (every footprint in one file) | supported |
 
-**Apache-2.0**, like [Signex](https://github.com/alplabai/signex). The reader
-is a clean-room implementation; see [docs/PROVENANCE.md](docs/PROVENANCE.md).
+Source-available under **FSL-1.1-ALv2**, like
+[Signex](https://github.com/alplabai/signex); see [License](#license). The
+reader is a clean-room implementation; see [docs/PROVENANCE.md](docs/PROVENANCE.md).
 
 ## Use
 
@@ -81,4 +82,18 @@ cargo run -p altium-format --example dump -- file.SchDoc [stream] [sch|pcbbin|pc
 
 ## License
 
-Apache-2.0. See `LICENSE` and `NOTICE`.
+signex-altium-import is source-available under the
+[Functional Source License 1.1, Apache 2.0 Future License (FSL-1.1-ALv2)](LICENSE):
+
+- **Allowed:** any use, including companies designing and selling their own
+  products with it.
+- **Not allowed:** a Competing Use, which means offering a rival product or
+  service built from this code.
+- **Later:** each release becomes Apache-2.0 two years after it ships.
+
+Releases published before the licence change stay Apache-2.0.
+
+The sample files in `tests/samples/` are third-party files under Apache-2.0;
+see `NOTICE` and `tests/samples/NOTICE.md`.
+
+Copyright 2026 [Alp Lab AB](https://github.com/alplabai)

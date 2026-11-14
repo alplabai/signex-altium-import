@@ -15,7 +15,7 @@ members = [
 version = "0.15.0"
 edition = "2024"
 rust-version = "1.97"
-license = "Apache-2.0"
+license = "FSL-1.1-ALv2"
 repository = "https://github.com/alplabai/signex-altium-import"
 
 [workspace.dependencies]

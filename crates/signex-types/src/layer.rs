@@ -9,7 +9,7 @@
 //! removed as part of the issue #62 Apache-clean remediation.
 //! Concrete `u8` IDs for any future foreign-format I/O are produced
 //! by the `signex-standard-import` companion crate's translation layer
-//! and do not live in this Apache codebase.
+//! and do not live in this codebase.
 
 use serde::{Deserialize, Serialize};
 

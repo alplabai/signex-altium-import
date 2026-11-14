@@ -1,4 +1,4 @@
-# Apache-2.0 repository: the dependency closure must stay permissive.
+# The dependency closure must stay permissive.
 [licenses]
 allow = [
     "Apache-2.0",
@@ -13,3 +13,16 @@ allow = [
     "CC0-1.0",
 ]
 confidence-threshold = 0.9
+
+# This workspace's own crates are FSL-1.1-ALv2 (LICENSE). That licence is
+# allowed for these crates only, never for a dependency: a third-party crate
+# under FSL or any other non-compete licence still fails the allowlist above.
+# A new workspace crate needs its own line here.
+exceptions = [
+    { crate = "altium-format", allow = ["FSL-1.1-ALv2"] },
+    { crate = "signex-altium-convert", allow = ["FSL-1.1-ALv2"] },
+    { crate = "signex-altium-import", allow = ["FSL-1.1-ALv2"] },
+    { crate = "signex-library", allow = ["FSL-1.1-ALv2"] },
+    { crate = "signex-sketch", allow = ["FSL-1.1-ALv2"] },
+    { crate = "signex-types", allow = ["FSL-1.1-ALv2"] },
+]

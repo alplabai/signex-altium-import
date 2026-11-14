@@ -1,6 +1,8 @@
 # Provenance
 
-This repository is Apache-2.0 and must stay compatible with Signex's
+This repository is FSL-1.1-ALv2 (each release becomes Apache-2.0 two years
+after it ships; releases published before the licence change stay
+Apache-2.0). It must stay compatible with Signex's
 licence policy (`CONTRIBUTING.md` § "License compliance for contributions"
 in alplabai/signex). This file records what the reader was built from.
 
