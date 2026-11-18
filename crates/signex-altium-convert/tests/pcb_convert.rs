@@ -49,7 +49,20 @@ fn converted_board_round_trips_and_matches_the_object_list() {
     // Top Layer: 2 tracks, Bottom Layer: 1 track (Net1 everywhere).
     assert_eq!(board.segments.len(), 3);
     assert!(board.segments.iter().all(|s| s.net == 4));
-    assert_eq!(board.zones.len(), 1);
+    // The Net1 pour, plus the sample's keepout area, now written as a keepout zone.
+    assert_eq!(board.zones.len(), 2);
+    assert_eq!(
+        board.zones.iter().filter(|z| z.fill_type == "pour").count(),
+        1
+    );
+    assert_eq!(
+        board
+            .zones
+            .iter()
+            .filter(|z| z.fill_type == "keepout")
+            .count(),
+        1
+    );
 
     // Outline: 60 x 40 mm with its top-left at the origin.
     let xs: Vec<f64> = board.outline.iter().map(|p| p.x).collect();

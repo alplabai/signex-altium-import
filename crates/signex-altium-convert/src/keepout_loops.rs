@@ -39,10 +39,7 @@ pub(crate) fn close_loops(pieces: Vec<KeepoutPiece>) -> (Vec<(Common, Vec<Point>
             taken[first] = true;
             let mut path = group[first].points.clone();
             let mut members = 1;
-            loop {
-                let (Some(&head), Some(&tail)) = (path.first(), path.last()) else {
-                    break;
-                };
+            while let (Some(&head), Some(&tail)) = (path.first(), path.last()) {
                 if path.len() > 2 && same(head, tail) {
                     path.pop();
                     loops.push((group[first].common, path));

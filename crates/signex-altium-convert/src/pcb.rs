@@ -330,7 +330,9 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             .zones
             .push(pour(doc, poly, last_pour, names.of(poly.layer), pts));
     }
-    board.zones.extend(plane_pours(doc, &names, &board.outline, report));
+    board
+        .zones
+        .extend(plane_pours(doc, &names, &board.outline, report));
 
     for r in &p.regions {
         let pts: Vec<Point> = r.outline.iter().map(|p| frame.world(*p)).collect();
@@ -384,8 +386,7 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
 const KEEPOUT_LINE_DROPPED: &str =
     "keepout line or arc that closes no loop not imported: a Signex keepout is an area";
 
-const SPLIT_LINE_DROPPED: &str =
-    "plane split line not imported: the plane is one pour on its net";
+const SPLIT_LINE_DROPPED: &str = "plane split line not imported: the plane is one pour on its net";
 
 /// A footprint text's own turn: Altium's turns are counter-clockwise with
 /// Y up, Signex's run the other way on its Y-down board, and on a
@@ -1122,7 +1123,12 @@ mod tests {
         let mut report = Report::default();
         let board = convert(&doc, &mut report).expect("converts");
         assert_eq!(board.generator, crate::GENERATOR);
-        assert!(board.footprints.iter().any(|f| f.footprint_id == FREE_PAD_FOOTPRINT));
+        assert!(
+            board
+                .footprints
+                .iter()
+                .any(|f| f.footprint_id == FREE_PAD_FOOTPRINT)
+        );
         assert!(board.graphics.iter().any(|g| g.layer == "Unmapped80"));
         assert!(
             board.footprints[0]
@@ -1164,7 +1170,7 @@ mod tests {
         let mut doc = stacked(&[Layer::TOP, plane1, mid1, plane2, Layer::BOTTOM]);
         doc.primitives.tracks.push(apcb::Track {
             common: apcb::Common {
-                layer: plane2,
+                layer: mid1,
                 ..Default::default()
             },
             a: Pt::new(0.0, 0.0),
@@ -1187,7 +1193,7 @@ mod tests {
                 ("BottomCopper", "signal"),
             ]
         );
-        assert_eq!(board.segments[0].layer, "Inner3Copper");
+        assert_eq!(board.segments[0].layer, "Inner2Copper");
     }
 
     #[test]
@@ -1266,7 +1272,11 @@ mod tests {
             .write_string()
             .expect("writes");
         assert!(!text.contains("KeepOut"), "{text}");
-        assert!(report.entries().any(|(m, n)| m == KEEPOUT_LINE_DROPPED && n == 1));
+        assert!(
+            report
+                .entries()
+                .any(|(m, n)| m == KEEPOUT_LINE_DROPPED && n == 1)
+        );
     }
 
     #[test]
@@ -1366,7 +1376,11 @@ mod tests {
         assert_eq!(pour.fill_type, POUR_FILL);
         assert_eq!((pour.net, pour.net_name.as_str()), (2, "GND"));
         assert_eq!(pour.outline.len(), 4);
-        assert!(report.entries().any(|(m, n)| m == SPLIT_LINE_DROPPED && n == 1));
+        assert!(
+            report
+                .entries()
+                .any(|(m, n)| m == SPLIT_LINE_DROPPED && n == 1)
+        );
     }
 
     #[test]
@@ -1455,7 +1469,11 @@ mod tests {
             } else {
                 fp.rotation + own.rotation
             };
-            assert!((deg(drawn) - deg(-75.0)).abs() < 1e-9, "{}: {drawn}", fp.layer);
+            assert!(
+                (deg(drawn) - deg(-75.0)).abs() < 1e-9,
+                "{}: {drawn}",
+                fp.layer
+            );
             assert_eq!(board.texts[0].rotation, deg(-75.0));
         }
     }
