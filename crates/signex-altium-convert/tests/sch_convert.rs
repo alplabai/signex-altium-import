@@ -22,6 +22,10 @@ fn converted_sheet_round_trips_and_keeps_connectivity() {
 
     // Survives the native writer and parser.
     let text = SnxSchematic::new(sheet).write_string().unwrap();
+    // The output names no source tool: neutral generator and lib_id prefix.
+    assert!(text.contains("generator = \"signex-import\""), "{text}");
+    assert!(!text.to_ascii_lowercase().contains("altium:"), "{text}");
+    assert!(!text.contains("signex-altium"), "{text}");
     let sheet = SnxSchematic::parse(&text).unwrap().sheet;
 
     assert_eq!(sheet.paper_size, "A4");

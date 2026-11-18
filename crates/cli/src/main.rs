@@ -311,8 +311,12 @@ fn convert_project(
         .map(|s| base_name(&s.file_name).to_ascii_lowercase())
         .collect();
 
+    // Convert every sheet and board before writing any of them, so a board
+    // that is refused (or a document that will not serialise) leaves no
+    // partial output behind.
     let mut entries = Vec::new();
     let mut root = None;
+    let mut texts: Vec<(&String, String)> = Vec::new();
     for ((path, doc), name) in sheets.iter().zip(&sheet_names) {
         let sheet = signex_altium_convert::sch::convert(doc, &opts, report);
         entries.push(SheetEntry {
@@ -326,14 +330,18 @@ fn convert_project(
         if root.is_none() && !children.contains(&file_name(path).to_ascii_lowercase()) {
             root = Some(name.clone());
         }
-        out.write(name, &SnxSchematic::new(sheet).write_string()?)?;
+        texts.push((name, SnxSchematic::new(sheet).write_string()?));
     }
     if boards.len() > 1 {
         report.warn("project has several PCB documents; the first is the project's board");
     }
-    for ((_, doc), name) in boards.iter().zip(&board_names) {
-        let board = signex_altium_convert::pcb::convert(doc, report)?;
-        out.write(name, &SnxPcb::new(board).write_string()?)?;
+    for ((path, doc), name) in boards.iter().zip(&board_names) {
+        let board = signex_altium_convert::pcb::convert(doc, report)
+            .with_context(|| format!("converting {}", path.display()))?;
+        texts.push((name, SnxPcb::new(board).write_string()?));
+    }
+    for (name, text) in &texts {
+        out.write(name, text)?;
     }
 
     // Libraries come along as Signex primitive files beside the design.

@@ -466,7 +466,7 @@ fn component(
         show_pin_names: true,
         pin_name_offset: 0.0,
     };
-    let base = format!("altium:{}", comp.lib_reference);
+    let base = format!("import:{}", comp.lib_reference);
     let lib_id = libs.intern(&base, lib);
 
     let mut fields = HashMap::new();

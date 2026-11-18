@@ -18,6 +18,7 @@ use signex_types::pcb::{
 use signex_types::property::PcbProperty;
 use uuid::Uuid;
 
+use crate::keepout_loops::{KeepoutPiece, close_loops};
 use crate::report::Report;
 use crate::units::{deg, mm};
 
@@ -118,9 +119,17 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
         }
     }
 
+    let mut keepout_lines: Vec<KeepoutPiece> = Vec::new();
     for t in &p.tracks {
         if is_keepout(&t.common) {
-            report.warn(KEEPOUT_LINE_DROPPED);
+            keepout_lines.push(KeepoutPiece {
+                common: t.common,
+                points: vec![frame.world(t.a), frame.world(t.b)],
+            });
+            continue;
+        }
+        if t.common.layer.plane().is_some() {
+            report.warn(SPLIT_LINE_DROPPED);
             continue;
         }
         let layer = names.of(t.common.layer);
@@ -158,7 +167,17 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
 
     for a in &p.arcs {
         if is_keepout(&a.common) {
-            report.warn(KEEPOUT_LINE_DROPPED);
+            keepout_lines.push(KeepoutPiece {
+                common: a.common,
+                points: arc_polyline(a.center, a.radius, a.start, a.end)
+                    .into_iter()
+                    .map(|p| frame.world(p))
+                    .collect(),
+            });
+            continue;
+        }
+        if a.common.layer.plane().is_some() {
+            report.warn(SPLIT_LINE_DROPPED);
             continue;
         }
         let layer = names.of(a.common.layer);
@@ -235,6 +254,7 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             Some(slot) => {
                 let fp = &mut board.footprints[slot];
                 let pos = fp_local(fp, frame.world(t.position));
+                let rotation = text_own_turn(fp, comp_rotation(slot), t.rotation);
                 fp.graphics.push(FpGraphic {
                     graphic_type: "text".into(),
                     layer: names.of(t.common.layer),
@@ -242,17 +262,19 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
                     text: t.text.clone(),
                     font_size: mm(t.height),
                     position: Some(pos),
-                    rotation: deg(t.rotation - comp_rotation(slot)),
+                    rotation,
                     ..fp_graphic_defaults()
                 });
             }
+            // Altium turns counter-clockwise with Y up; on the Y-down board
+            // the same visual turn is negative, as for footprints.
             None if !t.text.is_empty() => board.texts.push(BoardText {
                 uuid: Uuid::new_v4(),
                 text: t.text.clone(),
                 position: frame.world(t.position),
                 layer: names.of(t.common.layer),
                 font_size: mm(t.height),
-                rotation: deg(t.rotation),
+                rotation: deg(-t.rotation),
             }),
             None => {}
         }
@@ -273,7 +295,7 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
                 .push(zone(doc, f.common.net, names.of(f.common.layer), pts));
         } else {
             board.graphics.push(BoardGraphic {
-                graphic_type: "polygon".into(),
+                graphic_type: "poly".into(),
                 layer: names.of(f.common.layer),
                 width: 0.0,
                 start: None,
@@ -285,6 +307,13 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
         }
     }
 
+    let last_pour = doc
+        .polygons
+        .iter()
+        .filter_map(|poly| poly.params.i64("POURINDEX"))
+        .max()
+        .unwrap_or(0)
+        .max(0);
     for poly in &doc.polygons {
         let pts: Vec<Point> = outline(&poly.vertices)
             .into_iter()
@@ -297,25 +326,31 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
         if !hatch.is_empty() && !hatch.eq_ignore_ascii_case("Solid") {
             report.warn("hatched polygon pour imported as a solid pour");
         }
-        board.zones.push(pour(doc, poly, names.of(poly.layer), pts));
+        board
+            .zones
+            .push(pour(doc, poly, last_pour, names.of(poly.layer), pts));
     }
+    board.zones.extend(plane_pours(doc, &names, &board.outline, report));
 
     for r in &p.regions {
+        let pts: Vec<Point> = r.outline.iter().map(|p| frame.world(*p)).collect();
+        if pts.len() < 3 {
+            continue;
+        }
+        // A keepout region is a rule, also inside a footprint.
+        if is_keepout(&r.common) {
+            board
+                .zones
+                .extend(keepout_zones(&r.common, &pts, &names, &copper, report));
+            continue;
+        }
         // Poured copper belongs to its polygon (imported above), and
         // footprint regions are custom pad shapes: only free regions are
         // design data of their own.
         if r.common.polygon.is_some() || r.common.component.is_some() {
             continue;
         }
-        let pts: Vec<Point> = r.outline.iter().map(|p| frame.world(*p)).collect();
-        if pts.len() < 3 {
-            continue;
-        }
-        if is_keepout(&r.common) {
-            board
-                .zones
-                .extend(keepout_zones(&r.common, &pts, &names, &copper, report));
-        } else if r.common.layer.is_copper() && r.kind == 0 && !r.params.bool("ISBOARDCUTOUT") {
+        if r.common.layer.is_copper() && r.kind == 0 && !r.params.bool("ISBOARDCUTOUT") {
             board
                 .zones
                 .push(zone(doc, r.common.net, names.of(r.common.layer), pts));
@@ -333,12 +368,67 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             report.warn(format!("{what} not imported"));
         }
     }
+    let (loops, open) = close_loops(keepout_lines);
+    for (common, ring) in loops {
+        board
+            .zones
+            .extend(keepout_zones(&common, &ring, &names, &copper, report));
+    }
+    for _ in 0..open {
+        report.warn(KEEPOUT_LINE_DROPPED);
+    }
     names.report_unmapped(report);
     Ok(board)
 }
 
 const KEEPOUT_LINE_DROPPED: &str =
-    "keepout line or arc not imported: a Signex keepout is an area (a keepout zone)";
+    "keepout line or arc that closes no loop not imported: a Signex keepout is an area";
+
+const SPLIT_LINE_DROPPED: &str =
+    "plane split line not imported: the plane is one pour on its net";
+
+/// A footprint text's own turn: Altium's turns are counter-clockwise with
+/// Y up, Signex's run the other way on its Y-down board, and on a
+/// bottom-side footprint (mirrored) the own turn counts the other way again.
+fn text_own_turn(fp: &Footprint, comp_rotation: f64, text_rotation: f64) -> f64 {
+    if fp.layer == "BottomCopper" {
+        deg(text_rotation - comp_rotation)
+    } else {
+        deg(comp_rotation - text_rotation)
+    }
+}
+
+/// Each internal plane as a pour over the board outline on the plane's
+/// net (`PLANEnNETNAME`), so Signex fills it; a plane with no net is
+/// written without one and reported.
+fn plane_pours(
+    doc: &PcbDoc,
+    names: &LayerNames,
+    outline: &[Point],
+    report: &mut Report,
+) -> Vec<Zone> {
+    let mut pours = Vec::new();
+    for (n, token) in &names.planes {
+        if outline.len() < 3 {
+            report.warn("plane not written: the board has no outline to pour it over");
+            continue;
+        }
+        let net_name = doc.board.params.string(&format!("PLANE{n}NETNAME"));
+        let net = doc
+            .nets
+            .iter()
+            .position(|name| *name == net_name)
+            .and_then(|i| u16::try_from(i).ok());
+        if net.is_none() {
+            report.warn("plane with no net written as a pour without a net");
+        }
+        let mut z = zone(doc, net, token.clone(), outline.to_vec());
+        z.fill_type = POUR_FILL.into();
+        z.clearance = 0.0;
+        pours.push(z);
+    }
+    pours
+}
 
 /// Whether an item is a keepout: flagged as one, or on the keep-out layer.
 fn is_keepout(c: &apcb::Common) -> bool {
@@ -453,6 +543,8 @@ pub(crate) struct LayerNames {
     copper: HashMap<u8, String>,
     /// The copper stack top to bottom: token and whether it is a plane.
     pub(crate) stack: Vec<(String, bool)>,
+    /// The internal planes in the stack: plane number and token.
+    pub(crate) planes: Vec<(u8, String)>,
     /// Source layers with no Signex layer that items used, for the report.
     unmapped: RefCell<BTreeSet<u8>>,
 }
@@ -481,6 +573,9 @@ impl LayerNames {
                 i => format!("Inner{i}Copper"),
             };
             names.copper.insert(layer.0, token.clone());
+            if let Some(n) = layer.plane() {
+                names.planes.push((n, token.clone()));
+            }
             names.stack.push((token, layer.plane().is_some()));
         }
         Ok(names)
@@ -508,6 +603,7 @@ impl LayerNames {
             kinds: kinds.clone(),
             copper: HashMap::new(),
             stack: Vec::new(),
+            planes: Vec::new(),
             unmapped: RefCell::new(BTreeSet::new()),
         }
     }
@@ -657,10 +753,21 @@ const POUR_FILL: &str = "pour";
 /// A polygon pour as a Signex pour: its net, its pour order as the
 /// priority, and the board's clearance rule (a 0 clearance defers to it);
 /// Signex refills it rather than taking the poured copper as drawn.
-fn pour(doc: &PcbDoc, poly: &apcb::Polygon, layer: String, outline: Vec<Point>) -> Zone {
+///
+/// Altium pours the lowest `POURINDEX` first, and later pours give way to
+/// it; Signex fills the highest priority first. So the priority counts
+/// down from the board's last pour index: `last_pour - POURINDEX`.
+fn pour(
+    doc: &PcbDoc,
+    poly: &apcb::Polygon,
+    last_pour: i64,
+    layer: String,
+    outline: Vec<Point>,
+) -> Zone {
     let mut z = zone(doc, poly.net, layer, outline);
     z.fill_type = POUR_FILL.into();
-    z.priority = poly.params.i64("POURINDEX").unwrap_or(0).max(0) as u32;
+    let index = poly.params.i64("POURINDEX").unwrap_or(0).max(0);
+    z.priority = u32::try_from((last_pour - index).max(0)).unwrap_or(u32::MAX);
     z.clearance = 0.0;
     z
 }
@@ -1181,6 +1288,17 @@ mod tests {
             ],
             params: altium_format::Params::parse(b"|POURINDEX=3|"),
         });
+        // Poured first in the source, so it wins: the higher priority.
+        doc.polygons.push(apcb::Polygon {
+            layer: Layer::BOTTOM,
+            net: None,
+            vertices: vec![
+                corner(100.0, 100.0),
+                corner(200.0, 100.0),
+                corner(200.0, 200.0),
+            ],
+            params: altium_format::Params::parse(b"|POURINDEX=1|"),
+        });
         doc.primitives.fills.push(apcb::Fill {
             common: apcb::Common {
                 layer: Layer::TOP,
@@ -1192,20 +1310,174 @@ mod tests {
             rotation: 0.0,
         });
         let board = convert(&doc, &mut Report::default()).expect("converts");
-        let pour = board
+        let pours: Vec<&Zone> = board
             .zones
             .iter()
-            .find(|z| z.layer == "BottomCopper")
-            .expect("the pour");
-        assert_eq!(pour.fill_type, POUR_FILL);
-        assert_eq!((pour.net, pour.net_name.as_str()), (1, "GND"));
-        assert_eq!(pour.priority, 3);
-        assert_eq!(pour.clearance, 0.0, "a pour defers to the board clearance");
+            .filter(|z| z.layer == "BottomCopper")
+            .collect();
+        assert_eq!(pours.len(), 2);
+        let (later, first) = (pours[0], pours[1]);
+        assert_eq!(later.fill_type, POUR_FILL);
+        assert_eq!((later.net, later.net_name.as_str()), (1, "GND"));
+        assert_eq!((later.priority, first.priority), (0, 2));
+        assert_eq!(later.clearance, 0.0, "a pour defers to the board clearance");
         let fill = board
             .zones
             .iter()
             .find(|z| z.layer == "TopCopper")
             .expect("the fill");
         assert_eq!(fill.fill_type, "solid");
+    }
+
+    fn square(size: f64) -> Vec<Vertex> {
+        [(0.0, 0.0), (size, 0.0), (size, size), (0.0, size)]
+            .iter()
+            .map(|&(x, y)| Vertex {
+                at: Pt::new(x, y),
+                arc: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_plane_is_a_pour_over_the_board_and_its_split_lines_are_reported() {
+        let plane = Layer(39);
+        let mut doc = stacked(&[Layer::TOP, plane, Layer::BOTTOM]);
+        doc.board.outline = square(1000.0);
+        doc.board.params = altium_format::Params::parse(b"|PLANE1NETNAME=GND|");
+        doc.nets = vec!["VCC".into(), "GND".into()];
+        doc.primitives.tracks.push(apcb::Track {
+            common: apcb::Common {
+                layer: plane,
+                ..Default::default()
+            },
+            a: Pt::new(500.0, 0.0),
+            b: Pt::new(500.0, 1000.0),
+            width: 20.0,
+        });
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report).expect("converts");
+        assert!(board.segments.is_empty(), "a split line is not copper");
+        let pour = board
+            .zones
+            .iter()
+            .find(|z| z.layer == "Inner1Copper")
+            .expect("the plane pour");
+        assert_eq!(pour.fill_type, POUR_FILL);
+        assert_eq!((pour.net, pour.net_name.as_str()), (2, "GND"));
+        assert_eq!(pour.outline.len(), 4);
+        assert!(report.entries().any(|(m, n)| m == SPLIT_LINE_DROPPED && n == 1));
+    }
+
+    #[test]
+    fn a_closed_loop_of_keepout_lines_is_a_keepout_zone() {
+        let mut doc = stacked(&[Layer::TOP, Layer::BOTTOM]);
+        let corners = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)];
+        for i in 0..4 {
+            let (a, b) = (corners[i], corners[(i + 1) % 4]);
+            doc.primitives.tracks.push(apcb::Track {
+                common: apcb::Common {
+                    layer: Layer::TOP,
+                    keepout: true,
+                    ..Default::default()
+                },
+                a: Pt::new(a.0, a.1),
+                b: Pt::new(b.0, b.1),
+                width: 10.0,
+            });
+        }
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report).expect("converts");
+        let keepouts: Vec<&Zone> = board
+            .zones
+            .iter()
+            .filter(|z| z.fill_type == KEEPOUT_FILL)
+            .collect();
+        assert_eq!(keepouts.len(), 1);
+        assert_eq!(keepouts[0].layer, "TopCopper");
+        assert_eq!(keepouts[0].outline.len(), 4);
+        assert!(report.entries().all(|(m, _)| m != KEEPOUT_LINE_DROPPED));
+    }
+
+    #[test]
+    fn a_footprint_keepout_region_is_kept() {
+        let mut doc = one_pad_board(Layer::TOP, 0.0);
+        doc.primitives.regions.push(apcb::Region {
+            common: apcb::Common {
+                layer: Layer::TOP,
+                keepout: true,
+                component: Some(0),
+                ..Default::default()
+            },
+            outline: vec![
+                Pt::new(950.0, 1950.0),
+                Pt::new(1050.0, 1950.0),
+                Pt::new(1050.0, 2050.0),
+            ],
+            ..Default::default()
+        });
+        let board = convert(&doc, &mut Report::default()).expect("converts");
+        assert!(board.zones.iter().any(|z| z.fill_type == KEEPOUT_FILL));
+    }
+
+    #[test]
+    fn texts_turn_the_signex_way_on_both_sides() {
+        for layer in [Layer::TOP, Layer::BOTTOM] {
+            let mut doc = one_pad_board(layer, 30.0);
+            doc.primitives.texts.push(apcb::Text {
+                common: apcb::Common {
+                    layer: Layer::TOP_OVERLAY,
+                    component: Some(0),
+                    ..Default::default()
+                },
+                position: Pt::new(1000.0, 2000.0),
+                rotation: 75.0,
+                text: "note".into(),
+                ..Default::default()
+            });
+            doc.primitives.texts.push(apcb::Text {
+                common: apcb::Common {
+                    layer: Layer::TOP_OVERLAY,
+                    ..Default::default()
+                },
+                position: Pt::new(0.0, 0.0),
+                rotation: 75.0,
+                text: "board".into(),
+                ..Default::default()
+            });
+            let board = convert(&doc, &mut Report::default()).expect("converts");
+            let fp = &board.footprints[0];
+            let own = fp.graphics.iter().find(|g| g.text == "note").expect("text");
+            // Signex draws it at the footprint's turn plus its own on top,
+            // minus its own on the bottom: the source's 75 degrees, negated.
+            let drawn = if fp.layer == "BottomCopper" {
+                fp.rotation - own.rotation
+            } else {
+                fp.rotation + own.rotation
+            };
+            assert!((deg(drawn) - deg(-75.0)).abs() < 1e-9, "{}: {drawn}", fp.layer);
+            assert_eq!(board.texts[0].rotation, deg(-75.0));
+        }
+    }
+
+    /// An asymmetric pad turned a quarter turn against its bottom-side part
+    /// keeps its board position and the direction of its long side.
+    #[test]
+    fn a_turned_asymmetric_pad_on_a_bottom_part_keeps_its_long_side() {
+        let mut doc = one_pad_board(Layer::BOTTOM, 30.0);
+        doc.primitives.pads[0].rotation = 120.0;
+        let board = convert(&doc, &mut Report::default()).expect("converts");
+        let fp = &board.footprints[0];
+        let pad = &fp.pads[0];
+        // 20 x 40 mil turned a quarter turn against the part: written swapped.
+        assert!((pad.size.x - 1.016).abs() < 1e-9 && (pad.size.y - 0.508).abs() < 1e-9);
+        // The long side runs along the pad's x axis, at the bottom part's
+        // turn: Signex 330 degrees, the same line as the source's 210
+        // degrees (Y up) seen Y down, 150 degrees.
+        let long_side = deg(fp.rotation) % 180.0;
+        assert!((long_side - 150.0).abs() < 1e-9, "{long_side}");
+        let world = crate::check::signex_world(fp, pad.position);
+        assert!((world.x - fp.position.x - 2.54).abs() < 1e-6);
+        assert!((world.y - fp.position.y + 1.27).abs() < 1e-6);
     }
 }
