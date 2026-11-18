@@ -46,7 +46,7 @@ pub fn convert(doc: &SchDoc, opts: &SchOptions, report: &mut Report) -> Schemati
     let mut sheet = SchematicSheet {
         uuid: Uuid::new_v4(),
         version: 1,
-        generator: "signex-altium-import".into(),
+        generator: crate::GENERATOR.into(),
         generator_version: env!("CARGO_PKG_VERSION").into(),
         paper_size: paper_name(size).into(),
         ..Default::default()

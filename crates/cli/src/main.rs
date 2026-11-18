@@ -19,6 +19,7 @@ use altium_format::sch::{SchDoc, SchLib};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use signex_altium_convert::Report;
+use signex_altium_convert::check::{EndCheck, track_ends};
 use signex_altium_convert::sch::{PortScope, SchOptions, base_name, snx_sheet_name};
 use signex_types::format::{SnxPcb, SnxSchematic};
 use signex_types::project::{ProjectData, SheetEntry};
@@ -64,6 +65,8 @@ struct Summary {
     project: Option<PathBuf>,
     files: Vec<PathBuf>,
     report: Report,
+    /// The track-end self-check of a single converted board.
+    track_ends: Option<EndCheck>,
 }
 
 fn main() {
@@ -134,6 +137,7 @@ fn run(cli: &Cli) -> Result<Summary> {
             let name = format!("{}.snxpcb", stem(&input));
             out.check_free(std::slice::from_ref(&name))?;
             let board = signex_altium_convert::pcb::convert(&doc, &mut summary.report);
+            summary.track_ends = Some(track_ends(&board));
             out.write(&name, &SnxPcb::new(board).write_string()?)?;
         }
         "schlib" => {
@@ -392,12 +396,20 @@ fn summary_json(s: &Summary, error: Option<&str>) -> String {
         .entries()
         .map(|(m, n)| serde_json::json!({ "message": m, "count": n }))
         .collect();
+    let track_ends = s.track_ends.map(|t| {
+        serde_json::json!({
+            "total": t.ends,
+            "on_own_net_pad": t.on_own_net_pad,
+            "on_other_net_pad": t.on_other_net_pad,
+        })
+    });
     serde_json::json!({
         "ok": error.is_none(),
         "error": error,
         "project": s.project,
         "files": s.files,
         "warnings": warnings,
+        "track_ends": track_ends,
     })
     .to_string()
 }

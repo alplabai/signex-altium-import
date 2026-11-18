@@ -2,9 +2,12 @@
 //!
 //! Frames: Altium boards are mils, Y up, absolute. Signex boards are mm,
 //! Y down; the outline's top-left lands on (0, 0). Footprint pads and
-//! graphics are footprint-local, rotated by the footprint's rotation.
+//! graphics are footprint-local, rotated by the footprint's rotation; on a
+//! bottom-side footprint Signex also mirrors local x, so the local
+//! coordinates written here undo that mirror.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 
 use altium_format::pcb::{self as apcb, Layer, LayerKind, PadShape as APadShape, PcbDoc, Vertex};
 use altium_format::sch::Pt;
@@ -21,13 +24,16 @@ use crate::units::{deg, mm};
 /// Arcs flattened to chords of at most this many degrees.
 const ARC_STEP_DEG: f64 = 10.0;
 
+/// The footprint id of the holder a free pad (one in no component) gets.
+const FREE_PAD_FOOTPRINT: &str = "import:free-pad";
+
 pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
     let frame = Frame::for_doc(doc);
     let names = LayerNames::new(doc);
     let mut board = PcbBoard {
         uuid: Uuid::new_v4(),
         version: 1,
-        generator: "signex-altium-import".into(),
+        generator: crate::GENERATOR.into(),
         thickness: signex_types::pcb::PCB_DEFAULT_THICKNESS_MM,
         outline: outline(&doc.board.outline)
             .into_iter()
@@ -75,6 +81,9 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
     // Footprints first, so owned primitives can find their parent. Slot i
     // of `board.footprints` is Altium component i.
     for (i, c) in doc.components.iter().enumerate() {
+        if !c.unique_id.is_empty() {
+            report.warn("source-tool component unique id dropped");
+        }
         board.footprints.push(footprint(i as u16, c, doc, &frame));
     }
     let owner = |c: Option<u16>| c.map(usize::from).filter(|&i| i < doc.components.len());
@@ -300,6 +309,7 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
             report.warn(format!("{what} not imported"));
         }
     }
+    names.report_unmapped(report);
     board
 }
 
@@ -363,6 +373,8 @@ impl Frame {
 pub(crate) struct LayerNames {
     mech_names: HashMap<u8, String>,
     kinds: HashMap<u8, LayerKind>,
+    /// Source layers with no Signex layer that items used, for the report.
+    unmapped: RefCell<BTreeSet<u8>>,
 }
 
 impl LayerNames {
@@ -385,6 +397,16 @@ impl LayerNames {
         Self {
             mech_names,
             kinds: kinds.clone(),
+            unmapped: RefCell::new(BTreeSet::new()),
+        }
+    }
+
+    /// One report line per source layer that had no Signex layer.
+    pub(crate) fn report_unmapped(&self, report: &mut Report) {
+        for n in self.unmapped.borrow().iter() {
+            report.warn(format!(
+                "source layer {n} has no Signex layer; its items are on Unmapped{n}"
+            ));
         }
     }
 
@@ -400,6 +422,8 @@ impl LayerNames {
             Layer::BOTTOM_PASTE => "BottomPaste".into(),
             Layer::KEEP_OUT => "KeepOut".into(),
             Layer::MULTI_LAYER => "TopCopper".into(),
+            Layer::DRILL_DRAWING => "DrillDrawing".into(),
+            Layer::DRILL_GUIDE => "Notes".into(),
             _ => {
                 if let Some(n) = l.mid() {
                     format!("Inner{n}Copper")
@@ -410,7 +434,8 @@ impl LayerNames {
                 } else if let Some(n) = l.mechanical() {
                     self.mechanical(n)
                 } else {
-                    format!("Altium{}", l.0)
+                    self.unmapped.borrow_mut().insert(l.0);
+                    format!("Unmapped{}", l.0)
                 }
             }
         }
@@ -545,10 +570,17 @@ fn rotate(v: Point, deg: f64) -> Point {
     Point::new(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
-/// World -> footprint-local, inverting `world = origin + R(rotation) * local`.
+/// World -> footprint-local, inverting Signex's placement
+/// `world = origin + R(rotation) * M * local`, where `M` mirrors x on a
+/// bottom-side footprint and is the identity on top.
 fn fp_local(fp: &Footprint, world: Point) -> Point {
     let d = Point::new(world.x - fp.position.x, world.y - fp.position.y);
     let l = rotate(d, -fp.rotation);
+    let l = if fp.layer == "BottomCopper" {
+        Point::new(-l.x, l.y)
+    } else {
+        l
+    };
     Point::new((l.x * 1e6).round() / 1e6, (l.y * 1e6).round() / 1e6)
 }
 
@@ -605,7 +637,6 @@ fn footprint(index: u16, c: &apcb::Component, doc: &PcbDoc, frame: &Frame) -> Fo
     let properties = [
         ("Description", c.description.as_str()),
         ("Source Library", c.source_library.as_str()),
-        ("Altium Unique ID", c.unique_id.as_str()),
     ]
     .into_iter()
     .filter(|(_, v)| !v.is_empty())
@@ -640,7 +671,7 @@ fn free_pad_holder(pad: &apcb::Pad, frame: &Frame) -> Footprint {
         uuid: Uuid::new_v4(),
         reference: String::new(),
         value: String::new(),
-        footprint_id: "altium:free-pad".into(),
+        footprint_id: FREE_PAD_FOOTPRINT.into(),
         position: frame.world(pad.position),
         rotation: 0.0,
         layer: "TopCopper".into(),
@@ -765,5 +796,126 @@ mod tests {
         let pts = arc_polyline(Pt::new(0.0, 0.0), 10.0, 350.0, 10.0);
         assert_eq!(pts.len(), 3);
         assert!((pts[1].x - 10.0).abs() < 1e-9 && pts[1].y.abs() < 1e-9);
+    }
+
+    /// A one-component board: the component on `layer` at (1000, 2000) mil
+    /// turned by `rotation`, with one surface pad at (1100, 2050) mil.
+    fn one_pad_board(layer: Layer, rotation: f64) -> PcbDoc {
+        let component = apcb::Component {
+            layer,
+            position: Pt::new(1000.0, 2000.0),
+            rotation,
+            pattern: "SOT23".into(),
+            unique_id: "ABCDEFGH".into(),
+            ..Default::default()
+        };
+        let mut pad = apcb::Pad {
+            name: "1".into(),
+            position: Pt::new(1100.0, 2050.0),
+            size_top: Pt::new(20.0, 40.0),
+            size_bottom: Pt::new(20.0, 40.0),
+            rotation,
+            ..Default::default()
+        };
+        pad.common.component = Some(0);
+        pad.common.layer = layer;
+        PcbDoc {
+            components: vec![component],
+            primitives: apcb::Primitives {
+                pads: vec![pad],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Placed the way Signex places it, every pad lands 100 mil right of
+    /// and 50 mil above its component (Y down: +2.54 mm, -1.27 mm), on
+    /// either side and at every quarter turn.
+    #[test]
+    fn pads_land_where_the_source_puts_them_on_both_sides() {
+        for layer in [Layer::TOP, Layer::BOTTOM] {
+            for rotation in [0.0, 90.0, 180.0, 270.0] {
+                let board = convert(&one_pad_board(layer, rotation), &mut Report::default());
+                let fp = &board.footprints[0];
+                let world = crate::check::signex_world(fp, fp.pads[0].position);
+                let (dx, dy) = (world.x - fp.position.x, world.y - fp.position.y);
+                assert!(
+                    (dx - 2.54).abs() < 1e-6 && (dy + 1.27).abs() < 1e-6,
+                    "{} at {rotation}: pad off by ({dx}, {dy})",
+                    fp.layer
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_bottom_pad_track_end_counts_on_its_own_pad() {
+        let mut doc = one_pad_board(Layer::BOTTOM, 90.0);
+        doc.nets = vec!["N1".into()];
+        doc.primitives.pads[0].common.net = Some(0);
+        doc.primitives.tracks.push(apcb::Track {
+            common: apcb::Common {
+                layer: Layer::BOTTOM,
+                net: Some(0),
+                ..Default::default()
+            },
+            a: Pt::new(1100.0, 2050.0),
+            b: Pt::new(1300.0, 2050.0),
+            width: 10.0,
+        });
+        let board = convert(&doc, &mut Report::default());
+        let check = crate::check::track_ends(&board);
+        assert_eq!(check.ends, 2);
+        assert_eq!(check.on_own_net_pad, 1);
+        assert_eq!(check.on_other_net_pad, 0);
+    }
+
+    #[test]
+    fn output_names_no_source_tool() {
+        let mut doc = one_pad_board(Layer::TOP, 0.0);
+        // A free pad, and a track on a layer Signex has no name for.
+        let mut free = doc.primitives.pads[0].clone();
+        free.common.component = None;
+        doc.primitives.pads.push(free);
+        doc.primitives.tracks.push(apcb::Track {
+            common: apcb::Common {
+                layer: Layer(80),
+                ..Default::default()
+            },
+            a: Pt::new(0.0, 0.0),
+            b: Pt::new(100.0, 0.0),
+            width: 10.0,
+        });
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report);
+        assert_eq!(board.generator, crate::GENERATOR);
+        assert!(board.footprints.iter().any(|f| f.footprint_id == FREE_PAD_FOOTPRINT));
+        assert!(board.graphics.iter().any(|g| g.layer == "Unmapped80"));
+        assert!(
+            board.footprints[0]
+                .properties
+                .iter()
+                .all(|p| !p.key.to_ascii_lowercase().contains("unique"))
+        );
+        let text = signex_types::format::SnxPcb::new(board)
+            .write_string()
+            .expect("writes");
+        assert!(!text.to_ascii_lowercase().contains("altium"), "{text}");
+        let messages: Vec<&str> = report.entries().map(|(m, _)| m).collect();
+        assert!(
+            messages.contains(&"source layer 80 has no Signex layer; its items are on Unmapped80")
+        );
+        assert!(messages.contains(&"source-tool component unique id dropped"));
+    }
+
+    #[test]
+    fn the_drill_layers_map_to_signex_layers() {
+        let names = LayerNames::from_params(&Default::default(), &HashMap::new());
+        assert_eq!(names.of(Layer::DRILL_DRAWING), "DrillDrawing");
+        assert_eq!(names.of(Layer::DRILL_GUIDE), "Notes");
+        let mut report = Report::default();
+        names.report_unmapped(&mut report);
+        assert!(report.is_empty());
     }
 }

@@ -9,8 +9,14 @@ fn sample(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
-/// The renderer's pad placement: origin + R(rotation) * local.
+/// The renderer's pad placement: origin + R(rotation) * M * local, where
+/// M mirrors x on a bottom-side footprint.
 fn pad_world(fp: &signex_types::pcb::Footprint, local: Point) -> Point {
+    let local = if fp.layer == "BottomCopper" {
+        Point::new(-local.x, local.y)
+    } else {
+        local
+    };
     let (s, c) = fp.rotation.to_radians().sin_cos();
     Point::new(
         fp.position.x + local.x * c - local.y * s,

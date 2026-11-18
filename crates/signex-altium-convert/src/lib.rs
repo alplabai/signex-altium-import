@@ -8,6 +8,7 @@
 //! Conventions this crate bridges are written up in
 //! `docs/CONVERSION.md`.
 
+pub mod check;
 pub mod library;
 pub mod pcb;
 pub mod report;
@@ -15,3 +16,7 @@ pub mod sch;
 mod units;
 
 pub use report::Report;
+
+/// The `generator` written into converted documents: a neutral id that
+/// names no source tool.
+pub const GENERATOR: &str = "signex-import";
