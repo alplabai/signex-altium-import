@@ -136,7 +136,7 @@ fn run(cli: &Cli) -> Result<Summary> {
             let doc = PcbDoc::open(&input)?;
             let name = format!("{}.snxpcb", stem(&input));
             out.check_free(std::slice::from_ref(&name))?;
-            let board = signex_altium_convert::pcb::convert(&doc, &mut summary.report);
+            let board = signex_altium_convert::pcb::convert(&doc, &mut summary.report)?;
             summary.track_ends = Some(track_ends(&board));
             out.write(&name, &SnxPcb::new(board).write_string()?)?;
         }
@@ -332,7 +332,7 @@ fn convert_project(
         report.warn("project has several PCB documents; the first is the project's board");
     }
     for ((_, doc), name) in boards.iter().zip(&board_names) {
-        let board = signex_altium_convert::pcb::convert(doc, report);
+        let board = signex_altium_convert::pcb::convert(doc, report)?;
         out.write(name, &SnxPcb::new(board).write_string()?)?;
     }
 

@@ -27,9 +27,20 @@ const ARC_STEP_DEG: f64 = 10.0;
 /// The footprint id of the holder a free pad (one in no component) gets.
 const FREE_PAD_FOOTPRINT: &str = "import:free-pad";
 
-pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
+/// The most copper layers a Signex board holds: top, bottom and 30 inner.
+pub const MAX_COPPER_LAYERS: usize = 32;
+
+/// Why a board cannot be converted.
+#[derive(Debug, thiserror::Error)]
+pub enum ConvertError {
+    #[error("the board has {count} copper layers; Signex boards hold at most {max}")]
+    TooManyCopperLayers { count: usize, max: usize },
+}
+
+pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertError> {
     let frame = Frame::for_doc(doc);
-    let names = LayerNames::new(doc);
+    let names = LayerNames::for_doc(doc)?;
+    let copper = names.copper_tokens();
     let mut board = PcbBoard {
         uuid: Uuid::new_v4(),
         version: 1,
@@ -39,15 +50,14 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
             .into_iter()
             .map(|p| frame.world(p))
             .collect(),
-        layers: doc
-            .board
-            .copper_stack
+        layers: names
+            .stack
             .iter()
             .enumerate()
-            .map(|(i, (l, _))| LayerDef {
+            .map(|(i, (token, plane))| LayerDef {
                 id: i as u8,
-                name: names.of(*l),
-                layer_type: "signal".into(),
+                name: token.clone(),
+                layer_type: if *plane { "plane" } else { "signal" }.into(),
             })
             .collect(),
         setup: Some(PcbSetup {
@@ -109,8 +119,12 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
     }
 
     for t in &p.tracks {
+        if is_keepout(&t.common) {
+            report.warn(KEEPOUT_LINE_DROPPED);
+            continue;
+        }
         let layer = names.of(t.common.layer);
-        if t.common.layer.is_copper() && !t.common.keepout {
+        if t.common.layer.is_copper() {
             board
                 .segments
                 .push(segment(&frame, t.a, t.b, t.width, layer, t.common.net));
@@ -131,7 +145,7 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
         } else {
             board.graphics.push(BoardGraphic {
                 graphic_type: "line".into(),
-                layer: keepout_layer(&t.common, layer),
+                layer,
                 width: mm(t.width),
                 start: Some(frame.world(t.a)),
                 end: Some(frame.world(t.b)),
@@ -143,8 +157,12 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
     }
 
     for a in &p.arcs {
+        if is_keepout(&a.common) {
+            report.warn(KEEPOUT_LINE_DROPPED);
+            continue;
+        }
         let layer = names.of(a.common.layer);
-        if a.common.layer.is_copper() && !a.common.keepout {
+        if a.common.layer.is_copper() {
             report.warn("copper arc imported as straight track segments");
             let pts = arc_polyline(a.center, a.radius, a.start, a.end);
             for w in pts.windows(2) {
@@ -180,7 +198,7 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
         } else {
             board.graphics.push(BoardGraphic {
                 graphic_type: kind.into(),
-                layer: keepout_layer(&a.common, layer),
+                layer,
                 width: mm(a.width),
                 start: Some(frame.world(s)),
                 end: (!full).then(|| frame.world(e)),
@@ -245,14 +263,18 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
             .into_iter()
             .map(|p| frame.world(p))
             .collect();
-        if f.common.layer.is_copper() && !f.common.keepout {
+        if is_keepout(&f.common) {
+            board
+                .zones
+                .extend(keepout_zones(&f.common, &pts, &names, &copper, report));
+        } else if f.common.layer.is_copper() {
             board
                 .zones
                 .push(zone(doc, f.common.net, names.of(f.common.layer), pts));
         } else {
             board.graphics.push(BoardGraphic {
                 graphic_type: "polygon".into(),
-                layer: keepout_layer(&f.common, names.of(f.common.layer)),
+                layer: names.of(f.common.layer),
                 width: 0.0,
                 start: None,
                 end: None,
@@ -291,7 +313,11 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
         if pts.len() < 3 {
             continue;
         }
-        if r.common.layer.is_copper() && r.kind == 0 && !r.params.bool("ISBOARDCUTOUT") {
+        if is_keepout(&r.common) {
+            board
+                .zones
+                .extend(keepout_zones(&r.common, &pts, &names, &copper, report));
+        } else if r.common.layer.is_copper() && r.kind == 0 && !r.params.bool("ISBOARDCUTOUT") {
             board
                 .zones
                 .push(zone(doc, r.common.net, names.of(r.common.layer), pts));
@@ -310,8 +336,59 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
         }
     }
     names.report_unmapped(report);
-    board
+    Ok(board)
 }
+
+const KEEPOUT_LINE_DROPPED: &str =
+    "keepout line or arc not imported: a Signex keepout is an area (a keepout zone)";
+
+/// Whether an item is a keepout: flagged as one, or on the keep-out layer.
+fn is_keepout(c: &apcb::Common) -> bool {
+    c.keepout || c.layer == Layer::KEEP_OUT
+}
+
+/// A keepout area as Signex keepout zones (`fill_type = "keepout"`), one
+/// per copper layer it keeps clear: every copper layer for the keep-out
+/// layer, the item's own layer for a keepout on copper. A keepout on any
+/// other layer keeps no copper clear and is reported.
+fn keepout_zones(
+    c: &apcb::Common,
+    outline: &[Point],
+    names: &LayerNames,
+    copper: &[String],
+    report: &mut Report,
+) -> Vec<Zone> {
+    let layers = if c.layer == Layer::KEEP_OUT {
+        copper.to_vec()
+    } else if c.layer.is_copper() {
+        vec![names.of(c.layer)]
+    } else {
+        report.warn("keepout on a non-copper layer not imported");
+        return Vec::new();
+    };
+    layers
+        .into_iter()
+        .map(|layer| Zone {
+            uuid: Uuid::new_v4(),
+            net: 0,
+            net_name: String::new(),
+            layer,
+            outline: outline.to_vec(),
+            holes: Vec::new(),
+            priority: 0,
+            fill_type: KEEPOUT_FILL.into(),
+            thermal_relief: false,
+            thermal_gap: 0.0,
+            thermal_width: 0.0,
+            clearance: 0.0,
+            min_thickness: 0.0,
+            unknown: Default::default(),
+        })
+        .collect()
+}
+
+/// The `fill_type` Signex reads as a keepout zone.
+const KEEPOUT_FILL: &str = "keepout";
 
 /// Signex numbers nets from 1; 0 is "no net".
 fn net_number(n: Option<u16>) -> u32 {
@@ -373,13 +450,47 @@ impl Frame {
 pub(crate) struct LayerNames {
     mech_names: HashMap<u8, String>,
     kinds: HashMap<u8, LayerKind>,
+    /// A board's copper layers by Altium id: top, the inner layers in stack
+    /// order (mid and plane layers alike) and bottom. Empty for a library.
+    copper: HashMap<u8, String>,
+    /// The copper stack top to bottom: token and whether it is a plane.
+    pub(crate) stack: Vec<(String, bool)>,
     /// Source layers with no Signex layer that items used, for the report.
     unmapped: RefCell<BTreeSet<u8>>,
 }
 
 impl LayerNames {
-    fn new(doc: &PcbDoc) -> Self {
-        Self::from_params(&doc.board.params, &doc.layer_kinds)
+    /// A board's names: its copper stack numbered top to bottom as Signex
+    /// numbers it (`TopCopper`, `Inner1Copper`, .., `BottomCopper`), planes
+    /// in their stack place. A stack Signex cannot hold is refused.
+    fn for_doc(doc: &PcbDoc) -> Result<Self, ConvertError> {
+        let mut names = Self::from_params(&doc.board.params, &doc.layer_kinds);
+        let mut stack: Vec<Layer> = doc.board.copper_stack.iter().map(|(l, _)| *l).collect();
+        if stack.is_empty() {
+            stack = vec![Layer::TOP, Layer::BOTTOM];
+        }
+        if stack.len() > MAX_COPPER_LAYERS {
+            return Err(ConvertError::TooManyCopperLayers {
+                count: stack.len(),
+                max: MAX_COPPER_LAYERS,
+            });
+        }
+        let last = stack.len() - 1;
+        for (i, layer) in stack.iter().enumerate() {
+            let token = match i {
+                0 => "TopCopper".to_string(),
+                i if i == last => "BottomCopper".to_string(),
+                i => format!("Inner{i}Copper"),
+            };
+            names.copper.insert(layer.0, token.clone());
+            names.stack.push((token, layer.plane().is_some()));
+        }
+        Ok(names)
+    }
+
+    /// The board's copper tokens, top to bottom.
+    pub(crate) fn copper_tokens(&self) -> Vec<String> {
+        self.stack.iter().map(|(token, _)| token.clone()).collect()
     }
 
     /// From a header carrying `LAYERnNAME` (`Board6`, or a PcbLib's
@@ -397,6 +508,8 @@ impl LayerNames {
         Self {
             mech_names,
             kinds: kinds.clone(),
+            copper: HashMap::new(),
+            stack: Vec::new(),
             unmapped: RefCell::new(BTreeSet::new()),
         }
     }
@@ -410,7 +523,13 @@ impl LayerNames {
         }
     }
 
+    /// The token for `l`. Keepout items do not come here: they become
+    /// keepout zones (`keepout_zones`), so the keep-out layer itself, like
+    /// any layer Signex has no name for, is reported as unmapped.
     pub(crate) fn of(&self, l: Layer) -> String {
+        if let Some(token) = self.copper.get(&l.0) {
+            return token.clone();
+        }
         match l {
             Layer::TOP => "TopCopper".into(),
             Layer::BOTTOM => "BottomCopper".into(),
@@ -420,17 +539,13 @@ impl LayerNames {
             Layer::BOTTOM_SOLDER => "BottomSolderMask".into(),
             Layer::TOP_PASTE => "TopPaste".into(),
             Layer::BOTTOM_PASTE => "BottomPaste".into(),
-            Layer::KEEP_OUT => "KeepOut".into(),
             Layer::MULTI_LAYER => "TopCopper".into(),
             Layer::DRILL_DRAWING => "DrillDrawing".into(),
             Layer::DRILL_GUIDE => "Notes".into(),
             _ => {
                 if let Some(n) = l.mid() {
+                    // A library, or a mid layer the board stack leaves out.
                     format!("Inner{n}Copper")
-                } else if let Some(n) = l.plane() {
-                    // Planes follow the 30 signal mid layers in Signex's
-                    // single inner numbering.
-                    format!("Inner{}Copper", 30 + u32::from(n))
                 } else if let Some(n) = l.mechanical() {
                     self.mechanical(n)
                 } else {
@@ -471,10 +586,6 @@ impl LayerNames {
             format!("Mechanical{n}")
         }
     }
-}
-
-fn keepout_layer(c: &apcb::Common, layer: String) -> String {
-    if c.keepout { "KeepOut".into() } else { layer }
 }
 
 /// Text-record outline -> points, with arc edges flattened.
@@ -836,7 +947,8 @@ mod tests {
     fn pads_land_where_the_source_puts_them_on_both_sides() {
         for layer in [Layer::TOP, Layer::BOTTOM] {
             for rotation in [0.0, 90.0, 180.0, 270.0] {
-                let board = convert(&one_pad_board(layer, rotation), &mut Report::default());
+                let board = convert(&one_pad_board(layer, rotation), &mut Report::default())
+                    .expect("converts");
                 let fp = &board.footprints[0];
                 let world = crate::check::signex_world(fp, fp.pads[0].position);
                 let (dx, dy) = (world.x - fp.position.x, world.y - fp.position.y);
@@ -864,7 +976,7 @@ mod tests {
             b: Pt::new(1300.0, 2050.0),
             width: 10.0,
         });
-        let board = convert(&doc, &mut Report::default());
+        let board = convert(&doc, &mut Report::default()).expect("converts");
         let check = crate::check::track_ends(&board);
         assert_eq!(check.ends, 2);
         assert_eq!(check.on_own_net_pad, 1);
@@ -888,7 +1000,7 @@ mod tests {
             width: 10.0,
         });
         let mut report = Report::default();
-        let board = convert(&doc, &mut report);
+        let board = convert(&doc, &mut report).expect("converts");
         assert_eq!(board.generator, crate::GENERATOR);
         assert!(board.footprints.iter().any(|f| f.footprint_id == FREE_PAD_FOOTPRINT));
         assert!(board.graphics.iter().any(|g| g.layer == "Unmapped80"));
@@ -917,5 +1029,123 @@ mod tests {
         let mut report = Report::default();
         names.report_unmapped(&mut report);
         assert!(report.is_empty());
+    }
+
+    /// A doc whose copper stack is `stack`, top to bottom.
+    fn stacked(stack: &[Layer]) -> PcbDoc {
+        let mut doc = PcbDoc::default();
+        doc.board.copper_stack = stack.iter().map(|l| (*l, String::new())).collect();
+        doc
+    }
+
+    #[test]
+    fn planes_take_their_stack_place_among_the_inner_layers() {
+        let (mid1, plane1, plane2) = (Layer(2), Layer(39), Layer(40));
+        let mut doc = stacked(&[Layer::TOP, plane1, mid1, plane2, Layer::BOTTOM]);
+        doc.primitives.tracks.push(apcb::Track {
+            common: apcb::Common {
+                layer: plane2,
+                ..Default::default()
+            },
+            a: Pt::new(0.0, 0.0),
+            b: Pt::new(100.0, 0.0),
+            width: 10.0,
+        });
+        let board = convert(&doc, &mut Report::default()).expect("converts");
+        let layers: Vec<(&str, &str)> = board
+            .layers
+            .iter()
+            .map(|l| (l.name.as_str(), l.layer_type.as_str()))
+            .collect();
+        assert_eq!(
+            layers,
+            [
+                ("TopCopper", "signal"),
+                ("Inner1Copper", "plane"),
+                ("Inner2Copper", "signal"),
+                ("Inner3Copper", "plane"),
+                ("BottomCopper", "signal"),
+            ]
+        );
+        assert_eq!(board.segments[0].layer, "Inner3Copper");
+    }
+
+    #[test]
+    fn a_stack_past_the_signex_limit_is_refused() {
+        let mut stack = vec![Layer::TOP];
+        stack.extend((2..=31u8).map(Layer));
+        stack.extend((39..=41u8).map(Layer));
+        stack.push(Layer::BOTTOM);
+        assert_eq!(stack.len(), 35);
+        let err = convert(&stacked(&stack), &mut Report::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConvertError::TooManyCopperLayers { count: 35, max: 32 }
+        ));
+        let mut fits = vec![Layer::TOP];
+        fits.extend((2..=31u8).map(Layer));
+        fits.push(Layer::BOTTOM);
+        let board = convert(&stacked(&fits), &mut Report::default()).expect("32 layers fit");
+        assert_eq!(board.layers[30].name, "Inner30Copper");
+    }
+
+    #[test]
+    fn keepouts_become_keepout_zones_on_the_copper_they_keep_clear() {
+        let mut doc = stacked(&[Layer::TOP, Layer(39), Layer::BOTTOM]);
+        let square = vec![
+            Pt::new(0.0, 0.0),
+            Pt::new(100.0, 0.0),
+            Pt::new(100.0, 100.0),
+            Pt::new(0.0, 100.0),
+        ];
+        // A keepout region on the keep-out layer: every copper layer.
+        doc.primitives.regions.push(apcb::Region {
+            common: apcb::Common {
+                layer: Layer::KEEP_OUT,
+                ..Default::default()
+            },
+            outline: square.clone(),
+            ..Default::default()
+        });
+        // A fill flagged keepout on the bottom: that layer only.
+        doc.primitives.fills.push(apcb::Fill {
+            common: apcb::Common {
+                layer: Layer::BOTTOM,
+                keepout: true,
+                ..Default::default()
+            },
+            a: Pt::new(0.0, 0.0),
+            b: Pt::new(50.0, 50.0),
+            rotation: 0.0,
+        });
+        // A keepout line: no area, so reported, not drawn.
+        doc.primitives.tracks.push(apcb::Track {
+            common: apcb::Common {
+                layer: Layer::KEEP_OUT,
+                ..Default::default()
+            },
+            a: Pt::new(0.0, 0.0),
+            b: Pt::new(100.0, 0.0),
+            width: 10.0,
+        });
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report).expect("converts");
+        let keepouts: Vec<&str> = board
+            .zones
+            .iter()
+            .filter(|z| z.fill_type == KEEPOUT_FILL)
+            .map(|z| z.layer.as_str())
+            .collect();
+        // Fills convert before regions.
+        assert_eq!(
+            keepouts,
+            ["BottomCopper", "TopCopper", "Inner1Copper", "BottomCopper"]
+        );
+        assert!(board.graphics.is_empty());
+        let text = signex_types::format::SnxPcb::new(board)
+            .write_string()
+            .expect("writes");
+        assert!(!text.contains("KeepOut"), "{text}");
+        assert!(report.entries().any(|(m, n)| m == KEEPOUT_LINE_DROPPED && n == 1));
     }
 }

@@ -38,7 +38,7 @@ fn close(a: Point, b: Point) -> bool {
 fn converted_board_round_trips_and_matches_the_object_list() {
     let doc = PcbDoc::open(sample("simple.PcbDoc")).unwrap();
     let mut report = Report::default();
-    let board = signex_altium_convert::pcb::convert(&doc, &mut report);
+    let board = signex_altium_convert::pcb::convert(&doc, &mut report).expect("converts");
 
     let text = SnxPcb::new(board).write_string().unwrap();
     let board = SnxPcb::parse(&text).unwrap().board;
