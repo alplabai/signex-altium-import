@@ -295,11 +295,9 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
         }
         let hatch = poly.params.str("HATCHSTYLE");
         if !hatch.is_empty() && !hatch.eq_ignore_ascii_case("Solid") {
-            report.warn("hatched polygon pour imported as a solid zone");
+            report.warn("hatched polygon pour imported as a solid pour");
         }
-        let mut z = zone(doc, poly.net, names.of(poly.layer), pts);
-        z.priority = poly.params.i64("POURINDEX").unwrap_or(0).max(0) as u32;
-        board.zones.push(z);
+        board.zones.push(pour(doc, poly, names.of(poly.layer), pts));
     }
 
     for r in &p.regions {
@@ -653,6 +651,21 @@ fn rect_corners(a: Pt, b: Pt, rotation: f64) -> Vec<Pt> {
         .collect()
 }
 
+/// The `fill_type` of a polygon pour, whose copper Signex computes.
+const POUR_FILL: &str = "pour";
+
+/// A polygon pour as a Signex pour: its net, its pour order as the
+/// priority, and the board's clearance rule (a 0 clearance defers to it);
+/// Signex refills it rather than taking the poured copper as drawn.
+fn pour(doc: &PcbDoc, poly: &apcb::Polygon, layer: String, outline: Vec<Point>) -> Zone {
+    let mut z = zone(doc, poly.net, layer, outline);
+    z.fill_type = POUR_FILL.into();
+    z.priority = poly.params.i64("POURINDEX").unwrap_or(0).max(0) as u32;
+    z.clearance = 0.0;
+    z
+}
+
+/// Solid copper exactly `outline` (a fill or a free copper region).
 fn zone(doc: &PcbDoc, net: Option<u16>, layer: String, outline: Vec<Point>) -> Zone {
     let (net, net_name) = pad_net(doc, net)
         .map(|n| (n.number, n.name))
@@ -1147,5 +1160,52 @@ mod tests {
             .expect("writes");
         assert!(!text.contains("KeepOut"), "{text}");
         assert!(report.entries().any(|(m, n)| m == KEEPOUT_LINE_DROPPED && n == 1));
+    }
+
+    #[test]
+    fn polygon_pours_are_refilled_pours_and_fills_stay_solid() {
+        let mut doc = stacked(&[Layer::TOP, Layer::BOTTOM]);
+        doc.nets = vec!["GND".into()];
+        let corner = |x: f64, y: f64| Vertex {
+            at: Pt::new(x, y),
+            arc: None,
+        };
+        doc.polygons.push(apcb::Polygon {
+            layer: Layer::BOTTOM,
+            net: Some(0),
+            vertices: vec![
+                corner(0.0, 0.0),
+                corner(1000.0, 0.0),
+                corner(1000.0, 1000.0),
+                corner(0.0, 1000.0),
+            ],
+            params: altium_format::Params::parse(b"|POURINDEX=3|"),
+        });
+        doc.primitives.fills.push(apcb::Fill {
+            common: apcb::Common {
+                layer: Layer::TOP,
+                net: Some(0),
+                ..Default::default()
+            },
+            a: Pt::new(0.0, 0.0),
+            b: Pt::new(100.0, 100.0),
+            rotation: 0.0,
+        });
+        let board = convert(&doc, &mut Report::default()).expect("converts");
+        let pour = board
+            .zones
+            .iter()
+            .find(|z| z.layer == "BottomCopper")
+            .expect("the pour");
+        assert_eq!(pour.fill_type, POUR_FILL);
+        assert_eq!((pour.net, pour.net_name.as_str()), (1, "GND"));
+        assert_eq!(pour.priority, 3);
+        assert_eq!(pour.clearance, 0.0, "a pour defers to the board clearance");
+        let fill = board
+            .zones
+            .iter()
+            .find(|z| z.layer == "TopCopper")
+            .expect("the fill");
+        assert_eq!(fill.fill_type, "solid");
     }
 }
