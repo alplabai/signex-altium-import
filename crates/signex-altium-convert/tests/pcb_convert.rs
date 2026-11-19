@@ -49,8 +49,10 @@ fn converted_board_round_trips_and_matches_the_object_list() {
     // Top Layer: 2 tracks, Bottom Layer: 1 track (Net1 everywhere).
     assert_eq!(board.segments.len(), 3);
     assert!(board.segments.iter().all(|s| s.net == 4));
-    // The Net1 pour, plus the sample's keepout area, now written as a keepout zone.
-    assert_eq!(board.zones.len(), 2);
+    // The Net1 pour, plus the fiducial's keepout ring on the top layer: a
+    // keepout arc keeps copper clear along its line only, one thin keepout
+    // per 10 degree chord of the full circle.
+    assert_eq!(board.zones.len(), 37);
     assert_eq!(
         board.zones.iter().filter(|z| z.fill_type == "pour").count(),
         1
@@ -59,9 +61,9 @@ fn converted_board_round_trips_and_matches_the_object_list() {
         board
             .zones
             .iter()
-            .filter(|z| z.fill_type == "keepout")
+            .filter(|z| z.fill_type == "keepout" && z.layer == "TopCopper")
             .count(),
-        1
+        36
     );
 
     // Outline: 60 x 40 mm with its top-left at the origin.

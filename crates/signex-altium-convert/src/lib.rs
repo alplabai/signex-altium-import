@@ -9,7 +9,7 @@
 //! `docs/CONVERSION.md`.
 
 pub mod check;
-mod keepout_loops;
+mod keepouts;
 pub mod library;
 pub mod pcb;
 pub mod report;

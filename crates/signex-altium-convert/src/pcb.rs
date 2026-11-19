@@ -11,6 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use altium_format::pcb::{self as apcb, Layer, LayerKind, PadShape as APadShape, PcbDoc, Vertex};
 use altium_format::sch::Pt;
+use signex_sketch::geom::{CornerStyle, Point2, offset_polygon, signed_area};
 use signex_types::pcb::{
     BoardGraphic, BoardText, DrillDef, Footprint, FpGraphic, LayerDef, NetDef, Pad, PadNet,
     PadShape, PadType, PcbBoard, PcbSetup, Point, Segment, Via, ViaType, Zone,
@@ -18,7 +19,7 @@ use signex_types::pcb::{
 use signex_types::property::PcbProperty;
 use uuid::Uuid;
 
-use crate::keepout_loops::{KeepoutPiece, close_loops};
+use crate::keepouts::{keepout_area, keepout_line, plane_void};
 use crate::report::Report;
 use crate::units::{deg, mm};
 
@@ -119,17 +120,24 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
         }
     }
 
-    let mut keepout_lines: Vec<KeepoutPiece> = Vec::new();
+    // Planes with split lines, whose other nets' areas are lost.
+    let mut split_planes: BTreeSet<u8> = BTreeSet::new();
     for t in &p.tracks {
         if is_keepout(&t.common) {
-            keepout_lines.push(KeepoutPiece {
-                common: t.common,
-                points: vec![frame.world(t.a), frame.world(t.b)],
-            });
+            let line = [frame.world(t.a), frame.world(t.b)];
+            board.zones.extend(keepout_line(
+                &t.common,
+                &line,
+                mm(t.width),
+                &names,
+                &copper,
+                report,
+            ));
             continue;
         }
-        if t.common.layer.plane().is_some() {
+        if let Some(n) = t.common.layer.plane() {
             report.warn(SPLIT_LINE_DROPPED);
+            split_planes.insert(n);
             continue;
         }
         let layer = names.of(t.common.layer);
@@ -167,17 +175,23 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
 
     for a in &p.arcs {
         if is_keepout(&a.common) {
-            keepout_lines.push(KeepoutPiece {
-                common: a.common,
-                points: arc_polyline(a.center, a.radius, a.start, a.end)
-                    .into_iter()
-                    .map(|p| frame.world(p))
-                    .collect(),
-            });
+            let line: Vec<Point> = arc_polyline(a.center, a.radius, a.start, a.end)
+                .into_iter()
+                .map(|p| frame.world(p))
+                .collect();
+            board.zones.extend(keepout_line(
+                &a.common,
+                &line,
+                mm(a.width),
+                &names,
+                &copper,
+                report,
+            ));
             continue;
         }
-        if a.common.layer.plane().is_some() {
+        if let Some(n) = a.common.layer.plane() {
             report.warn(SPLIT_LINE_DROPPED);
+            split_planes.insert(n);
             continue;
         }
         let layer = names.of(a.common.layer);
@@ -215,12 +229,17 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             };
             fp.graphics.push(g);
         } else {
+            // A board arc has no mid point: it runs from start to end with
+            // the angle rising in the board's Y-down frame. The source
+            // sweeps counter-clockwise with Y up, which the Y flip turns
+            // around, so start and end swap.
+            let (first, last) = if full { (s, e) } else { (e, s) };
             board.graphics.push(BoardGraphic {
                 graphic_type: kind.into(),
                 layer,
                 width: mm(a.width),
-                start: Some(frame.world(s)),
-                end: (!full).then(|| frame.world(e)),
+                start: Some(frame.world(first)),
+                end: (!full).then(|| frame.world(last)),
                 center: Some(frame.world(a.center)),
                 radius: mm(a.radius),
                 points: Vec::new(),
@@ -288,7 +307,10 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
         if is_keepout(&f.common) {
             board
                 .zones
-                .extend(keepout_zones(&f.common, &pts, &names, &copper, report));
+                .extend(keepout_area(&f.common, &pts, &names, &copper, report));
+        } else if f.common.layer.plane().is_some() {
+            report.warn(PLANE_VOID);
+            board.zones.push(plane_void(names.of(f.common.layer), pts));
         } else if f.common.layer.is_copper() {
             board
                 .zones
@@ -330,29 +352,41 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             .zones
             .push(pour(doc, poly, last_pour, names.of(poly.layer), pts));
     }
-    board
-        .zones
-        .extend(plane_pours(doc, &names, &board.outline, report));
+    board.zones.extend(plane_pours(
+        doc,
+        &names,
+        &board.outline,
+        &split_planes,
+        report,
+    ));
 
     for r in &p.regions {
+        let keepout = is_keepout(&r.common);
+        // Poured copper belongs to its polygon, imported above.
+        if r.common.polygon.is_some() && !keepout {
+            continue;
+        }
         let pts: Vec<Point> = r.outline.iter().map(|p| frame.world(*p)).collect();
         if pts.len() < 3 {
+            report.warn("region with fewer than 3 points not imported");
             continue;
         }
         // A keepout region is a rule, also inside a footprint.
-        if is_keepout(&r.common) {
+        if keepout {
             board
                 .zones
-                .extend(keepout_zones(&r.common, &pts, &names, &copper, report));
+                .extend(keepout_area(&r.common, &pts, &names, &copper, report));
             continue;
         }
-        // Poured copper belongs to its polygon (imported above), and
-        // footprint regions are custom pad shapes: only free regions are
-        // design data of their own.
-        if r.common.polygon.is_some() || r.common.component.is_some() {
+        if r.common.component.is_some() {
+            report.warn("footprint region (custom pad shape or footprint copper) not imported");
             continue;
         }
-        if r.common.layer.is_copper() && r.kind == 0 && !r.params.bool("ISBOARDCUTOUT") {
+        let solid = r.kind == 0 && !r.params.bool("ISBOARDCUTOUT");
+        if solid && r.common.layer.plane().is_some() {
+            report.warn(PLANE_VOID);
+            board.zones.push(plane_void(names.of(r.common.layer), pts));
+        } else if solid && r.common.layer.is_copper() {
             board
                 .zones
                 .push(zone(doc, r.common.net, names.of(r.common.layer), pts));
@@ -370,23 +404,20 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             report.warn(format!("{what} not imported"));
         }
     }
-    let (loops, open) = close_loops(keepout_lines);
-    for (common, ring) in loops {
-        board
-            .zones
-            .extend(keepout_zones(&common, &ring, &names, &copper, report));
-    }
-    for _ in 0..open {
-        report.warn(KEEPOUT_LINE_DROPPED);
-    }
     names.report_unmapped(report);
     Ok(board)
 }
 
-const KEEPOUT_LINE_DROPPED: &str =
-    "keepout line or arc that closes no loop not imported: a Signex keepout is an area";
-
 const SPLIT_LINE_DROPPED: &str = "plane split line not imported: the plane is one pour on its net";
+
+const SPLIT_PLANE_NETS_LOST: &str = "split plane written as one pour on its plane net: \
+     the plane areas of its other nets are lost";
+
+const PLANE_VOID: &str =
+    "fill or region on an internal plane imported as a void (keepout) in the plane's pour";
+
+const PULLBACK_NOT_APPLIED: &str =
+    "plane pullback could not be applied to the board outline; the plane pours to the board edge";
 
 /// A footprint text's own turn: Altium's turns are counter-clockwise with
 /// Y up, Signex's run the other way on its Y-down board, and on a
@@ -399,13 +430,15 @@ fn text_own_turn(fp: &Footprint, comp_rotation: f64, text_rotation: f64) -> f64 
     }
 }
 
-/// Each internal plane as a pour over the board outline on the plane's
-/// net (`PLANEnNETNAME`), so Signex fills it; a plane with no net is
-/// written without one and reported.
+/// Each internal plane as a pour over the board outline, pulled back from
+/// the edge by `PLANEnPULLBACK`, on the plane's net (`PLANEnNETNAME`), so
+/// Signex fills it; a plane with no net is written without one and
+/// reported. A split plane keeps only its plane net (reported).
 fn plane_pours(
     doc: &PcbDoc,
     names: &LayerNames,
     outline: &[Point],
+    split_planes: &BTreeSet<u8>,
     report: &mut Report,
 ) -> Vec<Zone> {
     let mut pours = Vec::new();
@@ -414,6 +447,14 @@ fn plane_pours(
             report.warn("plane not written: the board has no outline to pour it over");
             continue;
         }
+        if split_planes.contains(n) {
+            report.warn(SPLIT_PLANE_NETS_LOST);
+        }
+        let pullback = doc
+            .board
+            .params
+            .pcb_mils(&format!("PLANE{n}PULLBACK"))
+            .map_or(0.0, mm);
         let net_name = doc.board.params.string(&format!("PLANE{n}NETNAME"));
         let net = doc
             .nets
@@ -423,7 +464,8 @@ fn plane_pours(
         if net.is_none() {
             report.warn("plane with no net written as a pour without a net");
         }
-        let mut z = zone(doc, net, token.clone(), outline.to_vec());
+        let area = pulled_back(outline, pullback, report);
+        let mut z = zone(doc, net, token.clone(), area);
         z.fill_type = POUR_FILL.into();
         z.clearance = 0.0;
         pours.push(z);
@@ -431,53 +473,33 @@ fn plane_pours(
     pours
 }
 
+/// `outline` shrunk by `pullback` mm. An offset that collapses or turns
+/// the outline inside out is not applied, and reported.
+fn pulled_back(outline: &[Point], pullback: f64, report: &mut Report) -> Vec<Point> {
+    if pullback <= 0.0 {
+        return outline.to_vec();
+    }
+    let mut ring: Vec<Point2> = outline.iter().map(|p| Point2::new(p.x, p.y)).collect();
+    // The offset needs every edge to have a length: drop a closing repeat.
+    if let (Some(first), Some(last)) = (ring.first(), ring.last())
+        && ring.len() > 1
+        && first.distance(*last) < 1e-9
+    {
+        ring.pop();
+    }
+    let inner = offset_polygon(&ring, -pullback, CornerStyle::Miter { miter_limit: 4.0 });
+    let (before, after) = (signed_area(&ring), signed_area(&inner));
+    if inner.len() < 3 || before * after <= 0.0 || after.abs() >= before.abs() {
+        report.warn(PULLBACK_NOT_APPLIED);
+        return outline.to_vec();
+    }
+    inner.into_iter().map(|p| Point::new(p.x, p.y)).collect()
+}
+
 /// Whether an item is a keepout: flagged as one, or on the keep-out layer.
 fn is_keepout(c: &apcb::Common) -> bool {
     c.keepout || c.layer == Layer::KEEP_OUT
 }
-
-/// A keepout area as Signex keepout zones (`fill_type = "keepout"`), one
-/// per copper layer it keeps clear: every copper layer for the keep-out
-/// layer, the item's own layer for a keepout on copper. A keepout on any
-/// other layer keeps no copper clear and is reported.
-fn keepout_zones(
-    c: &apcb::Common,
-    outline: &[Point],
-    names: &LayerNames,
-    copper: &[String],
-    report: &mut Report,
-) -> Vec<Zone> {
-    let layers = if c.layer == Layer::KEEP_OUT {
-        copper.to_vec()
-    } else if c.layer.is_copper() {
-        vec![names.of(c.layer)]
-    } else {
-        report.warn("keepout on a non-copper layer not imported");
-        return Vec::new();
-    };
-    layers
-        .into_iter()
-        .map(|layer| Zone {
-            uuid: Uuid::new_v4(),
-            net: 0,
-            net_name: String::new(),
-            layer,
-            outline: outline.to_vec(),
-            holes: Vec::new(),
-            priority: 0,
-            fill_type: KEEPOUT_FILL.into(),
-            thermal_relief: false,
-            thermal_gap: 0.0,
-            thermal_width: 0.0,
-            clearance: 0.0,
-            min_thickness: 0.0,
-            unknown: Default::default(),
-        })
-        .collect()
-}
-
-/// The `fill_type` Signex reads as a keepout zone.
-const KEEPOUT_FILL: &str = "keepout";
 
 /// Signex numbers nets from 1; 0 is "no net".
 fn net_number(n: Option<u16>) -> u32 {
@@ -619,8 +641,10 @@ impl LayerNames {
     }
 
     /// The token for `l`. Keepout items do not come here: they become
-    /// keepout zones (`keepout_zones`), so the keep-out layer itself, like
-    /// any layer Signex has no name for, is reported as unmapped.
+    /// keepout zones (`crate::keepouts`), so the keep-out layer itself,
+    /// like any layer Signex has no name for, is reported as unmapped. On
+    /// a board, a mid or plane layer outside the copper stack is unmapped
+    /// too: its raw number could name a stack layer.
     pub(crate) fn of(&self, l: Layer) -> String {
         if let Some(token) = self.copper.get(&l.0) {
             return token.clone();
@@ -638,8 +662,8 @@ impl LayerNames {
             Layer::DRILL_DRAWING => "DrillDrawing".into(),
             Layer::DRILL_GUIDE => "Notes".into(),
             _ => {
-                if let Some(n) = l.mid() {
-                    // A library, or a mid layer the board stack leaves out.
+                if let Some(n) = l.mid().filter(|_| self.copper.is_empty()) {
+                    // A library has no stack: the mid number is all there is.
                     format!("Inner{n}Copper")
                 } else if let Some(n) = l.mechanical() {
                     self.mechanical(n)
@@ -1004,6 +1028,7 @@ fn convert_pad(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keepouts::KEEPOUT_FILL;
 
     #[test]
     fn fp_local_inverts_the_renderer_rotation() {
@@ -1244,7 +1269,8 @@ mod tests {
             b: Pt::new(50.0, 50.0),
             rotation: 0.0,
         });
-        // A keepout line: no area, so reported, not drawn.
+        // A keepout line on the keep-out layer: a thin keepout on every
+        // copper layer.
         doc.primitives.tracks.push(apcb::Track {
             common: apcb::Common {
                 layer: Layer::KEEP_OUT,
@@ -1262,21 +1288,24 @@ mod tests {
             .filter(|z| z.fill_type == KEEPOUT_FILL)
             .map(|z| z.layer.as_str())
             .collect();
-        // Fills convert before regions.
+        // Tracks convert first, then fills, then regions.
         assert_eq!(
             keepouts,
-            ["BottomCopper", "TopCopper", "Inner1Copper", "BottomCopper"]
+            [
+                "TopCopper",
+                "Inner1Copper",
+                "BottomCopper",
+                "BottomCopper",
+                "TopCopper",
+                "Inner1Copper",
+                "BottomCopper"
+            ]
         );
         assert!(board.graphics.is_empty());
         let text = signex_types::format::SnxPcb::new(board)
             .write_string()
             .expect("writes");
         assert!(!text.contains("KeepOut"), "{text}");
-        assert!(
-            report
-                .entries()
-                .any(|(m, n)| m == KEEPOUT_LINE_DROPPED && n == 1)
-        );
     }
 
     #[test]
@@ -1381,36 +1410,176 @@ mod tests {
                 .entries()
                 .any(|(m, n)| m == SPLIT_LINE_DROPPED && n == 1)
         );
+        assert!(
+            report
+                .entries()
+                .any(|(m, n)| m == SPLIT_PLANE_NETS_LOST && n == 1)
+        );
     }
 
     #[test]
-    fn a_closed_loop_of_keepout_lines_is_a_keepout_zone() {
-        let mut doc = stacked(&[Layer::TOP, Layer::BOTTOM]);
-        let corners = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)];
-        for i in 0..4 {
-            let (a, b) = (corners[i], corners[(i + 1) % 4]);
-            doc.primitives.tracks.push(apcb::Track {
-                common: apcb::Common {
-                    layer: Layer::TOP,
-                    keepout: true,
-                    ..Default::default()
-                },
-                a: Pt::new(a.0, a.1),
-                b: Pt::new(b.0, b.1),
-                width: 10.0,
-            });
-        }
+    fn a_plane_pour_is_pulled_back_from_the_board_edge() {
+        let mut doc = stacked(&[Layer::TOP, Layer(39), Layer::BOTTOM]);
+        doc.board.outline = square(1000.0);
+        doc.board.params =
+            altium_format::Params::parse(b"|PLANE1NETNAME=GND|PLANE1PULLBACK=20mil|");
+        doc.nets = vec!["GND".into()];
         let mut report = Report::default();
         let board = convert(&doc, &mut report).expect("converts");
-        let keepouts: Vec<&Zone> = board
+        let pour = board
             .zones
             .iter()
-            .filter(|z| z.fill_type == KEEPOUT_FILL)
+            .find(|z| z.layer == "Inner1Copper")
+            .expect("the plane pour");
+        assert_eq!(pour.outline.len(), 4);
+        // 20 mil = 0.508 mm in from each side of the 25.4 mm board.
+        for p in &pour.outline {
+            for v in [p.x, p.y] {
+                let edge = v.min(25.4 - v);
+                assert!((edge - 0.508).abs() < 1e-6, "{p:?}");
+            }
+        }
+        assert!(report.entries().all(|(m, _)| m != PULLBACK_NOT_APPLIED));
+    }
+
+    #[test]
+    fn fills_and_free_regions_on_a_plane_are_voids_in_its_pour() {
+        let plane = Layer(39);
+        let mut doc = stacked(&[Layer::TOP, plane, Layer::BOTTOM]);
+        doc.board.outline = square(1000.0);
+        doc.board.params = altium_format::Params::parse(b"|PLANE1NETNAME=GND|");
+        doc.nets = vec!["GND".into()];
+        doc.primitives.fills.push(apcb::Fill {
+            common: apcb::Common {
+                layer: plane,
+                net: Some(0),
+                ..Default::default()
+            },
+            a: Pt::new(100.0, 100.0),
+            b: Pt::new(200.0, 200.0),
+            rotation: 0.0,
+        });
+        doc.primitives.regions.push(apcb::Region {
+            common: apcb::Common {
+                layer: plane,
+                ..Default::default()
+            },
+            outline: vec![
+                Pt::new(300.0, 300.0),
+                Pt::new(400.0, 300.0),
+                Pt::new(400.0, 400.0),
+            ],
+            ..Default::default()
+        });
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report).expect("converts");
+        let on_plane: Vec<&str> = board
+            .zones
+            .iter()
+            .filter(|z| z.layer == "Inner1Copper")
+            .map(|z| z.fill_type.as_str())
             .collect();
-        assert_eq!(keepouts.len(), 1);
-        assert_eq!(keepouts[0].layer, "TopCopper");
-        assert_eq!(keepouts[0].outline.len(), 4);
-        assert!(report.entries().all(|(m, _)| m != KEEPOUT_LINE_DROPPED));
+        assert_eq!(on_plane, [KEEPOUT_FILL, POUR_FILL, KEEPOUT_FILL]);
+        assert!(board.zones.iter().all(|z| z.fill_type != "solid"));
+        assert!(report.entries().any(|(m, n)| m == PLANE_VOID && n == 2));
+    }
+
+    #[test]
+    fn a_board_mid_layer_outside_the_stack_is_unmapped() {
+        // Mid 2 is the board's only inner layer, so it is Inner1Copper;
+        // mid 1 is not in the stack and must not borrow that name.
+        let mut doc = stacked(&[Layer::TOP, Layer(3), Layer::BOTTOM]);
+        doc.primitives.tracks.push(apcb::Track {
+            common: apcb::Common {
+                layer: Layer(2),
+                ..Default::default()
+            },
+            a: Pt::new(0.0, 0.0),
+            b: Pt::new(100.0, 0.0),
+            width: 10.0,
+        });
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report).expect("converts");
+        assert_eq!(board.segments[0].layer, "Unmapped2");
+        assert!(
+            report
+                .entries()
+                .any(|(m, _)| m == "source layer 2 has no Signex layer; its items are on Unmapped2")
+        );
+        // A library has no stack: the mid number names the layer.
+        let names = LayerNames::from_params(&Default::default(), &HashMap::new());
+        assert_eq!(names.of(Layer(2)), "Inner1Copper");
+    }
+
+    #[test]
+    fn short_regions_and_footprint_regions_are_reported() {
+        let mut doc = one_pad_board(Layer::TOP, 0.0);
+        doc.primitives.regions.push(apcb::Region {
+            common: apcb::Common {
+                layer: Layer::TOP,
+                ..Default::default()
+            },
+            outline: vec![Pt::new(0.0, 0.0), Pt::new(100.0, 0.0)],
+            ..Default::default()
+        });
+        doc.primitives.regions.push(apcb::Region {
+            common: apcb::Common {
+                layer: Layer::TOP,
+                component: Some(0),
+                ..Default::default()
+            },
+            outline: vec![
+                Pt::new(950.0, 1950.0),
+                Pt::new(1050.0, 1950.0),
+                Pt::new(1050.0, 2050.0),
+            ],
+            ..Default::default()
+        });
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report).expect("converts");
+        assert!(board.zones.is_empty());
+        let messages: Vec<&str> = report.entries().map(|(m, _)| m).collect();
+        assert!(messages.contains(&"region with fewer than 3 points not imported"));
+        assert!(
+            messages
+                .contains(&"footprint region (custom pad shape or footprint copper) not imported")
+        );
+    }
+
+    /// A board arc read from start to end with the angle rising, in the
+    /// Y-down board frame, passes through the source arc's middle.
+    #[test]
+    fn a_board_arc_keeps_its_direction_through_the_y_flip() {
+        let mut doc = stacked(&[Layer::TOP, Layer::BOTTOM]);
+        doc.primitives.arcs.push(apcb::Arc {
+            common: apcb::Common {
+                layer: Layer::TOP_OVERLAY,
+                ..Default::default()
+            },
+            center: Pt::new(500.0, 500.0),
+            radius: 100.0,
+            start: 0.0,
+            end: 90.0,
+            width: 10.0,
+        });
+        let board = convert(&doc, &mut Report::default()).expect("converts");
+        let g = &board.graphics[0];
+        let (c, s, e) = (
+            g.center.expect("center"),
+            g.start.expect("start"),
+            g.end.expect("end"),
+        );
+        let a_s = (s.y - c.y).atan2(s.x - c.x);
+        let a_e = (e.y - c.y).atan2(e.x - c.x);
+        let mid = a_s + (a_e - a_s).rem_euclid(std::f64::consts::TAU) / 2.0;
+        let drawn = Point::new(c.x + g.radius * mid.cos(), c.y + g.radius * mid.sin());
+        let source_mid = on_arc(Pt::new(500.0, 500.0), 100.0, 45.0);
+        let frame = Frame::for_doc(&doc);
+        let want = frame.world(source_mid);
+        assert!(
+            (drawn.x - want.x).abs() < 1e-4 && (drawn.y - want.y).abs() < 1e-4,
+            "drawn {drawn:?}, source middle {want:?}"
+        );
     }
 
     #[test]

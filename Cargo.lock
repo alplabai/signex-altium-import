@@ -789,6 +789,7 @@ version = "0.1.0"
 dependencies = [
  "altium-format",
  "signex-library",
+ "signex-sketch",
  "signex-types",
  "thiserror",
  "uuid",

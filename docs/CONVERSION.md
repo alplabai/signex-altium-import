@@ -89,16 +89,19 @@ order and names.
 |---|---|
 | Component | `Footprint`, rotation negated for the Y flip. Designator and comment come from its special strings; the component's unique id is dropped (reported). |
 | Pad | `Pad`. Plated and drilled → thru, unplated → np-thru, otherwise SMD. Rounded-rectangle radius → `roundrect_ratio` = percent / 200. |
-| Copper layers | The board's stack top to bottom: `TopCopper`, `Inner1Copper` .. in stack order (mid layers and internal planes alike), `BottomCopper`; planes are typed `plane`. A board of more than 32 copper layers is refused. |
-| Internal plane | A pour (`fill_type = "pour"`) over the board outline on the plane's net (`PLANEnNETNAME`); a plane with no net is written without one (reported). Split lines on a plane are reported, not imported. |
+| Copper layers | The board's stack top to bottom: `TopCopper`, `Inner1Copper` .. in stack order (mid layers and internal planes alike), `BottomCopper`; planes are typed `plane`. A board of more than 32 copper layers is refused. A mid or plane layer outside the stack is `Unmapped<n>` (reported); only a library, which has no stack, names a mid layer `Inner<n>Copper` by its number. |
+| Internal plane | A pour (`fill_type = "pour"`) over the board outline, pulled back from the edge by `PLANEnPULLBACK`, on the plane's net (`PLANEnNETNAME`); a plane with no net is written without one (reported). Split lines on a plane are reported, not imported: a split plane is one pour on its plane net, and the plane areas of its other nets are lost (reported). |
+| Fill or free region on an internal plane | A void in the plane's pour: a keepout zone on that plane (reported) |
 | Track on copper | `Segment`. Tracks on other layers become board or footprint graphics. |
 | Arc on copper | Straight segments, 10° per chord (reported). Other arcs become graphics. |
 | Via | `Via`. Blind or buried when it does not span top to bottom. |
 | Polygon pour | A pour (`fill_type = "pour"`) with the polygon's outline and net; Signex refills it. Altium pours the lowest `POURINDEX` first, Signex fills the highest priority first, so priority = the board's last pour index − `POURINDEX`. The clearance defers to the board's rule. |
 | Fill on copper, free copper region | Solid copper (`fill_type = "solid"`) |
 | Fill on another layer | A `poly` board drawing |
-| Keepout fill or region (flagged keepout, or on the keep-out layer, also inside a footprint) | Keepout zones (`fill_type = "keepout"`): one per copper layer for the keep-out layer, else on the item's own copper layer |
-| Keepout lines and arcs | Joined per layer; each closed loop becomes keepout zones like a keepout region. Lines that close no loop are reported, not imported. |
+| Keepout fill or region (flagged keepout, or on the keep-out layer, also inside a footprint) | Keepout zones (`fill_type = "keepout"`): one per copper layer for the keep-out layer, else on the item's own copper layer. Per-object restrictions (tracks, vias, pads) become a keepout of all copper, and a footprint's keepout becomes a board keepout that does not move with the footprint; both are reported. |
+| Keepout lines and arcs | A keepout line keeps copper clear along the line only: each segment (each 10° chord of an arc) becomes a thin keepout zone at the line's width with round ends, on the layers a keepout region would use. A closed loop of keepout lines keeps its inside free. A line with no width is reported, not imported. |
+| Region with fewer than 3 points, footprint region that is not a keepout | Reported, not imported |
+| Arc on another layer, outside a footprint | A board arc from start to end with the angle rising in the Y-down board frame, so start and end swap for the Y flip |
 | Mechanical layer | Courtyard, assembly (`*Fab`) or outline by its name, else `MechanicalN` |
 | Drill drawing, drill guide | `DrillDrawing`, `Notes` |
 | Any other layer | `Unmapped<n>`, reported |
@@ -117,7 +120,8 @@ classes. Recheck clearances in Signex before you send a board out.
 ## Output
 
 The command converts every document of a project before it writes any of
-them, so a board that is refused leaves no partial output. A single board
+them, so a board that is refused writes nothing. An I/O error while
+writing can still leave the files written before it. A single board
 (`.PcbDoc`) also reports a placement self-check in `--json`: how many
 track ends land on a pad of their own net and how many only on another
 net's pad (see `docs/APP_INTEGRATION.md`).

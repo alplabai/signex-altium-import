@@ -312,8 +312,9 @@ fn convert_project(
         .collect();
 
     // Convert every sheet and board before writing any of them, so a board
-    // that is refused (or a document that will not serialise) leaves no
-    // partial output behind.
+    // that is refused (or a document that will not serialise) writes
+    // nothing. An I/O error while writing can still leave the files written
+    // before it in the output directory.
     let mut entries = Vec::new();
     let mut root = None;
     let mut texts: Vec<(&String, String)> = Vec::new();
