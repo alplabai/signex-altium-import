@@ -789,6 +789,7 @@ version = "0.1.0"
 dependencies = [
  "altium-format",
  "signex-library",
+ "signex-sketch",
  "signex-types",
  "thiserror",
  "uuid",
@@ -818,6 +819,7 @@ dependencies = [
  "sha2",
  "signex-sketch",
  "signex-types",
+ "tempfile",
  "thiserror",
  "toml",
  "tracing",

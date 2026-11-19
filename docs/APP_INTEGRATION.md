@@ -30,7 +30,8 @@ status 0 on success, non-zero on failure.
   "error": null,
   "project": "/abs/out/Board.snxprj",
   "files": ["/abs/out/Main.snxsch", "/abs/out/Board.snxpcb", "/abs/out/Board.snxprj"],
-  "warnings": [{ "message": "copper arc imported as straight track segments", "count": 12 }]
+  "warnings": [{ "message": "copper arc imported as straight track segments", "count": 12 }],
+  "track_ends": null
 }
 ```
 
@@ -38,3 +39,9 @@ status 0 on success, non-zero on failure.
 Signex then opens the first entry of `files` (a `.snxsch`, `.snxpcb`,
 `.snxsym` or `.snxfpt`). Fields may be added; existing fields
 keep their meaning.
+
+`track_ends` is a self-check of a single converted board (`.PcbDoc`
+input), `null` otherwise: `{ "total", "on_own_net_pad",
+"on_other_net_pad" }`, counting track ends that land on a netted pad with
+copper on the track's layer. Ends on another net's pad should be about
+zero; many mean pads were placed wrong.

@@ -9,8 +9,14 @@ fn sample(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
-/// The renderer's pad placement: origin + R(rotation) * local.
+/// The renderer's pad placement: origin + R(rotation) * M * local, where
+/// M mirrors x on a bottom-side footprint.
 fn pad_world(fp: &signex_types::pcb::Footprint, local: Point) -> Point {
+    let local = if fp.layer == "BottomCopper" {
+        Point::new(-local.x, local.y)
+    } else {
+        local
+    };
     let (s, c) = fp.rotation.to_radians().sin_cos();
     Point::new(
         fp.position.x + local.x * c - local.y * s,
@@ -32,7 +38,7 @@ fn close(a: Point, b: Point) -> bool {
 fn converted_board_round_trips_and_matches_the_object_list() {
     let doc = PcbDoc::open(sample("simple.PcbDoc")).unwrap();
     let mut report = Report::default();
-    let board = signex_altium_convert::pcb::convert(&doc, &mut report);
+    let board = signex_altium_convert::pcb::convert(&doc, &mut report).expect("converts");
 
     let text = SnxPcb::new(board).write_string().unwrap();
     let board = SnxPcb::parse(&text).unwrap().board;
@@ -43,7 +49,22 @@ fn converted_board_round_trips_and_matches_the_object_list() {
     // Top Layer: 2 tracks, Bottom Layer: 1 track (Net1 everywhere).
     assert_eq!(board.segments.len(), 3);
     assert!(board.segments.iter().all(|s| s.net == 4));
-    assert_eq!(board.zones.len(), 1);
+    // The Net1 pour, plus the fiducial's keepout ring on the top layer: a
+    // keepout arc keeps copper clear along its line only, one thin keepout
+    // per 10 degree chord of the full circle.
+    assert_eq!(board.zones.len(), 37);
+    assert_eq!(
+        board.zones.iter().filter(|z| z.fill_type == "pour").count(),
+        1
+    );
+    assert_eq!(
+        board
+            .zones
+            .iter()
+            .filter(|z| z.fill_type == "keepout" && z.layer == "TopCopper")
+            .count(),
+        36
+    );
 
     // Outline: 60 x 40 mm with its top-left at the origin.
     let xs: Vec<f64> = board.outline.iter().map(|p| p.x).collect();

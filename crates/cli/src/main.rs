@@ -19,6 +19,7 @@ use altium_format::sch::{SchDoc, SchLib};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use signex_altium_convert::Report;
+use signex_altium_convert::check::{EndCheck, track_ends};
 use signex_altium_convert::sch::{PortScope, SchOptions, base_name, snx_sheet_name};
 use signex_types::format::{SnxPcb, SnxSchematic};
 use signex_types::project::{ProjectData, SheetEntry};
@@ -64,6 +65,8 @@ struct Summary {
     project: Option<PathBuf>,
     files: Vec<PathBuf>,
     report: Report,
+    /// The track-end self-check of a single converted board.
+    track_ends: Option<EndCheck>,
 }
 
 fn main() {
@@ -133,7 +136,8 @@ fn run(cli: &Cli) -> Result<Summary> {
             let doc = PcbDoc::open(&input)?;
             let name = format!("{}.snxpcb", stem(&input));
             out.check_free(std::slice::from_ref(&name))?;
-            let board = signex_altium_convert::pcb::convert(&doc, &mut summary.report);
+            let board = signex_altium_convert::pcb::convert(&doc, &mut summary.report)?;
+            summary.track_ends = Some(track_ends(&board));
             out.write(&name, &SnxPcb::new(board).write_string()?)?;
         }
         "schlib" => {
@@ -307,8 +311,13 @@ fn convert_project(
         .map(|s| base_name(&s.file_name).to_ascii_lowercase())
         .collect();
 
+    // Convert every sheet and board before writing any of them, so a board
+    // that is refused (or a document that will not serialise) writes
+    // nothing. An I/O error while writing can still leave the files written
+    // before it in the output directory.
     let mut entries = Vec::new();
     let mut root = None;
+    let mut texts: Vec<(&String, String)> = Vec::new();
     for ((path, doc), name) in sheets.iter().zip(&sheet_names) {
         let sheet = signex_altium_convert::sch::convert(doc, &opts, report);
         entries.push(SheetEntry {
@@ -322,14 +331,18 @@ fn convert_project(
         if root.is_none() && !children.contains(&file_name(path).to_ascii_lowercase()) {
             root = Some(name.clone());
         }
-        out.write(name, &SnxSchematic::new(sheet).write_string()?)?;
+        texts.push((name, SnxSchematic::new(sheet).write_string()?));
     }
     if boards.len() > 1 {
         report.warn("project has several PCB documents; the first is the project's board");
     }
-    for ((_, doc), name) in boards.iter().zip(&board_names) {
-        let board = signex_altium_convert::pcb::convert(doc, report);
-        out.write(name, &SnxPcb::new(board).write_string()?)?;
+    for ((path, doc), name) in boards.iter().zip(&board_names) {
+        let board = signex_altium_convert::pcb::convert(doc, report)
+            .with_context(|| format!("converting {}", path.display()))?;
+        texts.push((name, SnxPcb::new(board).write_string()?));
+    }
+    for (name, text) in &texts {
+        out.write(name, text)?;
     }
 
     // Libraries come along as Signex primitive files beside the design.
@@ -392,12 +405,20 @@ fn summary_json(s: &Summary, error: Option<&str>) -> String {
         .entries()
         .map(|(m, n)| serde_json::json!({ "message": m, "count": n }))
         .collect();
+    let track_ends = s.track_ends.map(|t| {
+        serde_json::json!({
+            "total": t.ends,
+            "on_own_net_pad": t.on_own_net_pad,
+            "on_other_net_pad": t.on_other_net_pad,
+        })
+    });
     serde_json::json!({
         "ok": error.is_none(),
         "error": error,
         "project": s.project,
         "files": s.files,
         "warnings": warnings,
+        "track_ends": track_ends,
     })
     .to_string()
 }

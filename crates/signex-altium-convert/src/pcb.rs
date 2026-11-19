@@ -2,12 +2,16 @@
 //!
 //! Frames: Altium boards are mils, Y up, absolute. Signex boards are mm,
 //! Y down; the outline's top-left lands on (0, 0). Footprint pads and
-//! graphics are footprint-local, rotated by the footprint's rotation.
+//! graphics are footprint-local, rotated by the footprint's rotation; on a
+//! bottom-side footprint Signex also mirrors local x, so the local
+//! coordinates written here undo that mirror.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
 
 use altium_format::pcb::{self as apcb, Layer, LayerKind, PadShape as APadShape, PcbDoc, Vertex};
 use altium_format::sch::Pt;
+use signex_sketch::geom::{CornerStyle, Point2, offset_polygon, signed_area};
 use signex_types::pcb::{
     BoardGraphic, BoardText, DrillDef, Footprint, FpGraphic, LayerDef, NetDef, Pad, PadNet,
     PadShape, PadType, PcbBoard, PcbSetup, Point, Segment, Via, ViaType, Zone,
@@ -15,33 +19,47 @@ use signex_types::pcb::{
 use signex_types::property::PcbProperty;
 use uuid::Uuid;
 
+use crate::keepouts::{keepout_area, keepout_line, plane_void};
 use crate::report::Report;
 use crate::units::{deg, mm};
 
 /// Arcs flattened to chords of at most this many degrees.
 const ARC_STEP_DEG: f64 = 10.0;
 
-pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
+/// The footprint id of the holder a free pad (one in no component) gets.
+const FREE_PAD_FOOTPRINT: &str = "import:free-pad";
+
+/// The most copper layers a Signex board holds: top, bottom and 30 inner.
+pub const MAX_COPPER_LAYERS: usize = 32;
+
+/// Why a board cannot be converted.
+#[derive(Debug, thiserror::Error)]
+pub enum ConvertError {
+    #[error("the board has {count} copper layers; Signex boards hold at most {max}")]
+    TooManyCopperLayers { count: usize, max: usize },
+}
+
+pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertError> {
     let frame = Frame::for_doc(doc);
-    let names = LayerNames::new(doc);
+    let names = LayerNames::for_doc(doc)?;
+    let copper = names.copper_tokens();
     let mut board = PcbBoard {
         uuid: Uuid::new_v4(),
         version: 1,
-        generator: "signex-altium-import".into(),
+        generator: crate::GENERATOR.into(),
         thickness: signex_types::pcb::PCB_DEFAULT_THICKNESS_MM,
         outline: outline(&doc.board.outline)
             .into_iter()
             .map(|p| frame.world(p))
             .collect(),
-        layers: doc
-            .board
-            .copper_stack
+        layers: names
+            .stack
             .iter()
             .enumerate()
-            .map(|(i, (l, _))| LayerDef {
+            .map(|(i, (token, plane))| LayerDef {
                 id: i as u8,
-                name: names.of(*l),
-                layer_type: "signal".into(),
+                name: token.clone(),
+                layer_type: if *plane { "plane" } else { "signal" }.into(),
             })
             .collect(),
         setup: Some(PcbSetup {
@@ -75,6 +93,9 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
     // Footprints first, so owned primitives can find their parent. Slot i
     // of `board.footprints` is Altium component i.
     for (i, c) in doc.components.iter().enumerate() {
+        if !c.unique_id.is_empty() {
+            report.warn("source-tool component unique id dropped");
+        }
         board.footprints.push(footprint(i as u16, c, doc, &frame));
     }
     let owner = |c: Option<u16>| c.map(usize::from).filter(|&i| i < doc.components.len());
@@ -99,9 +120,28 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
         }
     }
 
+    // Planes with split lines, whose other nets' areas are lost.
+    let mut split_planes: BTreeSet<u8> = BTreeSet::new();
     for t in &p.tracks {
+        if is_keepout(&t.common) {
+            let line = [frame.world(t.a), frame.world(t.b)];
+            board.zones.extend(keepout_line(
+                &t.common,
+                &line,
+                mm(t.width),
+                &names,
+                &copper,
+                report,
+            ));
+            continue;
+        }
+        if let Some(n) = t.common.layer.plane() {
+            report.warn(SPLIT_LINE_DROPPED);
+            split_planes.insert(n);
+            continue;
+        }
         let layer = names.of(t.common.layer);
-        if t.common.layer.is_copper() && !t.common.keepout {
+        if t.common.layer.is_copper() {
             board
                 .segments
                 .push(segment(&frame, t.a, t.b, t.width, layer, t.common.net));
@@ -122,7 +162,7 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
         } else {
             board.graphics.push(BoardGraphic {
                 graphic_type: "line".into(),
-                layer: keepout_layer(&t.common, layer),
+                layer,
                 width: mm(t.width),
                 start: Some(frame.world(t.a)),
                 end: Some(frame.world(t.b)),
@@ -134,8 +174,28 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
     }
 
     for a in &p.arcs {
+        if is_keepout(&a.common) {
+            let line: Vec<Point> = arc_polyline(a.center, a.radius, a.start, a.end)
+                .into_iter()
+                .map(|p| frame.world(p))
+                .collect();
+            board.zones.extend(keepout_line(
+                &a.common,
+                &line,
+                mm(a.width),
+                &names,
+                &copper,
+                report,
+            ));
+            continue;
+        }
+        if let Some(n) = a.common.layer.plane() {
+            report.warn(SPLIT_LINE_DROPPED);
+            split_planes.insert(n);
+            continue;
+        }
         let layer = names.of(a.common.layer);
-        if a.common.layer.is_copper() && !a.common.keepout {
+        if a.common.layer.is_copper() {
             report.warn("copper arc imported as straight track segments");
             let pts = arc_polyline(a.center, a.radius, a.start, a.end);
             for w in pts.windows(2) {
@@ -169,12 +229,17 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
             };
             fp.graphics.push(g);
         } else {
+            // A board arc has no mid point: it runs from start to end with
+            // the angle rising in the board's Y-down frame. The source
+            // sweeps counter-clockwise with Y up, which the Y flip turns
+            // around, so start and end swap.
+            let (first, last) = if full { (s, e) } else { (e, s) };
             board.graphics.push(BoardGraphic {
                 graphic_type: kind.into(),
-                layer: keepout_layer(&a.common, layer),
+                layer,
                 width: mm(a.width),
-                start: Some(frame.world(s)),
-                end: (!full).then(|| frame.world(e)),
+                start: Some(frame.world(first)),
+                end: (!full).then(|| frame.world(last)),
                 center: Some(frame.world(a.center)),
                 radius: mm(a.radius),
                 points: Vec::new(),
@@ -208,6 +273,7 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
             Some(slot) => {
                 let fp = &mut board.footprints[slot];
                 let pos = fp_local(fp, frame.world(t.position));
+                let rotation = text_own_turn(fp, comp_rotation(slot), t.rotation);
                 fp.graphics.push(FpGraphic {
                     graphic_type: "text".into(),
                     layer: names.of(t.common.layer),
@@ -215,17 +281,19 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
                     text: t.text.clone(),
                     font_size: mm(t.height),
                     position: Some(pos),
-                    rotation: deg(t.rotation - comp_rotation(slot)),
+                    rotation,
                     ..fp_graphic_defaults()
                 });
             }
+            // Altium turns counter-clockwise with Y up; on the Y-down board
+            // the same visual turn is negative, as for footprints.
             None if !t.text.is_empty() => board.texts.push(BoardText {
                 uuid: Uuid::new_v4(),
                 text: t.text.clone(),
                 position: frame.world(t.position),
                 layer: names.of(t.common.layer),
                 font_size: mm(t.height),
-                rotation: deg(t.rotation),
+                rotation: deg(-t.rotation),
             }),
             None => {}
         }
@@ -236,14 +304,21 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
             .into_iter()
             .map(|p| frame.world(p))
             .collect();
-        if f.common.layer.is_copper() && !f.common.keepout {
+        if is_keepout(&f.common) {
+            board
+                .zones
+                .extend(keepout_area(&f.common, &pts, &names, &copper, report));
+        } else if f.common.layer.plane().is_some() {
+            report.warn(PLANE_VOID);
+            board.zones.push(plane_void(names.of(f.common.layer), pts));
+        } else if f.common.layer.is_copper() {
             board
                 .zones
                 .push(zone(doc, f.common.net, names.of(f.common.layer), pts));
         } else {
             board.graphics.push(BoardGraphic {
-                graphic_type: "polygon".into(),
-                layer: keepout_layer(&f.common, names.of(f.common.layer)),
+                graphic_type: "poly".into(),
+                layer: names.of(f.common.layer),
                 width: 0.0,
                 start: None,
                 end: None,
@@ -254,6 +329,13 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
         }
     }
 
+    let last_pour = doc
+        .polygons
+        .iter()
+        .filter_map(|poly| poly.params.i64("POURINDEX"))
+        .max()
+        .unwrap_or(0)
+        .max(0);
     for poly in &doc.polygons {
         let pts: Vec<Point> = outline(&poly.vertices)
             .into_iter()
@@ -264,25 +346,47 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
         }
         let hatch = poly.params.str("HATCHSTYLE");
         if !hatch.is_empty() && !hatch.eq_ignore_ascii_case("Solid") {
-            report.warn("hatched polygon pour imported as a solid zone");
+            report.warn("hatched polygon pour imported as a solid pour");
         }
-        let mut z = zone(doc, poly.net, names.of(poly.layer), pts);
-        z.priority = poly.params.i64("POURINDEX").unwrap_or(0).max(0) as u32;
-        board.zones.push(z);
+        board
+            .zones
+            .push(pour(doc, poly, last_pour, names.of(poly.layer), pts));
     }
+    board.zones.extend(plane_pours(
+        doc,
+        &names,
+        &board.outline,
+        &split_planes,
+        report,
+    ));
 
     for r in &p.regions {
-        // Poured copper belongs to its polygon (imported above), and
-        // footprint regions are custom pad shapes: only free regions are
-        // design data of their own.
-        if r.common.polygon.is_some() || r.common.component.is_some() {
+        let keepout = is_keepout(&r.common);
+        // Poured copper belongs to its polygon, imported above.
+        if r.common.polygon.is_some() && !keepout {
             continue;
         }
         let pts: Vec<Point> = r.outline.iter().map(|p| frame.world(*p)).collect();
         if pts.len() < 3 {
+            report.warn("region with fewer than 3 points not imported");
             continue;
         }
-        if r.common.layer.is_copper() && r.kind == 0 && !r.params.bool("ISBOARDCUTOUT") {
+        // A keepout region is a rule, also inside a footprint.
+        if keepout {
+            board
+                .zones
+                .extend(keepout_area(&r.common, &pts, &names, &copper, report));
+            continue;
+        }
+        if r.common.component.is_some() {
+            report.warn("footprint region (custom pad shape or footprint copper) not imported");
+            continue;
+        }
+        let solid = r.kind == 0 && !r.params.bool("ISBOARDCUTOUT");
+        if solid && r.common.layer.plane().is_some() {
+            report.warn(PLANE_VOID);
+            board.zones.push(plane_void(names.of(r.common.layer), pts));
+        } else if solid && r.common.layer.is_copper() {
             board
                 .zones
                 .push(zone(doc, r.common.net, names.of(r.common.layer), pts));
@@ -300,7 +404,101 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> PcbBoard {
             report.warn(format!("{what} not imported"));
         }
     }
-    board
+    names.report_unmapped(report);
+    Ok(board)
+}
+
+const SPLIT_LINE_DROPPED: &str = "plane split line not imported: the plane is one pour on its net";
+
+const SPLIT_PLANE_NETS_LOST: &str = "split plane written as one pour on its plane net: \
+     the plane areas of its other nets are lost";
+
+const PLANE_VOID: &str =
+    "fill or region on an internal plane imported as a void (keepout) in the plane's pour";
+
+const PULLBACK_NOT_APPLIED: &str =
+    "plane pullback could not be applied to the board outline; the plane pours to the board edge";
+
+/// A footprint text's own turn: Altium's turns are counter-clockwise with
+/// Y up, Signex's run the other way on its Y-down board, and on a
+/// bottom-side footprint (mirrored) the own turn counts the other way again.
+fn text_own_turn(fp: &Footprint, comp_rotation: f64, text_rotation: f64) -> f64 {
+    if fp.layer == "BottomCopper" {
+        deg(text_rotation - comp_rotation)
+    } else {
+        deg(comp_rotation - text_rotation)
+    }
+}
+
+/// Each internal plane as a pour over the board outline, pulled back from
+/// the edge by `PLANEnPULLBACK`, on the plane's net (`PLANEnNETNAME`), so
+/// Signex fills it; a plane with no net is written without one and
+/// reported. A split plane keeps only its plane net (reported).
+fn plane_pours(
+    doc: &PcbDoc,
+    names: &LayerNames,
+    outline: &[Point],
+    split_planes: &BTreeSet<u8>,
+    report: &mut Report,
+) -> Vec<Zone> {
+    let mut pours = Vec::new();
+    for (n, token) in &names.planes {
+        if outline.len() < 3 {
+            report.warn("plane not written: the board has no outline to pour it over");
+            continue;
+        }
+        if split_planes.contains(n) {
+            report.warn(SPLIT_PLANE_NETS_LOST);
+        }
+        let pullback = doc
+            .board
+            .params
+            .pcb_mils(&format!("PLANE{n}PULLBACK"))
+            .map_or(0.0, mm);
+        let net_name = doc.board.params.string(&format!("PLANE{n}NETNAME"));
+        let net = doc
+            .nets
+            .iter()
+            .position(|name| *name == net_name)
+            .and_then(|i| u16::try_from(i).ok());
+        if net.is_none() {
+            report.warn("plane with no net written as a pour without a net");
+        }
+        let area = pulled_back(outline, pullback, report);
+        let mut z = zone(doc, net, token.clone(), area);
+        z.fill_type = POUR_FILL.into();
+        z.clearance = 0.0;
+        pours.push(z);
+    }
+    pours
+}
+
+/// `outline` shrunk by `pullback` mm. An offset that collapses or turns
+/// the outline inside out is not applied, and reported.
+fn pulled_back(outline: &[Point], pullback: f64, report: &mut Report) -> Vec<Point> {
+    if pullback <= 0.0 {
+        return outline.to_vec();
+    }
+    let mut ring: Vec<Point2> = outline.iter().map(|p| Point2::new(p.x, p.y)).collect();
+    // The offset needs every edge to have a length: drop a closing repeat.
+    if let (Some(first), Some(last)) = (ring.first(), ring.last())
+        && ring.len() > 1
+        && first.distance(*last) < 1e-9
+    {
+        ring.pop();
+    }
+    let inner = offset_polygon(&ring, -pullback, CornerStyle::Miter { miter_limit: 4.0 });
+    let (before, after) = (signed_area(&ring), signed_area(&inner));
+    if inner.len() < 3 || before * after <= 0.0 || after.abs() >= before.abs() {
+        report.warn(PULLBACK_NOT_APPLIED);
+        return outline.to_vec();
+    }
+    inner.into_iter().map(|p| Point::new(p.x, p.y)).collect()
+}
+
+/// Whether an item is a keepout: flagged as one, or on the keep-out layer.
+fn is_keepout(c: &apcb::Common) -> bool {
+    c.keepout || c.layer == Layer::KEEP_OUT
 }
 
 /// Signex numbers nets from 1; 0 is "no net".
@@ -363,11 +561,52 @@ impl Frame {
 pub(crate) struct LayerNames {
     mech_names: HashMap<u8, String>,
     kinds: HashMap<u8, LayerKind>,
+    /// A board's copper layers by Altium id: top, the inner layers in stack
+    /// order (mid and plane layers alike) and bottom. Empty for a library.
+    copper: HashMap<u8, String>,
+    /// The copper stack top to bottom: token and whether it is a plane.
+    pub(crate) stack: Vec<(String, bool)>,
+    /// The internal planes in the stack: plane number and token.
+    pub(crate) planes: Vec<(u8, String)>,
+    /// Source layers with no Signex layer that items used, for the report.
+    unmapped: RefCell<BTreeSet<u8>>,
 }
 
 impl LayerNames {
-    fn new(doc: &PcbDoc) -> Self {
-        Self::from_params(&doc.board.params, &doc.layer_kinds)
+    /// A board's names: its copper stack numbered top to bottom as Signex
+    /// numbers it (`TopCopper`, `Inner1Copper`, .., `BottomCopper`), planes
+    /// in their stack place. A stack Signex cannot hold is refused.
+    fn for_doc(doc: &PcbDoc) -> Result<Self, ConvertError> {
+        let mut names = Self::from_params(&doc.board.params, &doc.layer_kinds);
+        let mut stack: Vec<Layer> = doc.board.copper_stack.iter().map(|(l, _)| *l).collect();
+        if stack.is_empty() {
+            stack = vec![Layer::TOP, Layer::BOTTOM];
+        }
+        if stack.len() > MAX_COPPER_LAYERS {
+            return Err(ConvertError::TooManyCopperLayers {
+                count: stack.len(),
+                max: MAX_COPPER_LAYERS,
+            });
+        }
+        let last = stack.len() - 1;
+        for (i, layer) in stack.iter().enumerate() {
+            let token = match i {
+                0 => "TopCopper".to_string(),
+                i if i == last => "BottomCopper".to_string(),
+                i => format!("Inner{i}Copper"),
+            };
+            names.copper.insert(layer.0, token.clone());
+            if let Some(n) = layer.plane() {
+                names.planes.push((n, token.clone()));
+            }
+            names.stack.push((token, layer.plane().is_some()));
+        }
+        Ok(names)
+    }
+
+    /// The board's copper tokens, top to bottom.
+    pub(crate) fn copper_tokens(&self) -> Vec<String> {
+        self.stack.iter().map(|(token, _)| token.clone()).collect()
     }
 
     /// From a header carrying `LAYERnNAME` (`Board6`, or a PcbLib's
@@ -385,10 +624,31 @@ impl LayerNames {
         Self {
             mech_names,
             kinds: kinds.clone(),
+            copper: HashMap::new(),
+            stack: Vec::new(),
+            planes: Vec::new(),
+            unmapped: RefCell::new(BTreeSet::new()),
         }
     }
 
+    /// One report line per source layer that had no Signex layer.
+    pub(crate) fn report_unmapped(&self, report: &mut Report) {
+        for n in self.unmapped.borrow().iter() {
+            report.warn(format!(
+                "source layer {n} has no Signex layer; its items are on Unmapped{n}"
+            ));
+        }
+    }
+
+    /// The token for `l`. Keepout items do not come here: they become
+    /// keepout zones (`crate::keepouts`), so the keep-out layer itself,
+    /// like any layer Signex has no name for, is reported as unmapped. On
+    /// a board, a mid or plane layer outside the copper stack is unmapped
+    /// too: its raw number could name a stack layer.
     pub(crate) fn of(&self, l: Layer) -> String {
+        if let Some(token) = self.copper.get(&l.0) {
+            return token.clone();
+        }
         match l {
             Layer::TOP => "TopCopper".into(),
             Layer::BOTTOM => "BottomCopper".into(),
@@ -398,19 +658,18 @@ impl LayerNames {
             Layer::BOTTOM_SOLDER => "BottomSolderMask".into(),
             Layer::TOP_PASTE => "TopPaste".into(),
             Layer::BOTTOM_PASTE => "BottomPaste".into(),
-            Layer::KEEP_OUT => "KeepOut".into(),
             Layer::MULTI_LAYER => "TopCopper".into(),
+            Layer::DRILL_DRAWING => "DrillDrawing".into(),
+            Layer::DRILL_GUIDE => "Notes".into(),
             _ => {
-                if let Some(n) = l.mid() {
+                if let Some(n) = l.mid().filter(|_| self.copper.is_empty()) {
+                    // A library has no stack: the mid number is all there is.
                     format!("Inner{n}Copper")
-                } else if let Some(n) = l.plane() {
-                    // Planes follow the 30 signal mid layers in Signex's
-                    // single inner numbering.
-                    format!("Inner{}Copper", 30 + u32::from(n))
                 } else if let Some(n) = l.mechanical() {
                     self.mechanical(n)
                 } else {
-                    format!("Altium{}", l.0)
+                    self.unmapped.borrow_mut().insert(l.0);
+                    format!("Unmapped{}", l.0)
                 }
             }
         }
@@ -446,10 +705,6 @@ impl LayerNames {
             format!("Mechanical{n}")
         }
     }
-}
-
-fn keepout_layer(c: &apcb::Common, layer: String) -> String {
-    if c.keepout { "KeepOut".into() } else { layer }
 }
 
 /// Text-record outline -> points, with arc edges flattened.
@@ -517,6 +772,32 @@ fn rect_corners(a: Pt, b: Pt, rotation: f64) -> Vec<Pt> {
         .collect()
 }
 
+/// The `fill_type` of a polygon pour, whose copper Signex computes.
+const POUR_FILL: &str = "pour";
+
+/// A polygon pour as a Signex pour: its net, its pour order as the
+/// priority, and the board's clearance rule (a 0 clearance defers to it);
+/// Signex refills it rather than taking the poured copper as drawn.
+///
+/// Altium pours the lowest `POURINDEX` first, and later pours give way to
+/// it; Signex fills the highest priority first. So the priority counts
+/// down from the board's last pour index: `last_pour - POURINDEX`.
+fn pour(
+    doc: &PcbDoc,
+    poly: &apcb::Polygon,
+    last_pour: i64,
+    layer: String,
+    outline: Vec<Point>,
+) -> Zone {
+    let mut z = zone(doc, poly.net, layer, outline);
+    z.fill_type = POUR_FILL.into();
+    let index = poly.params.i64("POURINDEX").unwrap_or(0).max(0);
+    z.priority = u32::try_from((last_pour - index).max(0)).unwrap_or(u32::MAX);
+    z.clearance = 0.0;
+    z
+}
+
+/// Solid copper exactly `outline` (a fill or a free copper region).
 fn zone(doc: &PcbDoc, net: Option<u16>, layer: String, outline: Vec<Point>) -> Zone {
     let (net, net_name) = pad_net(doc, net)
         .map(|n| (n.number, n.name))
@@ -545,10 +826,17 @@ fn rotate(v: Point, deg: f64) -> Point {
     Point::new(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
-/// World -> footprint-local, inverting `world = origin + R(rotation) * local`.
+/// World -> footprint-local, inverting Signex's placement
+/// `world = origin + R(rotation) * M * local`, where `M` mirrors x on a
+/// bottom-side footprint and is the identity on top.
 fn fp_local(fp: &Footprint, world: Point) -> Point {
     let d = Point::new(world.x - fp.position.x, world.y - fp.position.y);
     let l = rotate(d, -fp.rotation);
+    let l = if fp.layer == "BottomCopper" {
+        Point::new(-l.x, l.y)
+    } else {
+        l
+    };
     Point::new((l.x * 1e6).round() / 1e6, (l.y * 1e6).round() / 1e6)
 }
 
@@ -605,7 +893,6 @@ fn footprint(index: u16, c: &apcb::Component, doc: &PcbDoc, frame: &Frame) -> Fo
     let properties = [
         ("Description", c.description.as_str()),
         ("Source Library", c.source_library.as_str()),
-        ("Altium Unique ID", c.unique_id.as_str()),
     ]
     .into_iter()
     .filter(|(_, v)| !v.is_empty())
@@ -640,7 +927,7 @@ fn free_pad_holder(pad: &apcb::Pad, frame: &Frame) -> Footprint {
         uuid: Uuid::new_v4(),
         reference: String::new(),
         value: String::new(),
-        footprint_id: "altium:free-pad".into(),
+        footprint_id: FREE_PAD_FOOTPRINT.into(),
         position: frame.world(pad.position),
         rotation: 0.0,
         layer: "TopCopper".into(),
@@ -741,6 +1028,7 @@ fn convert_pad(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keepouts::KEEPOUT_FILL;
 
     #[test]
     fn fp_local_inverts_the_renderer_rotation() {
@@ -765,5 +1053,618 @@ mod tests {
         let pts = arc_polyline(Pt::new(0.0, 0.0), 10.0, 350.0, 10.0);
         assert_eq!(pts.len(), 3);
         assert!((pts[1].x - 10.0).abs() < 1e-9 && pts[1].y.abs() < 1e-9);
+    }
+
+    /// A one-component board: the component on `layer` at (1000, 2000) mil
+    /// turned by `rotation`, with one surface pad at (1100, 2050) mil.
+    fn one_pad_board(layer: Layer, rotation: f64) -> PcbDoc {
+        let component = apcb::Component {
+            layer,
+            position: Pt::new(1000.0, 2000.0),
+            rotation,
+            pattern: "SOT23".into(),
+            unique_id: "ABCDEFGH".into(),
+            ..Default::default()
+        };
+        let mut pad = apcb::Pad {
+            name: "1".into(),
+            position: Pt::new(1100.0, 2050.0),
+            size_top: Pt::new(20.0, 40.0),
+            size_bottom: Pt::new(20.0, 40.0),
+            rotation,
+            ..Default::default()
+        };
+        pad.common.component = Some(0);
+        pad.common.layer = layer;
+        PcbDoc {
+            components: vec![component],
+            primitives: apcb::Primitives {
+                pads: vec![pad],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Placed the way Signex places it, every pad lands 100 mil right of
+    /// and 50 mil above its component (Y down: +2.54 mm, -1.27 mm), on
+    /// either side and at every quarter turn.
+    #[test]
+    fn pads_land_where_the_source_puts_them_on_both_sides() {
+        for layer in [Layer::TOP, Layer::BOTTOM] {
+            for rotation in [0.0, 90.0, 180.0, 270.0] {
+                let board = convert(&one_pad_board(layer, rotation), &mut Report::default())
+                    .expect("converts");
+                let fp = &board.footprints[0];
+                let world = crate::check::signex_world(fp, fp.pads[0].position);
+                let (dx, dy) = (world.x - fp.position.x, world.y - fp.position.y);
+                assert!(
+                    (dx - 2.54).abs() < 1e-6 && (dy + 1.27).abs() < 1e-6,
+                    "{} at {rotation}: pad off by ({dx}, {dy})",
+                    fp.layer
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_bottom_pad_track_end_counts_on_its_own_pad() {
+        let mut doc = one_pad_board(Layer::BOTTOM, 90.0);
+        doc.nets = vec!["N1".into()];
+        doc.primitives.pads[0].common.net = Some(0);
+        doc.primitives.tracks.push(apcb::Track {
+            common: apcb::Common {
+                layer: Layer::BOTTOM,
+                net: Some(0),
+                ..Default::default()
+            },
+            a: Pt::new(1100.0, 2050.0),
+            b: Pt::new(1300.0, 2050.0),
+            width: 10.0,
+        });
+        let board = convert(&doc, &mut Report::default()).expect("converts");
+        let check = crate::check::track_ends(&board);
+        assert_eq!(check.ends, 2);
+        assert_eq!(check.on_own_net_pad, 1);
+        assert_eq!(check.on_other_net_pad, 0);
+    }
+
+    #[test]
+    fn output_names_no_source_tool() {
+        let mut doc = one_pad_board(Layer::TOP, 0.0);
+        // A free pad, and a track on a layer Signex has no name for.
+        let mut free = doc.primitives.pads[0].clone();
+        free.common.component = None;
+        doc.primitives.pads.push(free);
+        doc.primitives.tracks.push(apcb::Track {
+            common: apcb::Common {
+                layer: Layer(80),
+                ..Default::default()
+            },
+            a: Pt::new(0.0, 0.0),
+            b: Pt::new(100.0, 0.0),
+            width: 10.0,
+        });
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report).expect("converts");
+        assert_eq!(board.generator, crate::GENERATOR);
+        assert!(
+            board
+                .footprints
+                .iter()
+                .any(|f| f.footprint_id == FREE_PAD_FOOTPRINT)
+        );
+        assert!(board.graphics.iter().any(|g| g.layer == "Unmapped80"));
+        assert!(
+            board.footprints[0]
+                .properties
+                .iter()
+                .all(|p| !p.key.to_ascii_lowercase().contains("unique"))
+        );
+        let text = signex_types::format::SnxPcb::new(board)
+            .write_string()
+            .expect("writes");
+        assert!(!text.to_ascii_lowercase().contains("altium"), "{text}");
+        let messages: Vec<&str> = report.entries().map(|(m, _)| m).collect();
+        assert!(
+            messages.contains(&"source layer 80 has no Signex layer; its items are on Unmapped80")
+        );
+        assert!(messages.contains(&"source-tool component unique id dropped"));
+    }
+
+    #[test]
+    fn the_drill_layers_map_to_signex_layers() {
+        let names = LayerNames::from_params(&Default::default(), &HashMap::new());
+        assert_eq!(names.of(Layer::DRILL_DRAWING), "DrillDrawing");
+        assert_eq!(names.of(Layer::DRILL_GUIDE), "Notes");
+        let mut report = Report::default();
+        names.report_unmapped(&mut report);
+        assert!(report.is_empty());
+    }
+
+    /// A doc whose copper stack is `stack`, top to bottom.
+    fn stacked(stack: &[Layer]) -> PcbDoc {
+        let mut doc = PcbDoc::default();
+        doc.board.copper_stack = stack.iter().map(|l| (*l, String::new())).collect();
+        doc
+    }
+
+    #[test]
+    fn planes_take_their_stack_place_among_the_inner_layers() {
+        let (mid1, plane1, plane2) = (Layer(2), Layer(39), Layer(40));
+        let mut doc = stacked(&[Layer::TOP, plane1, mid1, plane2, Layer::BOTTOM]);
+        doc.primitives.tracks.push(apcb::Track {
+            common: apcb::Common {
+                layer: mid1,
+                ..Default::default()
+            },
+            a: Pt::new(0.0, 0.0),
+            b: Pt::new(100.0, 0.0),
+            width: 10.0,
+        });
+        let board = convert(&doc, &mut Report::default()).expect("converts");
+        let layers: Vec<(&str, &str)> = board
+            .layers
+            .iter()
+            .map(|l| (l.name.as_str(), l.layer_type.as_str()))
+            .collect();
+        assert_eq!(
+            layers,
+            [
+                ("TopCopper", "signal"),
+                ("Inner1Copper", "plane"),
+                ("Inner2Copper", "signal"),
+                ("Inner3Copper", "plane"),
+                ("BottomCopper", "signal"),
+            ]
+        );
+        assert_eq!(board.segments[0].layer, "Inner2Copper");
+    }
+
+    #[test]
+    fn a_stack_past_the_signex_limit_is_refused() {
+        let mut stack = vec![Layer::TOP];
+        stack.extend((2..=31u8).map(Layer));
+        stack.extend((39..=41u8).map(Layer));
+        stack.push(Layer::BOTTOM);
+        assert_eq!(stack.len(), 35);
+        let err = convert(&stacked(&stack), &mut Report::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConvertError::TooManyCopperLayers { count: 35, max: 32 }
+        ));
+        let mut fits = vec![Layer::TOP];
+        fits.extend((2..=31u8).map(Layer));
+        fits.push(Layer::BOTTOM);
+        let board = convert(&stacked(&fits), &mut Report::default()).expect("32 layers fit");
+        assert_eq!(board.layers[30].name, "Inner30Copper");
+    }
+
+    #[test]
+    fn keepouts_become_keepout_zones_on_the_copper_they_keep_clear() {
+        let mut doc = stacked(&[Layer::TOP, Layer(39), Layer::BOTTOM]);
+        let square = vec![
+            Pt::new(0.0, 0.0),
+            Pt::new(100.0, 0.0),
+            Pt::new(100.0, 100.0),
+            Pt::new(0.0, 100.0),
+        ];
+        // A keepout region on the keep-out layer: every copper layer.
+        doc.primitives.regions.push(apcb::Region {
+            common: apcb::Common {
+                layer: Layer::KEEP_OUT,
+                ..Default::default()
+            },
+            outline: square.clone(),
+            ..Default::default()
+        });
+        // A fill flagged keepout on the bottom: that layer only.
+        doc.primitives.fills.push(apcb::Fill {
+            common: apcb::Common {
+                layer: Layer::BOTTOM,
+                keepout: true,
+                ..Default::default()
+            },
+            a: Pt::new(0.0, 0.0),
+            b: Pt::new(50.0, 50.0),
+            rotation: 0.0,
+        });
+        // A keepout line on the keep-out layer: a thin keepout on every
+        // copper layer.
+        doc.primitives.tracks.push(apcb::Track {
+            common: apcb::Common {
+                layer: Layer::KEEP_OUT,
+                ..Default::default()
+            },
+            a: Pt::new(0.0, 0.0),
+            b: Pt::new(100.0, 0.0),
+            width: 10.0,
+        });
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report).expect("converts");
+        let keepouts: Vec<&str> = board
+            .zones
+            .iter()
+            .filter(|z| z.fill_type == KEEPOUT_FILL)
+            .map(|z| z.layer.as_str())
+            .collect();
+        // Tracks convert first, then fills, then regions.
+        assert_eq!(
+            keepouts,
+            [
+                "TopCopper",
+                "Inner1Copper",
+                "BottomCopper",
+                "BottomCopper",
+                "TopCopper",
+                "Inner1Copper",
+                "BottomCopper"
+            ]
+        );
+        assert!(board.graphics.is_empty());
+        let text = signex_types::format::SnxPcb::new(board)
+            .write_string()
+            .expect("writes");
+        assert!(!text.contains("KeepOut"), "{text}");
+    }
+
+    #[test]
+    fn polygon_pours_are_refilled_pours_and_fills_stay_solid() {
+        let mut doc = stacked(&[Layer::TOP, Layer::BOTTOM]);
+        doc.nets = vec!["GND".into()];
+        let corner = |x: f64, y: f64| Vertex {
+            at: Pt::new(x, y),
+            arc: None,
+        };
+        doc.polygons.push(apcb::Polygon {
+            layer: Layer::BOTTOM,
+            net: Some(0),
+            vertices: vec![
+                corner(0.0, 0.0),
+                corner(1000.0, 0.0),
+                corner(1000.0, 1000.0),
+                corner(0.0, 1000.0),
+            ],
+            params: altium_format::Params::parse(b"|POURINDEX=3|"),
+        });
+        // Poured first in the source, so it wins: the higher priority.
+        doc.polygons.push(apcb::Polygon {
+            layer: Layer::BOTTOM,
+            net: None,
+            vertices: vec![
+                corner(100.0, 100.0),
+                corner(200.0, 100.0),
+                corner(200.0, 200.0),
+            ],
+            params: altium_format::Params::parse(b"|POURINDEX=1|"),
+        });
+        doc.primitives.fills.push(apcb::Fill {
+            common: apcb::Common {
+                layer: Layer::TOP,
+                net: Some(0),
+                ..Default::default()
+            },
+            a: Pt::new(0.0, 0.0),
+            b: Pt::new(100.0, 100.0),
+            rotation: 0.0,
+        });
+        let board = convert(&doc, &mut Report::default()).expect("converts");
+        let pours: Vec<&Zone> = board
+            .zones
+            .iter()
+            .filter(|z| z.layer == "BottomCopper")
+            .collect();
+        assert_eq!(pours.len(), 2);
+        let (later, first) = (pours[0], pours[1]);
+        assert_eq!(later.fill_type, POUR_FILL);
+        assert_eq!((later.net, later.net_name.as_str()), (1, "GND"));
+        assert_eq!((later.priority, first.priority), (0, 2));
+        assert_eq!(later.clearance, 0.0, "a pour defers to the board clearance");
+        let fill = board
+            .zones
+            .iter()
+            .find(|z| z.layer == "TopCopper")
+            .expect("the fill");
+        assert_eq!(fill.fill_type, "solid");
+    }
+
+    fn square(size: f64) -> Vec<Vertex> {
+        [(0.0, 0.0), (size, 0.0), (size, size), (0.0, size)]
+            .iter()
+            .map(|&(x, y)| Vertex {
+                at: Pt::new(x, y),
+                arc: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_plane_is_a_pour_over_the_board_and_its_split_lines_are_reported() {
+        let plane = Layer(39);
+        let mut doc = stacked(&[Layer::TOP, plane, Layer::BOTTOM]);
+        doc.board.outline = square(1000.0);
+        doc.board.params = altium_format::Params::parse(b"|PLANE1NETNAME=GND|");
+        doc.nets = vec!["VCC".into(), "GND".into()];
+        doc.primitives.tracks.push(apcb::Track {
+            common: apcb::Common {
+                layer: plane,
+                ..Default::default()
+            },
+            a: Pt::new(500.0, 0.0),
+            b: Pt::new(500.0, 1000.0),
+            width: 20.0,
+        });
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report).expect("converts");
+        assert!(board.segments.is_empty(), "a split line is not copper");
+        let pour = board
+            .zones
+            .iter()
+            .find(|z| z.layer == "Inner1Copper")
+            .expect("the plane pour");
+        assert_eq!(pour.fill_type, POUR_FILL);
+        assert_eq!((pour.net, pour.net_name.as_str()), (2, "GND"));
+        assert_eq!(pour.outline.len(), 4);
+        assert!(
+            report
+                .entries()
+                .any(|(m, n)| m == SPLIT_LINE_DROPPED && n == 1)
+        );
+        assert!(
+            report
+                .entries()
+                .any(|(m, n)| m == SPLIT_PLANE_NETS_LOST && n == 1)
+        );
+    }
+
+    #[test]
+    fn a_plane_pour_is_pulled_back_from_the_board_edge() {
+        let mut doc = stacked(&[Layer::TOP, Layer(39), Layer::BOTTOM]);
+        doc.board.outline = square(1000.0);
+        doc.board.params =
+            altium_format::Params::parse(b"|PLANE1NETNAME=GND|PLANE1PULLBACK=20mil|");
+        doc.nets = vec!["GND".into()];
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report).expect("converts");
+        let pour = board
+            .zones
+            .iter()
+            .find(|z| z.layer == "Inner1Copper")
+            .expect("the plane pour");
+        assert_eq!(pour.outline.len(), 4);
+        // 20 mil = 0.508 mm in from each side of the 25.4 mm board.
+        for p in &pour.outline {
+            for v in [p.x, p.y] {
+                let edge = v.min(25.4 - v);
+                assert!((edge - 0.508).abs() < 1e-6, "{p:?}");
+            }
+        }
+        assert!(report.entries().all(|(m, _)| m != PULLBACK_NOT_APPLIED));
+    }
+
+    #[test]
+    fn fills_and_free_regions_on_a_plane_are_voids_in_its_pour() {
+        let plane = Layer(39);
+        let mut doc = stacked(&[Layer::TOP, plane, Layer::BOTTOM]);
+        doc.board.outline = square(1000.0);
+        doc.board.params = altium_format::Params::parse(b"|PLANE1NETNAME=GND|");
+        doc.nets = vec!["GND".into()];
+        doc.primitives.fills.push(apcb::Fill {
+            common: apcb::Common {
+                layer: plane,
+                net: Some(0),
+                ..Default::default()
+            },
+            a: Pt::new(100.0, 100.0),
+            b: Pt::new(200.0, 200.0),
+            rotation: 0.0,
+        });
+        doc.primitives.regions.push(apcb::Region {
+            common: apcb::Common {
+                layer: plane,
+                ..Default::default()
+            },
+            outline: vec![
+                Pt::new(300.0, 300.0),
+                Pt::new(400.0, 300.0),
+                Pt::new(400.0, 400.0),
+            ],
+            ..Default::default()
+        });
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report).expect("converts");
+        let on_plane: Vec<&str> = board
+            .zones
+            .iter()
+            .filter(|z| z.layer == "Inner1Copper")
+            .map(|z| z.fill_type.as_str())
+            .collect();
+        assert_eq!(on_plane, [KEEPOUT_FILL, POUR_FILL, KEEPOUT_FILL]);
+        assert!(board.zones.iter().all(|z| z.fill_type != "solid"));
+        assert!(report.entries().any(|(m, n)| m == PLANE_VOID && n == 2));
+    }
+
+    #[test]
+    fn a_board_mid_layer_outside_the_stack_is_unmapped() {
+        // Mid 2 is the board's only inner layer, so it is Inner1Copper;
+        // mid 1 is not in the stack and must not borrow that name.
+        let mut doc = stacked(&[Layer::TOP, Layer(3), Layer::BOTTOM]);
+        doc.primitives.tracks.push(apcb::Track {
+            common: apcb::Common {
+                layer: Layer(2),
+                ..Default::default()
+            },
+            a: Pt::new(0.0, 0.0),
+            b: Pt::new(100.0, 0.0),
+            width: 10.0,
+        });
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report).expect("converts");
+        assert_eq!(board.segments[0].layer, "Unmapped2");
+        assert!(
+            report
+                .entries()
+                .any(|(m, _)| m == "source layer 2 has no Signex layer; its items are on Unmapped2")
+        );
+        // A library has no stack: the mid number names the layer.
+        let names = LayerNames::from_params(&Default::default(), &HashMap::new());
+        assert_eq!(names.of(Layer(2)), "Inner1Copper");
+    }
+
+    #[test]
+    fn short_regions_and_footprint_regions_are_reported() {
+        let mut doc = one_pad_board(Layer::TOP, 0.0);
+        doc.primitives.regions.push(apcb::Region {
+            common: apcb::Common {
+                layer: Layer::TOP,
+                ..Default::default()
+            },
+            outline: vec![Pt::new(0.0, 0.0), Pt::new(100.0, 0.0)],
+            ..Default::default()
+        });
+        doc.primitives.regions.push(apcb::Region {
+            common: apcb::Common {
+                layer: Layer::TOP,
+                component: Some(0),
+                ..Default::default()
+            },
+            outline: vec![
+                Pt::new(950.0, 1950.0),
+                Pt::new(1050.0, 1950.0),
+                Pt::new(1050.0, 2050.0),
+            ],
+            ..Default::default()
+        });
+        let mut report = Report::default();
+        let board = convert(&doc, &mut report).expect("converts");
+        assert!(board.zones.is_empty());
+        let messages: Vec<&str> = report.entries().map(|(m, _)| m).collect();
+        assert!(messages.contains(&"region with fewer than 3 points not imported"));
+        assert!(
+            messages
+                .contains(&"footprint region (custom pad shape or footprint copper) not imported")
+        );
+    }
+
+    /// A board arc read from start to end with the angle rising, in the
+    /// Y-down board frame, passes through the source arc's middle.
+    #[test]
+    fn a_board_arc_keeps_its_direction_through_the_y_flip() {
+        let mut doc = stacked(&[Layer::TOP, Layer::BOTTOM]);
+        doc.primitives.arcs.push(apcb::Arc {
+            common: apcb::Common {
+                layer: Layer::TOP_OVERLAY,
+                ..Default::default()
+            },
+            center: Pt::new(500.0, 500.0),
+            radius: 100.0,
+            start: 0.0,
+            end: 90.0,
+            width: 10.0,
+        });
+        let board = convert(&doc, &mut Report::default()).expect("converts");
+        let g = &board.graphics[0];
+        let (c, s, e) = (
+            g.center.expect("center"),
+            g.start.expect("start"),
+            g.end.expect("end"),
+        );
+        let a_s = (s.y - c.y).atan2(s.x - c.x);
+        let a_e = (e.y - c.y).atan2(e.x - c.x);
+        let mid = a_s + (a_e - a_s).rem_euclid(std::f64::consts::TAU) / 2.0;
+        let drawn = Point::new(c.x + g.radius * mid.cos(), c.y + g.radius * mid.sin());
+        let source_mid = on_arc(Pt::new(500.0, 500.0), 100.0, 45.0);
+        let frame = Frame::for_doc(&doc);
+        let want = frame.world(source_mid);
+        assert!(
+            (drawn.x - want.x).abs() < 1e-4 && (drawn.y - want.y).abs() < 1e-4,
+            "drawn {drawn:?}, source middle {want:?}"
+        );
+    }
+
+    #[test]
+    fn a_footprint_keepout_region_is_kept() {
+        let mut doc = one_pad_board(Layer::TOP, 0.0);
+        doc.primitives.regions.push(apcb::Region {
+            common: apcb::Common {
+                layer: Layer::TOP,
+                keepout: true,
+                component: Some(0),
+                ..Default::default()
+            },
+            outline: vec![
+                Pt::new(950.0, 1950.0),
+                Pt::new(1050.0, 1950.0),
+                Pt::new(1050.0, 2050.0),
+            ],
+            ..Default::default()
+        });
+        let board = convert(&doc, &mut Report::default()).expect("converts");
+        assert!(board.zones.iter().any(|z| z.fill_type == KEEPOUT_FILL));
+    }
+
+    #[test]
+    fn texts_turn_the_signex_way_on_both_sides() {
+        for layer in [Layer::TOP, Layer::BOTTOM] {
+            let mut doc = one_pad_board(layer, 30.0);
+            doc.primitives.texts.push(apcb::Text {
+                common: apcb::Common {
+                    layer: Layer::TOP_OVERLAY,
+                    component: Some(0),
+                    ..Default::default()
+                },
+                position: Pt::new(1000.0, 2000.0),
+                rotation: 75.0,
+                text: "note".into(),
+                ..Default::default()
+            });
+            doc.primitives.texts.push(apcb::Text {
+                common: apcb::Common {
+                    layer: Layer::TOP_OVERLAY,
+                    ..Default::default()
+                },
+                position: Pt::new(0.0, 0.0),
+                rotation: 75.0,
+                text: "board".into(),
+                ..Default::default()
+            });
+            let board = convert(&doc, &mut Report::default()).expect("converts");
+            let fp = &board.footprints[0];
+            let own = fp.graphics.iter().find(|g| g.text == "note").expect("text");
+            // Signex draws it at the footprint's turn plus its own on top,
+            // minus its own on the bottom: the source's 75 degrees, negated.
+            let drawn = if fp.layer == "BottomCopper" {
+                fp.rotation - own.rotation
+            } else {
+                fp.rotation + own.rotation
+            };
+            assert!(
+                (deg(drawn) - deg(-75.0)).abs() < 1e-9,
+                "{}: {drawn}",
+                fp.layer
+            );
+            assert_eq!(board.texts[0].rotation, deg(-75.0));
+        }
+    }
+
+    /// An asymmetric pad turned a quarter turn against its bottom-side part
+    /// keeps its board position and the direction of its long side.
+    #[test]
+    fn a_turned_asymmetric_pad_on_a_bottom_part_keeps_its_long_side() {
+        let mut doc = one_pad_board(Layer::BOTTOM, 30.0);
+        doc.primitives.pads[0].rotation = 120.0;
+        let board = convert(&doc, &mut Report::default()).expect("converts");
+        let fp = &board.footprints[0];
+        let pad = &fp.pads[0];
+        // 20 x 40 mil turned a quarter turn against the part: written swapped.
+        assert!((pad.size.x - 1.016).abs() < 1e-9 && (pad.size.y - 0.508).abs() < 1e-9);
+        // The long side runs along the pad's x axis, at the bottom part's
+        // turn: Signex 330 degrees, the same line as the source's 210
+        // degrees (Y up) seen Y down, 150 degrees.
+        let long_side = deg(fp.rotation) % 180.0;
+        assert!((long_side - 150.0).abs() < 1e-9, "{long_side}");
+        let world = crate::check::signex_world(fp, pad.position);
+        assert!((world.x - fp.position.x - 2.54).abs() < 1e-6);
+        assert!((world.y - fp.position.y + 1.27).abs() < 1e-6);
     }
 }

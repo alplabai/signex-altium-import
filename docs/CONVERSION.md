@@ -13,10 +13,20 @@ Each approximation is also counted in the run's report.
   `SymbolTransform` then reproduces every point exactly; the unit tests
   check all 8 rotation and mirror combinations. Identical symbols share
   one `lib_symbol`. A library reference whose geometry differs between
-  placements gets numbered variants (`altium:R~2`).
+  placements gets numbered variants (`import:R~2`).
 - **PCB:** mils, Y up, absolute coordinates map to mm, Y down, with the
   board outline's top-left at (0, 0). Pads and footprint graphics are
-  footprint-local, matching how the Signex renderer places them.
+  footprint-local, matching how the Signex renderer places them: Signex
+  mirrors local x on a bottom-side footprint, so the local coordinates
+  written for one undo that mirror as well as the footprint's turn.
+- **Turns:** Altium turns counter-clockwise with Y up; on Signex's Y-down
+  board the same visual turn is negative. A footprint's turn `c` becomes
+  `-c`, a free text's turn `t` becomes `-t`, and a text inside a footprint
+  gets the own turn `c - t` on top and `t - c` on the bottom (where
+  Signex counts own turns the other way).
+- **Names:** the output names no source tool. The generator is
+  `signex-import`, a symbol's library id is `import:<library reference>`,
+  and a free pad's holder footprint is `import:free-pad`.
 - **Lengths** are rounded to 10 nm. Altium's internal unit is 2.54 nm, so
   rounding recovers mm-designed values exactly.
 
@@ -77,14 +87,24 @@ order and names.
 
 | Altium | Signex |
 |---|---|
-| Component | `Footprint`, rotation negated for the Y flip. Designator and comment come from its special strings. |
+| Component | `Footprint`, rotation negated for the Y flip. Designator and comment come from its special strings; the component's unique id is dropped (reported). |
 | Pad | `Pad`. Plated and drilled → thru, unplated → np-thru, otherwise SMD. Rounded-rectangle radius → `roundrect_ratio` = percent / 200. |
+| Copper layers | The board's stack top to bottom: `TopCopper`, `Inner1Copper` .. in stack order (mid layers and internal planes alike), `BottomCopper`; planes are typed `plane`. A board of more than 32 copper layers is refused. A mid or plane layer outside the stack is `Unmapped<n>` (reported); only a library, which has no stack, names a mid layer `Inner<n>Copper` by its number. |
+| Internal plane | A pour (`fill_type = "pour"`) over the board outline, pulled back from the edge by `PLANEnPULLBACK`, on the plane's net (`PLANEnNETNAME`); a plane with no net is written without one (reported). Split lines on a plane are reported, not imported: a split plane is one pour on its plane net, and the plane areas of its other nets are lost (reported). |
+| Fill or free region on an internal plane | A void in the plane's pour: a keepout zone on that plane (reported) |
 | Track on copper | `Segment`. Tracks on other layers become board or footprint graphics. |
 | Arc on copper | Straight segments, 10° per chord (reported). Other arcs become graphics. |
 | Via | `Via`. Blind or buried when it does not span top to bottom. |
-| Polygon pour | `Zone` with the polygon's outline. The pour is recomputed by Signex. |
-| Fill on copper, free copper region | `Zone` |
+| Polygon pour | A pour (`fill_type = "pour"`) with the polygon's outline and net; Signex refills it. Altium pours the lowest `POURINDEX` first, Signex fills the highest priority first, so priority = the board's last pour index − `POURINDEX`. The clearance defers to the board's rule. |
+| Fill on copper, free copper region | Solid copper (`fill_type = "solid"`) |
+| Fill on another layer | A `poly` board drawing |
+| Keepout fill or region (flagged keepout, or on the keep-out layer, also inside a footprint) | Keepout zones (`fill_type = "keepout"`): one per copper layer for the keep-out layer, else on the item's own copper layer. Per-object restrictions (tracks, vias, pads) become a keepout of all copper, and a footprint's keepout becomes a board keepout that does not move with the footprint; both are reported. |
+| Keepout lines and arcs | A keepout line keeps copper clear along the line only: each segment (each 10° chord of an arc) becomes a thin keepout zone at the line's width with round ends, on the layers a keepout region would use. A closed loop of keepout lines keeps its inside free. A line with no width is reported, not imported. |
+| Region with fewer than 3 points, footprint region that is not a keepout | Reported, not imported |
+| Arc on another layer, outside a footprint | A board arc from start to end with the angle rising in the Y-down board frame, so start and end swap for the Y flip |
 | Mechanical layer | Courtyard, assembly (`*Fab`) or outline by its name, else `MechanicalN` |
+| Drill drawing, drill guide | `DrillDrawing`, `Notes` |
+| Any other layer | `Unmapped<n>`, reported |
 | Board shape | board outline (arc edges flattened) |
 
 **Approximations:**
@@ -96,3 +116,16 @@ order and names.
 
 **Not imported:** 3D bodies, dimensions, board cutouts, design rules and
 classes. Recheck clearances in Signex before you send a board out.
+
+## Output
+
+The command converts every document of a project before it writes any of
+them, so a board that is refused writes nothing. An I/O error while
+writing can still leave the files written before it. A single board
+(`.PcbDoc`) also reports a placement self-check in `--json`: how many
+track ends land on a pad of their own net and how many only on another
+net's pad (see `docs/APP_INTEGRATION.md`).
+
+The vendored Signex types are still those of the format's 1.1 revision
+(no pad rotation column, no `remove_dead_islands`); moving them to 1.4 is
+a follow-up.
