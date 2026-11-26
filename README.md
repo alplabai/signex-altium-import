@@ -37,6 +37,20 @@ before trusting an imported board for fabrication.
 --json                             machine-readable summary (used by Signex)
 ```
 
+### Library converter
+
+Signex also drives the binary as a library converter (contract in
+[docs/APP_INTEGRATION.md](docs/APP_INTEGRATION.md)):
+
+```bash
+signex-altium-import describe --json
+signex-altium-import library Passives.SchLib Passives.PcbLib --output out/Passives --dry-run --progress
+```
+
+`library` writes `import-report.json` and `import-report.md` into `--output`
+and exits 0 (ok), 2 (partial) or 1 (failed). Writing the Signex library
+itself is not available yet; `--dry-run` gives the report preview.
+
 ## Install
 
 Download the archive for your platform from

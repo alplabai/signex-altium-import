@@ -45,3 +45,39 @@ input), `null` otherwise: `{ "total", "on_own_net_pad",
 "on_other_net_pad" }`, counting track ends that land on a netted pad with
 copper on the track's layer. Ends on another net's pad should be about
 zero; many mean pads were placed wrong.
+
+## Library converter contract
+
+Besides the single-file import above, the binary is a Signex *library
+converter*. The authoritative contract is
+`docs/LIBRARY_CONVERTER_CONTRACT.md` in the
+[Signex repository](https://github.com/alplabai/signex) (version `1.0`), with
+a JSON Schema beside it; this section only says how this binary meets it. The
+single-file contract above is unchanged.
+
+```text
+signex-altium-import describe --json
+signex-altium-import library <input>... --output <dir>
+    [--name <name>] [--library-id <uuid>] [--db <path>] [--search-path <dir>]...
+    [--map <mapping.toml>] [--models include|skip] [--models-dir <dir>]
+    [--dry-run] [--update] [--json] [--progress]
+```
+
+- `describe` lists the inputs: `schlib`, `pcblib`, `intlib` (kind `library`)
+  and `dblib` (kind `database`).
+- `library` runs read, convert and write phases. `--progress` streams NDJSON
+  events, flushed per line, with a heartbeat at least every 10 s; the
+  `summary` event is always last and implies `--json`.
+- Every run that read its inputs writes `import-report.json` and
+  `import-report.md` into `--output`; codes are catalogued in
+  `docs/CONVERSION.md` ("Report codes").
+- Exit codes: 0 `ok`, 2 `partial` (something was dropped or not written), 1
+  `failed`. An unknown option, a bad value or an unusable `--output` exits 1
+  with a failed summary on stdout, even without `--json`.
+
+Status: reading `.SchLib` and `.PcbLib`, option validation, progress, the
+report and the summary are in place, and `--dry-run` works end to end. Writing
+the `.snxlib` itself is not: a run without `--dry-run` writes the report and
+fails with `library output not implemented yet`. `.IntLib`, `.DbLib` and
+folder inputs are advertised by `describe` but refused until their readers
+land. In a dry run the summary's `files` is empty and `counts` are zero.

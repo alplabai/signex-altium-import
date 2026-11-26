@@ -121,7 +121,11 @@ fn pin(p: &APin, report: &mut Report) -> SymbolPin {
     pin.outside_edge_symbol = edge_symbol(p.symbols.outer_edge, report);
     for code in [p.symbols.inside, p.symbols.outside] {
         if code != 0 {
-            report.warn(format!("pin IEEE symbol code {code} not mapped"));
+            report.warn_detail(
+                "symbol.pin_ieee_unmapped",
+                format!("pin IEEE symbol code {code} not mapped"),
+                serde_json::json!({ "ieee_code": code }),
+            );
         }
     }
     pin
@@ -134,7 +138,11 @@ fn edge_symbol(code: u8, report: &mut Report) -> PinSymbolKind {
         PinSymbols::DOT => PinSymbolKind::Dot,
         PinSymbols::CLOCK => PinSymbolKind::ClockEdge,
         other => {
-            report.warn(format!("pin IEEE symbol code {other} not mapped"));
+            report.warn_detail(
+                "symbol.pin_ieee_unmapped",
+                format!("pin IEEE symbol code {other} not mapped"),
+                serde_json::json!({ "ieee_code": other }),
+            );
             PinSymbolKind::None
         }
     }
@@ -163,7 +171,10 @@ fn graphics(shape: &Shape, part_number: u8, report: &mut Report) -> Vec<SymbolGr
         Shape::Line { a, b, width } => vec![g(line(*a, *b), *width, false)],
         Shape::Polyline { points, width } => lines(points, *width),
         Shape::Bezier { points, width } => {
-            report.warn("symbol bezier imported as its control polygon");
+            report.warn(
+                "symbol.bezier_polygon",
+                "symbol bezier imported as its control polygon",
+            );
             lines(points, *width)
         }
         Shape::Polygon {
@@ -197,7 +208,10 @@ fn graphics(shape: &Shape, part_number: u8, report: &mut Report) -> Vec<SymbolGr
             filled,
             ..
         } => {
-            report.warn("rounded rectangle imported with square corners");
+            report.warn(
+                "symbol.rounded_rect_square",
+                "rounded rectangle imported with square corners",
+            );
             vec![g(
                 SymbolGraphicKind::Rectangle {
                     from: xy(*a),
@@ -334,11 +348,15 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
             Some(Slot::FabBottom) => fp.fab_b.push(g),
             // Lines and arcs on a courtyard layer build the outline;
             // anything else there (text) has no place in it.
-            Some(Slot::Courtyard) => report.warn("text on a courtyard layer not imported"),
-            None => report.warn(format!(
-                "footprint graphic on {} not imported",
-                names.of(layer)
-            )),
+            Some(Slot::Courtyard) => report.warn(
+                "footprint.courtyard_text_dropped",
+                "text on a courtyard layer not imported",
+            ),
+            None => report.warn_detail(
+                "footprint.graphic_layer_unmapped",
+                format!("footprint graphic on {} not imported", names.of(layer)),
+                serde_json::json!({ "layer": names.of(layer).to_string() }),
+            ),
         }
     };
 
@@ -348,7 +366,10 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
             continue;
         }
         if t.common.layer.is_copper() {
-            report.warn("copper track inside a library footprint not imported");
+            report.warn(
+                "footprint.copper_track_dropped",
+                "copper track inside a library footprint not imported",
+            );
             continue;
         }
         let g = FpGraphic {
@@ -405,16 +426,25 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
         push(&mut fp, t.common.layer, g, report);
     }
     for _ in &p.fills {
-        report.warn("fill inside a library footprint not imported");
+        report.warn(
+            "footprint.fill_dropped",
+            "fill inside a library footprint not imported",
+        );
     }
     for _ in &p.regions {
-        report.warn("region inside a library footprint (custom pad shape) not imported");
+        report.warn(
+            "footprint.region_dropped",
+            "region inside a library footprint (custom pad shape) not imported",
+        );
     }
     if !courtyard.is_empty() {
         match chain(&courtyard) {
             Some(points) => fp.courtyard = Polygon::new(points),
             None => {
-                report.warn("open courtyard outline replaced by its bounding box");
+                report.warn(
+                    "footprint.courtyard_open_bbox",
+                    "open courtyard outline replaced by its bounding box",
+                );
                 fp.courtyard = Polygon::new(bounding_box(&courtyard));
             }
         }
@@ -497,7 +527,10 @@ fn pad(p: &apcb::Pad, report: &mut Report) -> Pad {
             radius_ratio: f64::from(p.corner_radius_pct.min(100)) / 200.0,
         },
         APadShape::Octagonal => {
-            report.warn("octagonal pad imported as a rectangle");
+            report.warn(
+                "footprint.pad_octagon_rect",
+                "octagonal pad imported as a rectangle",
+            );
             PadShape::Rect
         }
     };

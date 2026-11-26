@@ -10,6 +10,11 @@
 //! Signex's File > Import > Altium Project runs this binary and reads the
 //! `--json` summary; `docs/APP_INTEGRATION.md` is that contract.
 
+mod contract;
+mod library_cmd;
+mod progress;
+mod report_doc;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -28,7 +33,8 @@ use signex_types::project::{ProjectData, SheetEntry};
 #[command(
     name = "signex-altium-import",
     version,
-    about = "Convert Altium Designer files (.PrjPcb / .SchDoc / .PcbDoc / .SchLib / .PcbLib) to Signex native files"
+    about = "Convert Altium Designer files (.PrjPcb / .SchDoc / .PcbDoc / .SchLib / .PcbLib) to Signex native files",
+    after_help = "Library converter commands (see docs/APP_INTEGRATION.md):\n  describe --json                         describe this converter\n  library <input>... --output <dir> ...   convert libraries into one Signex library"
 )]
 struct Cli {
     /// A .PrjPcb, .SchDoc, .PcbDoc, .SchLib or .PcbLib file.
@@ -70,6 +76,14 @@ struct Summary {
 }
 
 fn main() {
+    // `describe` and `library` are the library converter contract
+    // (docs/APP_INTEGRATION.md); anything else is the single-file importer.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    match args.get(1).and_then(|a| a.to_str()) {
+        Some("describe") => std::process::exit(contract::describe_main(&args[2..])),
+        Some("library") => std::process::exit(library_cmd::main(&args[2..])),
+        _ => {}
+    }
     let cli = Cli::parse();
     match run(&cli) {
         Ok(summary) if cli.json => println!("{}", summary_json(&summary, None)),
@@ -334,7 +348,10 @@ fn convert_project(
         texts.push((name, SnxSchematic::new(sheet).write_string()?));
     }
     if boards.len() > 1 {
-        report.warn("project has several PCB documents; the first is the project's board");
+        report.warn(
+            "project.several_boards",
+            "project has several PCB documents; the first is the project's board",
+        );
     }
     for ((path, doc), name) in boards.iter().zip(&board_names) {
         let board = signex_altium_convert::pcb::convert(doc, report)

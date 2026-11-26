@@ -18,6 +18,12 @@ signex-types = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+jsonschema = { version = "0.30", default-features = false }
 
 [lints]
 workspace = true

@@ -139,12 +139,16 @@ pub fn convert(doc: &SchDoc, opts: &SchOptions, report: &mut Report) -> Schemati
         sheet_shape(shape, &frame, &doc.setup, &params, &mut sheet, report);
     }
     for (kind, n) in &doc.skipped {
-        let what = match *kind {
-            altium_format::sch::kind::IMAGE => "embedded image".to_string(),
-            k => format!("schematic record type {k}"),
+        let (code, what) = match *kind {
+            altium_format::sch::kind::IMAGE => ("sch.image_dropped", "embedded image".to_string()),
+            k => ("sch.record_dropped", format!("schematic record type {k}")),
         };
         for _ in 0..*n {
-            report.warn(format!("{what} not imported"));
+            report.warn_detail(
+                code,
+                format!("{what} not imported"),
+                serde_json::json!({ "record": kind }),
+            );
         }
     }
     sheet
@@ -705,7 +709,10 @@ fn lib_graphic(
             filled,
             ..
         } => {
-            report.warn("rounded rectangle imported with square corners");
+            report.warn(
+                "sch.rounded_rect_square",
+                "rounded rectangle imported with square corners",
+            );
             Graphic::Rectangle {
                 start: l(*a),
                 end: l(*b),
@@ -1049,7 +1056,10 @@ fn sheet_shape(
         },
         Shape::Polyline { points, width } | Shape::Bezier { points, width } => {
             if matches!(shape, Shape::Bezier { .. }) {
-                report.warn("sheet bezier imported as its control polygon");
+                report.warn(
+                    "sch.bezier_polygon",
+                    "sheet bezier imported as its control polygon",
+                );
             }
             SchDrawing::Polyline {
                 uuid: id(),

@@ -129,3 +129,56 @@ net's pad (see `docs/APP_INTEGRATION.md`).
 The vendored Signex types are still those of the format's 1.1 revision
 (no pad rotation column, no `remove_dead_islands`); moving them to 1.4 is
 a follow-up.
+
+## Report codes
+
+Every approximation or loss has a stable code, `<area>.<what>`; a code never
+changes meaning. The single-file `--json` summary groups items by message and
+lists all of them; the library report (`import-report.json`) keeps each item
+with its code, severity and source. Severities are the library converter
+contract's: `info` (nothing lost), `approximated` (written, approximately),
+`dropped` (written, part left out), `error` (item not written).
+
+| Code | Severity | Meaning |
+|---|---|---|
+| `symbol.pin_ieee_unmapped` | dropped | A pin's IEEE symbol code with no Signex shape (detail `ieee_code`) |
+| `symbol.bezier_polygon` | approximated | Library symbol bezier imported as its control polygon |
+| `symbol.rounded_rect_square` | approximated | Library symbol rounded rectangle imported with square corners |
+| `sch.rounded_rect_square` | approximated | Sheet rounded rectangle imported with square corners |
+| `sch.bezier_polygon` | approximated | Sheet bezier imported as its control polygon |
+| `sch.image_dropped` | dropped | Embedded image not imported |
+| `sch.record_dropped` | dropped | Other schematic record type not imported (detail `record`) |
+| `footprint.courtyard_text_dropped` | dropped | Text on a courtyard layer not imported |
+| `footprint.graphic_layer_unmapped` | dropped | Footprint graphic on a layer with no slot not imported (detail `layer`) |
+| `footprint.copper_track_dropped` | dropped | Copper track inside a library footprint not imported |
+| `footprint.fill_dropped` | dropped | Fill inside a library footprint not imported |
+| `footprint.region_dropped` | dropped | Region (custom pad shape) inside a library footprint not imported |
+| `footprint.courtyard_open_bbox` | approximated | Open courtyard outline replaced by its bounding box |
+| `footprint.pad_octagon_rect` | approximated | Octagonal library pad imported as a rectangle |
+| `pcb.keepout_line_no_width` | dropped | Keepout line or arc with no width not imported |
+| `pcb.keepout_non_copper` | dropped | Keepout on a non-copper layer not imported |
+| `pcb.footprint_keepout_moved` | approximated | Footprint keepout becomes a board keepout that does not move with the footprint |
+| `pcb.keepout_restrictions_merged` | approximated | Per-object keepout restrictions become a keepout of all copper |
+| `pcb.component_uid_dropped` | dropped | Source-tool component unique id dropped |
+| `pcb.free_pad_holder` | approximated | Free pad imported into its own footprint |
+| `pcb.plane_split_line_dropped` | dropped | Plane split line not imported |
+| `pcb.copper_arc_flattened` | approximated | Copper arc imported as straight track segments |
+| `pcb.plane_void_keepout` | approximated | Fill or region on an internal plane becomes a keepout void |
+| `pcb.pour_hatch_solid` | approximated | Hatched polygon pour imported as a solid pour |
+| `pcb.region_too_few_points` | dropped | Region with fewer than 3 points not imported |
+| `pcb.footprint_region_dropped` | dropped | Footprint region (custom pad shape or copper) not imported |
+| `pcb.region_cutout_dropped` | dropped | Cutout or non-copper region not imported |
+| `pcb.body_dropped` | dropped | 3D component body not imported |
+| `pcb.primitive_dropped` | dropped | Other PCB primitive type not imported (detail `primitive`) |
+| `pcb.plane_no_outline` | dropped | Plane not written: the board has no outline |
+| `pcb.split_plane_nets_lost` | dropped | Split plane written as one pour; other nets' areas lost |
+| `pcb.plane_no_net` | approximated | Plane with no net written as a pour without a net |
+| `pcb.pullback_not_applied` | approximated | Plane pullback could not be applied; the pour covers the outline |
+| `pcb.layer_unmapped` | approximated | Source layer with no Signex layer; its items are on `Unmapped<n>` (detail `layer`) |
+| `pcb.pad_rotation_dropped` | approximated | Pad turned off a quarter turn from its footprint imported unrotated |
+| `pcb.pad_octagon_rect` | approximated | Octagonal pad imported as a rectangle |
+| `project.several_boards` | info | Project has several PCB documents; the first is the project's board |
+| `library.input_unreadable` | error | An input file could not be read (library runs) |
+| `library.output_not_implemented` | error | The `.snxlib` writer is not available yet (library runs) |
+
+39 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.
