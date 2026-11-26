@@ -69,8 +69,12 @@ order and names.
   - **Fields:** designator and comment, with their positions. The other
     parameters, plus the current footprint model, become schematic
     parameters.
-  - **Decorations:** the dot and clock IEEE marks map. Other IEEE codes
-    are reported.
+  - **Decorations:** the dot and clock IEEE marks map (outer and inner edge
+    slots). Every other IEEE code, in any of the four slots, is reported
+    with its code and slot (`symbol.pin_ieee_unmapped`); the file's codes
+    for the other marks are not known from any sample, so none is guessed.
+  - **Shapes:** a rounded rectangle keeps its corner radius and a cubic
+    Bezier is written as a Bezier (symbol format 4).
 - **Footprints** flip to the footprint editor's Y-down frame, so rotations
   negate:
   - **Pads:** each keeps its own rotation. Layers are the named
@@ -95,8 +99,16 @@ order and names.
   descriptions, pad numbers and part names become spaces, and a triple
   apostrophe three typographic quotes, since the writer refuses them
   (`symbol.text_sanitized`, `footprint.text_sanitized`, `part.text_sanitized`).
-- **Not imported:** copper drawn inside a footprint, custom pad shapes
-  (regions), fills, 3D bodies.
+- **Pads:** an octagonal pad is a custom outline with regular-octagon cuts (the board refuses chamfered pads)
+  (`footprint.pad_octagon_custom`).
+- **Not imported, each with its own code:** copper tracks
+  (`footprint.copper_track_dropped`), fills (`footprint.fill_dropped`),
+  regions, which include custom pad shapes (`footprint.region_dropped`), and
+  graphics on layers the format has no list for
+  (`footprint.graphic_layer_unmapped`). The library format has no home for
+  copper graphics or custom regions beyond a pad's own outline, and turning
+  a region into a pad's custom outline would need the pad-and-region union
+  rule, which no sample shows.
 
 ## PCB
 
@@ -244,7 +256,7 @@ Signex repository is the format; `docs/APP_INTEGRATION.md` the command).
   (`LIBRARY_FORMAT.md` 4.3 states Signex's model frame). That Altium's turn
   order equals Signex's is not verified in a 3D view; a body with two or more
   non-zero turns, a 2D rotation or a bottom-side projection is reported
-  (`model.placement_approximated`). `--models skip` embeds none and reports
+  (`model.placement_approximated`). `--models-dir DIR` supplies a model a body names but the file does not hold: the file is looked up in that one folder by name (any case, also with `.step` or `.stp` added), as a plain file of at most 256 MiB charged to the run budget. `--models skip` embeds none and reports
   each (`model.skipped`, info; skipped models are not counted). A body that does not say its model is
   embedded and has no table entry names a model stored outside the file
   (`model.external`; observed in a private corpus, where no integrated
@@ -311,9 +323,9 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 
 | Code | Severity | Meaning |
 |---|---|---|
-| `symbol.pin_ieee_unmapped` | dropped | A pin's IEEE symbol code with no Signex shape (detail `ieee_code`) |
-| `symbol.bezier_polygon` | approximated | Library symbol bezier imported as its control polygon |
-| `symbol.rounded_rect_square` | approximated | Library symbol rounded rectangle imported with square corners |
+| `symbol.pin_ieee_unmapped` | dropped | A pin's IEEE symbol code with no Signex shape (detail `ieee_code` and `slot`: `inside`, `outside`, `inner_edge`, `outer_edge`) |
+| `symbol.bezier_polygon` | approximated | A library symbol bezier that is not a run of cubic curves (4, 7, 10, ... points) imported as its control polygon |
+| `symbol.rounded_rect_radius` | approximated | A library symbol rounded rectangle with different x and y corner radii takes the smaller |
 | `symbol.display_mode_dropped` | dropped | A pin or graphic of a display mode beyond the two Signex bodies |
 | `symbol.pin_decoration_merged` | approximated | A pin with an inner and an outer edge symbol keeps both; placement shows the outer |
 | `symbol.text_sanitized` | approximated | Control characters or a triple apostrophe in a pin text replaced |
@@ -329,7 +341,7 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `footprint.fill_dropped` | dropped | Fill inside a library footprint not imported |
 | `footprint.region_dropped` | dropped | Region (custom pad shape) inside a library footprint not imported |
 | `footprint.courtyard_open_bbox` | approximated | Open courtyard outline replaced by its bounding box |
-| `footprint.pad_octagon_rect` | approximated | Octagonal library pad imported as a rectangle |
+| `footprint.pad_octagon_custom` | approximated | Octagonal library pad written as a custom outline with regular-octagon cuts (the cut is not read from the file) |
 | `pad.slot_not_placeable` | approximated | A footprint has a slotted drill. It is written exactly (slot length kept), but Signex cannot place it on a board until slotted drills are supported (signex #3128). Once per footprint. |
 | `pcb.keepout_line_no_width` | dropped | Keepout line or arc with no width not imported |
 | `pcb.keepout_non_copper` | dropped | Keepout on a non-copper layer not imported |
@@ -373,7 +385,8 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `model.not_step` | error | The model is not a STEP file |
 | `model.placement_approximated` | approximated | A 2D rotation is added to the z turn, or a bottom-side projection is not applied |
 | `library.crossref_mismatch` | info | An integrated library's cross-reference disagrees with its schematic library |
+| `library.kept_edited` | info | A file this converter wrote that left the source was edited since; kept |
 | `library.kept_referenced` | info | A file that left the source is kept because a row you added still uses it |
 | `library.input_unreadable` | error | An input file could not be read (library runs) |
 
-64 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.
+65 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.

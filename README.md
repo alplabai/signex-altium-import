@@ -48,9 +48,22 @@ signex-altium-import describe --json
 signex-altium-import library Passives.SchLib Passives.PcbLib --output out/Passives --dry-run --progress
 ```
 
-`library` writes the library (a `.snxlib`, its symbol and footprint files)
-plus `import-report.json` and `import-report.md` into `--output`, and exits 0
-(ok), 2 (partial) or 1 (failed). `--dry-run` writes only the report.
+`library` takes `.SchLib`, `.PcbLib` and `.IntLib` files (several go into one
+library) and writes the library (a `.snxlib`, its symbol and footprint files)
+plus `import-report.json` and `import-report.md` into `--output`. It exits 0
+(ok), 2 (partial: something was dropped or not written) or 1 (failed).
+
+| Option | Meaning |
+|---|---|
+| `--dry-run` | write only the report |
+| `--update` | refresh a library this tool wrote; deletes only what it wrote, keeps what you added |
+| `--name`, `--library-id` | library name; override the derived id |
+| `--models include\|skip` | embed STEP models (default) or leave them out |
+| `--models-dir DIR` | where to find 3D models a body names but the file does not hold |
+| `--progress` | NDJSON progress events on stdout (implies `--json`) |
+
+`docs/CONVERSION.md` lists what each Altium object becomes and every report
+code.
 
 ## Install
 

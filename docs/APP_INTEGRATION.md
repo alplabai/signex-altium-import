@@ -79,7 +79,8 @@ Status: `.SchLib` and `.PcbLib` inputs convert into one library
 (`docs/CONVERSION.md`, "Library conversion"); `--update` refreshes a library
 this converter wrote and refuses one with another id. `.IntLib` inputs convert
 (parts released), and STEP models are embedded in footprint files
-(`--models skip` leaves them out). `.DbLib` and folder inputs are
+(`--models skip` leaves them out; `--models-dir` supplies models a body
+names but the file does not hold). `.DbLib` and folder inputs are
 advertised by `describe` but refused until their readers land. `--help` and
 `--version` print no summary. A failed run removes the library files it
 wrote, keeps `import-report.*` once the source was read, and leaves a

@@ -215,8 +215,8 @@ fn pin(p: &APin, report: &mut Report) -> SymbolPin {
     // Schematic placement reads only the outside-edge column. A dot takes
     // it; a clock beside a dot goes to the inside-edge column, kept in the
     // file though placement shows the dot. A clock alone is outside.
-    let inner = edge_symbol(p.symbols.inner_edge, report);
-    let outer = edge_symbol(p.symbols.outer_edge, report);
+    let inner = edge_symbol(p.symbols.inner_edge, "inner_edge", report);
+    let outer = edge_symbol(p.symbols.outer_edge, "outer_edge", report);
     if outer != PinSymbolKind::None && inner != PinSymbolKind::None {
         pin.outside_edge_symbol = outer;
         pin.inside_edge_symbol = inner;
@@ -235,12 +235,12 @@ fn pin(p: &APin, report: &mut Report) -> SymbolPin {
             inner
         };
     }
-    for code in [p.symbols.inside, p.symbols.outside] {
+    for (code, slot) in [(p.symbols.inside, "inside"), (p.symbols.outside, "outside")] {
         if code != 0 {
             report.warn_detail(
                 "symbol.pin_ieee_unmapped",
-                format!("pin IEEE symbol code {code} not mapped"),
-                serde_json::json!({ "ieee_code": code }),
+                format!("pin IEEE symbol code {code} ({slot}) not mapped"),
+                serde_json::json!({ "ieee_code": code, "slot": slot }),
             );
         }
     }
@@ -248,7 +248,7 @@ fn pin(p: &APin, report: &mut Report) -> SymbolPin {
 }
 
 /// The edge codes the samples confirm; anything else is reported.
-fn edge_symbol(code: u8, report: &mut Report) -> PinSymbolKind {
+fn edge_symbol(code: u8, slot: &str, report: &mut Report) -> PinSymbolKind {
     match code {
         0 => PinSymbolKind::None,
         PinSymbols::DOT => PinSymbolKind::Dot,
@@ -256,8 +256,8 @@ fn edge_symbol(code: u8, report: &mut Report) -> PinSymbolKind {
         other => {
             report.warn_detail(
                 "symbol.pin_ieee_unmapped",
-                format!("pin IEEE symbol code {other} not mapped"),
-                serde_json::json!({ "ieee_code": other }),
+                format!("pin IEEE symbol code {other} ({slot}) not mapped"),
+                serde_json::json!({ "ieee_code": other, "slot": slot }),
             );
             PinSymbolKind::None
         }
@@ -287,10 +287,27 @@ fn graphics(shape: &Shape, part_number: u8, report: &mut Report) -> Vec<SymbolGr
     match shape {
         Shape::Line { a, b, width } => vec![g(line(*a, *b), *width, false)],
         Shape::Polyline { points, width } => lines(points, *width),
+        // A cubic Bezier is four points; a longer run of 3n+1 points is n
+        // curves joined end to end.
+        Shape::Bezier { points, width } if points.len() >= 4 && (points.len() - 1) % 3 == 0 => {
+            points
+                .windows(4)
+                .step_by(3)
+                .map(|w| {
+                    g(
+                        SymbolGraphicKind::Bezier {
+                            points: [xy(w[0]), xy(w[1]), xy(w[2]), xy(w[3])],
+                        },
+                        *width,
+                        false,
+                    )
+                })
+                .collect()
+        }
         Shape::Bezier { points, width } => {
             report.warn(
                 "symbol.bezier_polygon",
-                "symbol bezier imported as its control polygon",
+                "symbol bezier that is not a run of cubic curves imported as its control polygon",
             );
             lines(points, *width)
         }
@@ -321,18 +338,22 @@ fn graphics(shape: &Shape, part_number: u8, report: &mut Report) -> Vec<SymbolGr
         Shape::RoundRect {
             a,
             b,
+            rx,
+            ry,
             width,
             filled,
-            ..
         } => {
-            report.warn(
-                "symbol.rounded_rect_square",
-                "rounded rectangle imported with square corners",
-            );
+            if (rx - ry).abs() > 1e-6 {
+                report.warn(
+                    "symbol.rounded_rect_radius",
+                    "rounded rectangle with different corner radii imported with the smaller one",
+                );
+            }
             vec![g(
-                SymbolGraphicKind::Rectangle {
+                SymbolGraphicKind::RoundRectangle {
                     from: xy(*a),
                     to: xy(*b),
+                    corner_radius: mm(rx.min(*ry)),
                 },
                 *width,
                 *filled,
@@ -681,12 +702,32 @@ fn pad(p: &apcb::Pad, report: &mut Report) -> Pad {
         APadShape::RoundedRect => PadShape::RoundRect {
             radius_ratio: f64::from(p.corner_radius_pct.min(100)) / 200.0,
         },
+        // A regular octagon as a custom outline (the board refuses chamfered
+        // pads): each corner cut at 45 degrees by (1 - 1/sqrt(2)) / 2 of the
+        // shorter side. The cut is the regular one, not read from the file
+        // (no sample records it), so the shape is reported as approximated.
         APadShape::Octagonal => {
             report.warn(
-                "footprint.pad_octagon_rect",
-                "octagonal pad imported as a rectangle",
+                "footprint.pad_octagon_custom",
+                "octagonal pad written as a custom outline with regular-octagon corner cuts",
             );
-            PadShape::Rect
+            let (hw, hh) = (mm(size.x) / 2.0, mm(size.y) / 2.0);
+            let c = 0.292_893 * hw.min(hh) * 2.0;
+            let r = |v: f64| (v * 1e5).round() / 1e5;
+            PadShape::Custom(Polygon::new(
+                [
+                    [-hw + c, -hh],
+                    [hw - c, -hh],
+                    [hw, -hh + c],
+                    [hw, hh - c],
+                    [hw - c, hh],
+                    [-hw + c, hh],
+                    [-hw, hh - c],
+                    [-hw, -hh + c],
+                ]
+                .map(|[x, y]| [r(x), r(y)])
+                .to_vec(),
+            ))
         }
     };
     // The named layer tokens of `LIBRARY_FORMAT.md` section 4.2, the sets

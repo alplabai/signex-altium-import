@@ -292,3 +292,112 @@ fn a_slotted_pad_is_written_exactly_and_reported_once_per_footprint() {
     );
     assert!(items[0].message.contains("#3128"));
 }
+
+#[test]
+fn an_octagonal_pad_is_a_placeable_custom_outline() {
+    let mut lib = PcbLib::open(sample("Simple.PcbLib")).unwrap();
+    let fp = lib
+        .footprints
+        .iter_mut()
+        .find(|f| f.name == "Four pads")
+        .unwrap();
+    fp.primitives.pads[0].shape_top = altium_format::pcb::PadShape::Octagonal;
+    let mut report = Report::default();
+    let file = footprint_file(&lib, "Simple", &mut report);
+    let back = FootprintFile::from_toml_str(&file.to_toml_string().unwrap()).unwrap();
+    let four = back
+        .footprints
+        .iter()
+        .find(|f| f.name == "Four pads")
+        .unwrap();
+    let PadShape::Custom(poly) = &four.pads[0].shape else {
+        panic!("{:?}", four.pads[0].shape)
+    };
+    assert_eq!(poly.points.len(), 8);
+    let held = signex_library::drawn_board_footprint(four);
+    assert!(held.unheld_pads.is_empty(), "{:?}", held.unheld_pads);
+    assert!(
+        report
+            .items()
+            .iter()
+            .any(|i| i.code == "footprint.pad_octagon_custom")
+    );
+}
+
+#[test]
+fn symbol_beziers_and_rounded_rectangles_keep_their_shape() {
+    use altium_format::sch::Shape;
+    use signex_library::primitive::symbol::SymbolGraphicKind;
+    let mut lib = SchLib::open(sample("simple.SchLib")).unwrap();
+    lib.components.truncate(1);
+    let pts = |n: usize| {
+        (0..n)
+            .map(|i| altium_format::sch::Pt::new(i as f64 * 10.0, (i % 2) as f64 * 10.0))
+            .collect::<Vec<_>>()
+    };
+    let c = &mut lib.components[0];
+    c.shapes.clear();
+    c.shapes.push((
+        -1,
+        0,
+        Shape::Bezier {
+            points: pts(4),
+            width: 10.0,
+        },
+    ));
+    c.shapes.push((
+        -1,
+        0,
+        Shape::Bezier {
+            points: pts(7),
+            width: 10.0,
+        },
+    ));
+    c.shapes.push((
+        -1,
+        0,
+        Shape::Bezier {
+            points: pts(5),
+            width: 10.0,
+        },
+    ));
+    c.shapes.push((
+        -1,
+        0,
+        Shape::RoundRect {
+            a: altium_format::sch::Pt::new(0.0, 0.0),
+            b: altium_format::sch::Pt::new(100.0, 50.0),
+            rx: 10.0,
+            ry: 10.0,
+            width: 10.0,
+            filled: false,
+        },
+    ));
+    let mut report = Report::default();
+    let syms = symbols_of(&lib, &mut report);
+    let g = &syms[0].graphics;
+    let beziers = g
+        .iter()
+        .filter(|x| matches!(x.kind, SymbolGraphicKind::Bezier { .. }))
+        .count();
+    assert_eq!(
+        beziers, 3,
+        "one curve, two joined curves, and not the 5-point run"
+    );
+    assert!(g.iter().any(|x| matches!(x.kind, SymbolGraphicKind::RoundRectangle { corner_radius, .. } if (corner_radius - 0.254).abs() < 1e-9)));
+    // Only the 5-point run falls back, once, with its own code.
+    assert_eq!(
+        report
+            .items()
+            .iter()
+            .filter(|i| i.code == "symbol.bezier_polygon")
+            .count(),
+        1
+    );
+    assert!(
+        !report
+            .items()
+            .iter()
+            .any(|i| i.code == "symbol.rounded_rect_radius")
+    );
+}
