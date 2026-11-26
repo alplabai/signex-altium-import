@@ -72,6 +72,9 @@ run as separate programs; install the `mdbtools` package), or a folder of
 per-table `.csv` files given with `--db`. Direct connections through the
 Access driver on Windows are not implemented yet; use `--db <folder>` there.
 
+A repeated part number gets `~2`, `~3` in an order independent of the
+database's physical row order, so re-imports keep their identities.
+
 `docs/CONVERSION.md` lists what each Altium object becomes and every report
 code.
 

@@ -1125,6 +1125,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "encoding_rs",
  "jsonschema",
  "serde_json",
  "sha2",

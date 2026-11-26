@@ -151,3 +151,25 @@ fn a_binary_pin_display_mode_is_signed() {
         assert_eq!(c.pins[0].display_mode, want, "stored {stored}");
     }
 }
+
+#[test]
+fn storage_names_map_the_characters_the_file_cannot_hold() {
+    // Components named with `/ \ : !` are stored under `_`.
+    let lib = SchLib::open(sample("simple.SchLib")).unwrap();
+    assert!(!lib.components.is_empty());
+}
+
+#[test]
+fn one_unreadable_component_is_skipped_and_listed_not_fatal() {
+    use std::io::Cursor;
+    let bytes = std::fs::read(sample("simple.SchLib")).unwrap();
+    let mut cf = cfb::CompoundFile::open(Cursor::new(bytes)).unwrap();
+    cf.remove_storage_all("/Position").unwrap();
+    cf.flush().unwrap();
+    let cut = cf.into_inner().into_inner();
+    let mut c = altium_format::Container::from_bytes("x".into(), cut).unwrap();
+    let lib = SchLib::from_container(&mut c).unwrap();
+    assert_eq!(lib.components.len(), 9);
+    assert_eq!(lib.unreadable.len(), 1);
+    assert_eq!(lib.unreadable[0].0, "Position");
+}

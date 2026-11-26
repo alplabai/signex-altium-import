@@ -10,6 +10,8 @@ use std::process::Command;
 pub struct TableData {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    /// Columns whose text held bytes that are not UTF-8 (replaced).
+    pub lossy_columns: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +39,8 @@ pub enum DbSource {
 
 /// Largest export accepted from one table.
 const MAX_EXPORT: usize = 1 << 30;
+/// How long one mdbtools run may take.
+const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl DbSource {
     pub fn access(file: impl Into<PathBuf>) -> Self {
@@ -71,25 +75,81 @@ impl DbSource {
         }
     }
 
+    /// Run a tool with a deadline, a cap on its output and a tail of its
+    /// error text. The process is killed when the deadline passes.
     fn run(mut cmd: Command) -> Result<Vec<u8>, SourceError> {
-        let out = cmd.output().map_err(|e| {
+        use std::io::Read;
+        use std::process::Stdio;
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.env("LC_ALL", "C");
+        let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 SourceError::NoMdbTools
             } else {
                 SourceError::Other(format!("running mdbtools: {e}"))
             }
         })?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
+        let mut out = child.stdout.take().expect("piped");
+        let mut err = child.stderr.take().expect("piped");
+        let reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                match out.read(&mut chunk) {
+                    Ok(0) | Err(_) => return Ok(buf),
+                    Ok(n) => {
+                        if buf.len() + n > MAX_EXPORT {
+                            return Err(());
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            }
+        });
+        let tail = std::thread::spawn(move || {
+            let mut t: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = err.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                t.extend_from_slice(&chunk[..n]);
+                if t.len() > 8192 {
+                    t.drain(..t.len() - 4096);
+                }
+            }
+            String::from_utf8_lossy(&t).into_owned()
+        });
+        let start = std::time::Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break Some(s),
+                Ok(None) if start.elapsed() > TOOL_TIMEOUT => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(e) => return Err(SourceError::Other(format!("waiting for mdbtools: {e}"))),
+            }
+        };
+        let stdout = reader.join().unwrap_or(Err(()));
+        let stderr = tail.join().unwrap_or_default();
+        let Some(status) = status else {
+            return Err(SourceError::Other(
+                "mdbtools did not finish in time; stopped".into(),
+            ));
+        };
+        if !status.success() {
+            let last: Vec<&str> = stderr.lines().rev().take(3).collect();
             return Err(SourceError::Other(format!(
                 "mdbtools failed: {}",
-                err.lines().next().unwrap_or("no message")
+                last.into_iter().rev().collect::<Vec<_>>().join(" / ")
             )));
         }
-        if out.stdout.len() > MAX_EXPORT {
-            return Err(SourceError::Other("a table export is too large".into()));
-        }
-        Ok(out.stdout)
+        stdout.map_err(|()| SourceError::Other("a table export is too large".into()))
     }
 
     /// The table names the source holds.
@@ -112,7 +172,7 @@ impl DbSource {
             }
             DbSource::Access { file, tools } => {
                 let mut c = Self::tool(tools, "mdb-tables");
-                c.arg("-1").arg(file);
+                c.arg("-1").arg("--").arg(file);
                 let out = Self::run(c)?;
                 Ok(String::from_utf8_lossy(&out)
                     .lines()
@@ -142,7 +202,17 @@ impl DbSource {
             DbSource::Access { file, tools } => {
                 let mut c = Self::tool(tools, "mdb-export");
                 // ISO dates, one header row, quoted text with embedded newlines.
-                c.arg("-D").arg("%Y-%m-%dT%H:%M:%S").arg(file).arg(&name);
+                c.args([
+                    "-D",
+                    "%Y-%m-%d",
+                    "-T",
+                    "%Y-%m-%dT%H:%M:%S",
+                    "-b",
+                    "strip",
+                    "--",
+                ])
+                .arg(file)
+                .arg(&name);
                 Self::run(c)?
             }
         };
@@ -155,6 +225,9 @@ impl DbSource {
 pub fn parse_csv(bytes: &[u8]) -> Result<TableData, SourceError> {
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     let text = String::from_utf8_lossy(bytes);
+    let lossy = text.contains('\u{fffd}')
+        && !String::from_utf8_lossy(bytes).is_empty()
+        && std::str::from_utf8(bytes).is_err();
     let mut r = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
@@ -175,7 +248,24 @@ pub fn parse_csv(bytes: &[u8]) -> Result<TableData, SourceError> {
         row.resize(columns.len(), String::new());
         rows.push(row);
     }
-    Ok(TableData { columns, rows })
+    let lossy_columns = if lossy {
+        columns
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                rows.iter()
+                    .any(|r: &Vec<String>| r.get(*i).is_some_and(|c| c.contains('\u{fffd}')))
+            })
+            .map(|(_, c)| c.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(TableData {
+        columns,
+        rows,
+        lossy_columns,
+    })
 }
 
 #[cfg(test)]

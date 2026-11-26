@@ -307,6 +307,13 @@ requires parameters the part lacks, one `info` item lists them
 
 ## Behaviour changes
 
+- **`~n` part numbers.** A repeated key gets `~2`, `~3` in a fixed order that
+  does not depend on the database's physical row order (a compacted
+  database reorders rows): rows are ordered by key and then by every cell,
+  tables by name. A generated number is reserved, so it cannot collide with a
+  later source name.
+- A schematic library component whose storage cannot be read is skipped and
+  reported (`symbol.unreadable`); it no longer fails the whole library.
 - The single-file warning for a footprint graphic on a layer with no list now
   reads "graphic on <layer> dropped: Signex footprints have no such layer yet
   (signex #3133)" (the `--json` summary message changed; the code and the
@@ -453,6 +460,13 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `row.symbol_library_missing` | error | A row's symbol library was not found or could not be read; skipped |
 | `row.footprint_missing` | error | A footprint a row names is not in its library; skipped |
 | `row.footprint_library_missing` | error | A footprint library a row names was not found or could not be read; skipped |
+| `table.reserved_unknown` | info | A bracketed target this converter does not know is kept as a parameter of that name |
+| `table.lossy_text` | info | A column held bytes that are not UTF-8; they were replaced |
+| `library.search_truncated` | info | A search folder holds more files than the listing limit |
+| `row.symbol_library_unreadable` | error | A row's symbol library exists but could not be read; skipped |
+| `row.footprint_library_unreadable` | error | A row's footprint library exists but could not be read; skipped |
+| `symbol.unreadable` | error | A component of a schematic library could not be read; not written |
+| `part.symbol_unreadable` | error | The part of a component that could not be read; not written |
 | `library.input_unreadable` | error | An input file could not be read (library runs) |
 
-74 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.
+81 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.

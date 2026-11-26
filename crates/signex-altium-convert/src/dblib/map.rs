@@ -143,6 +143,7 @@ mod tests {
         let data = TableData {
             columns: vec!["Part Number".into(), "Lib".into(), "Value".into()],
             rows: vec![],
+            ..Default::default()
         };
         let m = map_table(&table(), &data, &MapFile::default());
         assert_eq!(m, [KEY, "[Library Ref]", "Value"]);
@@ -153,6 +154,7 @@ mod tests {
         let data = TableData {
             columns: vec!["Part Number".into(), "Lib".into(), "Maker".into()],
             rows: vec![],
+            ..Default::default()
         };
         let user =
             MapFile::parse("[tables.\"r\"]\nmaker = \"Manufacturer\"\nLib = \"[Skip]\"\n").unwrap();

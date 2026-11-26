@@ -35,10 +35,13 @@ fn read_text(p: &Path) -> Result<String, String> {
         ));
     }
     let bytes = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
-    // DbLib files are written in the local ANSI code page.
+    // DbLib files are written in the local ANSI code page (Windows-1252 here).
     Ok(match String::from_utf8(bytes) {
         Ok(s) => s,
-        Err(e) => e.into_bytes().iter().map(|&b| char::from(b)).collect(),
+        Err(e) => encoding_rs::WINDOWS_1252
+            .decode(e.as_bytes())
+            .0
+            .into_owned(),
     })
 }
 

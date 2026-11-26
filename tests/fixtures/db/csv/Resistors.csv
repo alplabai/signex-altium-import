@@ -1,8 +1,8 @@
-Part Number,Library Ref,Library Path,Footprint Ref,Footprint Path,Footprint Ref 2,Footprint Path 2,Footprint Ref 3,Footprint Path 3,Description,Value,Tolerance,Colour,Maker,Maker Part No,Supplier 1,Supplier Part Number 1,Datasheet,Sim Model
-RES-OK,Resistor - Standard,C:\Other\Machine\Libs\Passives.SchLib,Four pads,Footprints1.PcbLib,CAPC1608X09L,Footprints1.PcbLib,SQFP50P800X800X300_HS-33T300X300,D:\Lib\Footprints2.PcbLib,Synthetic resistor,10 kOhm,1%,blue,Acme,A-100,Shop,SHOP-1,https://example.com/ds.pdf,SPICE-1
-RES-NOSYM,No such symbol,Passives.SchLib,Four pads,Footprints1.PcbLib,,,,,Missing symbol,,,,,,,,,
-RES-NOALT,Resistor - Standard,Passives.SchLib,Four pads,Footprints1.PcbLib,Not a footprint,Footprints1.PcbLib,,,Missing alternate,,,,,,,,,
-RES-DUP,Resistor - Standard,Passives.SchLib,Four pads,Footprints1.PcbLib,,,,,First duplicate,,,,,,,,,
-RES-DUP,Resistor - Standard,Passives.SchLib,Four pads,Footprints1.PcbLib,,,,,Second duplicate,,,,,,,,,
-,Resistor - Standard,Passives.SchLib,,,,,,,No key,,,,,,,,,
-RES-NOFP,Resistor - Standard,Passives.SchLib,,,,,,,No footprint named,,,,,,,,,
+Part Number,Library Ref,Library Path,Footprint Ref,Footprint Path,Footprint Ref 2,Footprint Path 2,Footprint Ref 3,Footprint Path 3,Description,Value,Tolerance,Colour,Maker,Maker Part No,Supplier 1,Supplier Part Number 1,Datasheet,Sim Model,Odd
+RES-OK,Resistor - Standard,C:\Other\Machine\Libs\Passives.SchLib,Four pads,Footprints1.PcbLib,CAPC1608X09L,Footprints1.PcbLib,SQFP50P800X800X300_HS-33T300X300,D:\Lib\Footprints2.PcbLib,Synthetic resistor,10 kOhm,1%,blue,Acme,A-100,Shop,SHOP-1,https://example.com/ds.pdf,SPICE-1,odd-value
+RES-NOSYM,No such symbol,Passives.SchLib,Four pads,Footprints1.PcbLib,,,,,Missing symbol,,,,,,,,,,
+RES-NOALT,Resistor - Standard,Passives.SchLib,Four pads,Footprints1.PcbLib,Not a footprint,Footprints1.PcbLib,,,Missing alternate,,,,,,,,,,
+RES-DUP,Resistor - Standard,Passives.SchLib,Four pads,Footprints1.PcbLib,,,,,First duplicate,,,,,,,,,,
+RES-DUP,Resistor - Standard,Passives.SchLib,Four pads,Footprints1.PcbLib,,,,,Second duplicate,,,,,,,,,,
+,Resistor - Standard,Passives.SchLib,,,,,,,No key,,,,,,,,,,
+RES-NOFP,Resistor - Standard,Passives.SchLib,,,,,,,No footprint named,,,,,,,,,,

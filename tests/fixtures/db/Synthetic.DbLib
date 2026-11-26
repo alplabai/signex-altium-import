@@ -31,6 +31,16 @@ Enabled=0
 UserWhere=0
 UserWhereText=
 
+[Table4]
+SchemaName=
+TableName=Absent
+Enabled=1
+UserWhere=0
+UserWhereText=
+
+[FieldMap19]
+Options=FieldName=Absent.Id|TableNameOnly=Absent|FieldNameOnly=Id|FieldType=0|ParameterName=Id|VisibleOnAdd=True|AddMode=1|RemoveMode=0|UpdateMode=2
+
 [FieldMap1]
 Options=FieldName=Resistors.Part Number|TableNameOnly=Resistors|FieldNameOnly=Part Number|FieldType=0|ParameterName=Part Number|VisibleOnAdd=True|AddMode=1|RemoveMode=0|UpdateMode=2
 
@@ -63,6 +73,9 @@ Options=FieldName=Resistors.Description|TableNameOnly=Resistors|FieldNameOnly=De
 
 [FieldMap11]
 Options=FieldName=Resistors.Sim Model|TableNameOnly=Resistors|FieldNameOnly=Sim Model|FieldType=1|ParameterName=[Sim Model]|VisibleOnAdd=False|AddMode=1|RemoveMode=0|UpdateMode=2
+
+[FieldMap18]
+Options=FieldName=Resistors.Odd|TableNameOnly=Resistors|FieldNameOnly=Odd|FieldType=1|ParameterName=[Mystery]|VisibleOnAdd=False|AddMode=1|RemoveMode=0|UpdateMode=2
 
 [FieldMap12]
 Options=FieldName=Capacitors.Part Number|TableNameOnly=Capacitors|FieldNameOnly=Part Number|FieldType=0|ParameterName=Part Number|VisibleOnAdd=True|AddMode=1|RemoveMode=0|UpdateMode=2

@@ -99,14 +99,21 @@ impl Parts {
                 "control characters or a triple apostrophe in the part name replaced",
             );
         }
-        let n = self.taken_pns.entry(base.clone()).or_default();
-        *n += 1;
-        let pn = if *n == 1 {
+        // The number, or the first `~n` nobody holds yet (a generated number
+        // is taken too, so it cannot collide with a later source name).
+        let mut n = *self.taken_pns.entry(base.clone()).or_default() + 1;
+        let mut pn = if n == 1 {
             base.clone()
         } else {
             format!("{base}~{n}")
         };
-        if *n > 1 {
+        while n > 1 && self.taken_pns.contains_key(&pn) {
+            n += 1;
+            pn = format!("{base}~{n}");
+        }
+        self.taken_pns.insert(base.clone(), n);
+        self.taken_pns.entry(pn.clone()).or_insert(1);
+        if n > 1 {
             report.warn_detail(
                 "part.pn_collision",
                 format!("part number {base} is taken; this part is {pn}"),

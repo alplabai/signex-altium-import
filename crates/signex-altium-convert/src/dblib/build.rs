@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::map::{KEY, MapFile, SKIP, map_table};
 use super::parse::DbLib;
@@ -167,6 +167,16 @@ pub fn prepare(
         }
     };
 
+    if input.resolver.truncated() {
+        report.push(item(
+            ItemKind::Library,
+            "library.search_truncated",
+            Severity::Info,
+            String::new(),
+            "a search folder holds more files than the listing limit; later files were not seen"
+                .into(),
+        ));
+    }
     let total = input.dblib.tables.len();
     for (ti, table) in input.dblib.tables.iter().enumerate() {
         on_table(ti, total, &table.name);
@@ -197,7 +207,17 @@ pub fn prepare(
             }
             Err(e) => return Err(format!("reading table {}: {e}", table.name)),
         };
+        for col in &data.lossy_columns {
+            report.push(item(
+                ItemKind::Library,
+                "table.lossy_text",
+                Severity::Info,
+                table.name.clone(),
+                format!("column {col} held bytes that are not valid UTF-8; they were replaced"),
+            ));
+        }
         let targets = map_table(table, &data, input.user_map);
+        let mut data = data;
         mapping.tables.insert(
             table.name.clone(),
             data.columns
@@ -207,6 +227,12 @@ pub fn prepare(
                 .collect(),
         );
         let key_col = targets.iter().position(|t| t == KEY);
+        // A stable order that does not depend on the database's physical row
+        // order (a compacted .mdb reorders rows): by key, then every cell.
+        data.rows.sort_by(|a, b| {
+            let k = |r: &Vec<String>| key_col.and_then(|i| r.get(i)).cloned().unwrap_or_default();
+            k(a).cmp(&k(b)).then_with(|| a.cmp(b))
+        });
         let mut set = DatabaseSet {
             table: crate::text::cell_safe(&table.name).0,
             released: true,
@@ -225,6 +251,7 @@ pub fn prepare(
             ));
         }
         let mut sim_noted = false;
+        let mut unknown_noted: HashSet<String> = HashSet::new();
         for (ri, row) in data.rows.iter().enumerate() {
             let cell = |i: usize| row.get(i).map_or("", |s| s.trim());
             let key = key_col.map_or("", cell).to_string();
@@ -288,7 +315,19 @@ pub fn prepare(
                             ));
                         }
                     }
-                    Some(Reserved::Unknown) => {}
+                    Some(Reserved::Unknown) => {
+                        // Kept as a parameter named like the target, noted once.
+                        if unknown_noted.insert(target.clone()) {
+                            report.push(item(
+                                ItemKind::Library,
+                                "table.reserved_unknown",
+                                Severity::Info,
+                                table.name.clone(),
+                                format!("{target} is not a reserved name this converter knows; kept as a parameter"),
+                            ));
+                        }
+                        params.push((target.trim_matches(['[', ']']).to_string(), v.to_string()));
+                    }
                     None => params.push((target.clone(), v.to_string())),
                 }
             }
@@ -419,11 +458,12 @@ pub fn prepare(
             body: SourceBody::Database(set),
         });
     }
-    let _ = json!(null);
     let dbpath = input.source.path().to_string_lossy().into_owned();
     for s in &mut sets {
         s.path = dbpath.clone();
     }
+    // Across tables by name, so a repeated key gets its suffix in a fixed order.
+    sets.sort_by(|a, b| a.name.cmp(&b.name));
     sources.extend(sets);
     Ok(Prepared {
         sources,

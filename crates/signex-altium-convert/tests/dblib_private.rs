@@ -41,7 +41,7 @@ fn the_corpus_dblib_parses_with_one_key_field_per_table() {
 }
 
 #[test]
-fn every_enabled_table_exports_with_the_row_count_mdb_count_gives() {
+fn every_enabled_table_exports_with_the_record_count_of_a_fresh_export() {
     let Some(dir) = corpus() else {
         return;
     };

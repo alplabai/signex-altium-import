@@ -26,7 +26,7 @@ use signex_library::{FootprintFile, LifecycleState};
 use uuid::Uuid;
 
 use crate::library::{footprints_scoped, symbols_scoped};
-use crate::report::Report;
+use crate::report::{Item, ItemKind, Report, Severity};
 use bind::FootprintIndex;
 use snxlib::{epoch, library_text};
 
@@ -433,6 +433,7 @@ pub fn build_library(
             fp.created = created;
             fp.updated = updated;
             footprint_versions.insert(fp.uuid, fp.version.clone());
+            index.insert_in(&s.name, &fp.name, fp.uuid);
             let here = format!("{}:{}", s.name, fp.name);
             if let Err(first) = index.insert(&fp.name, fp.uuid, &here) {
                 report.set_scope_with_id(here.clone(), fp.uuid);
@@ -487,6 +488,7 @@ pub fn build_library(
                 })
             })
             .collect();
+        let original_unreadable = lib.unreadable.clone();
         let filtered;
         let (lib, sym_ids, part_ids): (&SchLib, Vec<Uuid>, Vec<Uuid>) =
             if kept.len() == all_names.len() {
@@ -505,6 +507,26 @@ pub fn build_library(
         source.symbols += lib.components.len();
         if !database_mode {
             source.parts += lib.components.len();
+            // Components the reader could not open: each is a symbol and a
+            // part that were not written.
+            for (name, why) in &original_unreadable {
+                source.symbols += 1;
+                source.parts += 1;
+                for (kind, code) in [
+                    (ItemKind::Symbol, "symbol.unreadable"),
+                    (ItemKind::Part, "part.symbol_unreadable"),
+                ] {
+                    report.push(Item {
+                        kind,
+                        source: format!("{}:{name}", s.name),
+                        id: None,
+                        code,
+                        severity: Severity::Error,
+                        message: format!("component {name} could not be read: {why}"),
+                        detail: serde_json::Value::Null,
+                    });
+                }
+            }
         }
         let mut symbols = symbols_scoped(lib, &s.name, &sym_ids, report);
         for sym in &mut symbols {
@@ -598,6 +620,15 @@ pub fn build_library(
             let Some((symbol_id, symbol_version, designator)) =
                 symbol_info.get(&(row.symbol.0.to_lowercase(), row.symbol.1.to_lowercase()))
             else {
+                report.push(Item {
+                    kind: ItemKind::Row,
+                    source: source_name,
+                    id: None,
+                    code: "row.symbol_missing",
+                    severity: Severity::Error,
+                    message: "the row's symbol was not written; row skipped".into(),
+                    detail: serde_json::Value::Null,
+                });
                 continue;
             };
             let comp = altium_format::sch::Component {
@@ -619,8 +650,8 @@ pub fn build_library(
                     .footprints
                     .iter()
                     .enumerate()
-                    .map(|(i, (_, name))| altium_format::sch::Implementation {
-                        model_name: name.clone(),
+                    .map(|(i, (lib, name))| altium_format::sch::Implementation {
+                        model_name: format!("{lib}\u{1f}{name}"),
                         model_type: "PCBLIB".into(),
                         is_current: i == 0,
                         pin_map: Vec::new(),

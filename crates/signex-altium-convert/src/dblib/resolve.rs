@@ -14,6 +14,7 @@ pub struct Resolver {
     folders: Vec<PathBuf>,
     subdirs: bool,
     listings: RefCell<HashMap<PathBuf, Vec<(String, PathBuf)>>>,
+    truncated: std::cell::Cell<bool>,
 }
 
 fn plain_file(p: &Path) -> bool {
@@ -35,6 +36,7 @@ impl Resolver {
             folders,
             subdirs,
             listings: RefCell::new(HashMap::new()),
+            truncated: std::cell::Cell::new(false),
         }
     }
 
@@ -54,6 +56,7 @@ impl Resolver {
             for e in entries {
                 seen += 1;
                 if seen > 1_000_000 {
+                    self.truncated.set(true);
                     break;
                 }
                 let Ok(t) = e.file_type() else { continue };
@@ -70,6 +73,11 @@ impl Resolver {
         out
     }
 
+    /// A listing stopped at its size limit.
+    pub fn truncated(&self) -> bool {
+        self.truncated.get()
+    }
+
     /// The file `given` names, if any.
     pub fn resolve(&self, given: &str) -> Option<PathBuf> {
         let norm = given.trim().replace('\\', "/");
@@ -77,7 +85,7 @@ impl Resolver {
             return None;
         }
         let as_given = Path::new(&norm);
-        if plain_file(as_given) {
+        if as_given.is_absolute() && plain_file(as_given) {
             return Some(as_given.to_path_buf());
         }
         let beside = self.dblib_dir.join(&norm);

@@ -113,7 +113,7 @@ fn the_fixture_produces_exactly_the_expected_report_entries() {
                 "row.footprint_missing".to_string(),
                 "Resistors:RES-NOALT".to_string()
             ),
-            ("row.key_missing".to_string(), "Resistors:row 6".to_string()),
+            ("row.key_missing".to_string(), "Resistors:row 1".to_string()),
             (
                 "row.symbol_missing".to_string(),
                 "Resistors:RES-NOSYM".to_string()
@@ -125,6 +125,11 @@ fn the_fixture_produces_exactly_the_expected_report_entries() {
         tables,
         vec![
             ("table.disabled".to_string(), "Retired".to_string()),
+            ("table.missing".to_string(), "Absent".to_string()),
+            (
+                "table.reserved_unknown".to_string(),
+                "Resistors".to_string()
+            ),
             ("table.sim_skipped".to_string(), "Resistors".to_string()),
         ]
     );
@@ -262,4 +267,31 @@ fn a_database_library_is_converted_on_its_own() {
         os("--json"),
     ]);
     assert_eq!(o.status.code(), Some(1));
+}
+
+#[test]
+fn duplicate_keys_get_their_suffix_whatever_the_row_order() {
+    let tmp = Tmp::new();
+    let root = setup(&tmp);
+    let (a, b) = (tmp.0.join("a"), tmp.0.join("b"));
+    convert(&root, &a, &[]);
+    // The same rows in the opposite physical order (a compacted database
+    // reorders them): the same library, byte for byte.
+    let csv = root.join("csv/Resistors.csv");
+    let text = std::fs::read_to_string(&csv).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    let head = lines.remove(0);
+    lines.reverse();
+    std::fs::write(&csv, format!("{head}\n{}\n", lines.join("\n"))).unwrap();
+    convert(&root, &b, &[]);
+    let lib = |d: &Path| {
+        std::fs::read_dir(d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "snxlib"))
+            .map(|p| std::fs::read(p).unwrap())
+            .unwrap()
+    };
+    assert_eq!(lib(&a), lib(&b));
 }

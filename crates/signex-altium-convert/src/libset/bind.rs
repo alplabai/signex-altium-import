@@ -17,6 +17,8 @@ use crate::report::Report;
 #[derive(Default)]
 pub struct FootprintIndex {
     by_name: HashMap<String, (Uuid, String)>,
+    /// By (library source name, footprint name), both lower case.
+    by_pair: HashMap<(String, String), Uuid>,
 }
 
 impl FootprintIndex {
@@ -31,7 +33,21 @@ impl FootprintIndex {
         Ok(())
     }
 
+    /// Record where a footprint lives, for rows that name its library.
+    pub fn insert_in(&mut self, library: &str, name: &str, id: Uuid) {
+        self.by_pair
+            .entry((library.to_lowercase(), name.trim().to_lowercase()))
+            .or_insert(id);
+    }
+
+    /// A model name of the form `<library>\u{1f}<name>` names its library.
     fn get(&self, name: &str) -> Option<Uuid> {
+        if let Some((lib, n)) = name.split_once('\u{1f}') {
+            return self
+                .by_pair
+                .get(&(lib.to_lowercase(), n.trim().to_lowercase()))
+                .copied();
+        }
         self.by_name
             .get(&name.trim().to_lowercase())
             .map(|(id, _)| *id)

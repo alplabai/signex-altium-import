@@ -690,6 +690,8 @@ pub struct SchLib {
     pub components: Vec<Component>,
     /// The container's root-entry modified time, if it records one.
     pub modified: Option<std::time::SystemTime>,
+    /// Components whose storage could not be read: (name, why).
+    pub unreadable: Vec<(String, String)>,
 }
 
 impl SchLib {
@@ -718,24 +720,45 @@ impl SchLib {
                 .get(&libref)
                 .cloned()
                 .unwrap_or_else(|| storage_name(&libref));
-            if !storages.iter().any(|s| s == &storage) {
-                return Err(Error::MissingStream(format!("{storage}/Data")));
+            // One component that cannot be read is skipped and reported, not
+            // the whole library.
+            let one = (|| -> Result<Component> {
+                if !storages.iter().any(|s| s == &storage) {
+                    return Err(Error::MissingStream(format!("{storage}/Data")));
+                }
+                let data = c.stream(&format!("{storage}/Data"))?;
+                let mut comp = parse_symbol_stream(&data)?;
+                apply_pin_fracs(c, &storage, &mut comp)?;
+                Ok(comp)
+            })();
+            match one {
+                Ok(mut comp) => {
+                    if comp.lib_reference.is_empty() {
+                        comp.lib_reference = libref;
+                    }
+                    lib.components.push(comp);
+                }
+                Err(e) => lib.unreadable.push((libref, e.to_string())),
             }
-            let data = c.stream(&format!("{storage}/Data"))?;
-            let mut comp = parse_symbol_stream(&data)?;
-            apply_pin_fracs(c, &storage, &mut comp)?;
-            if comp.lib_reference.is_empty() {
-                comp.lib_reference = libref;
-            }
-            lib.components.push(comp);
         }
         Ok(lib)
     }
 }
 
-/// Storage names are capped at 31 characters and cannot hold `/`.
+/// Storage names are capped at 31 characters and cannot hold `/`, `\\`, `:`
+/// or `!` (written as `_`; observed in a private corpus file).
 fn storage_name(libref: &str) -> String {
-    libref.replace('/', "_").chars().take(31).collect()
+    libref
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '!') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(31)
+        .collect()
 }
 
 /// Long or unusual names map to their storage through `SectionKeys`.

@@ -25,12 +25,25 @@ impl Container {
     }
 
     pub fn from_bytes(path: PathBuf, bytes: Vec<u8>) -> Result<Self> {
-        let cfb = cfb::CompoundFile::open(std::io::Cursor::new(bytes)).map_err(|source| {
-            Error::NotCompound {
-                path: path.clone(),
-                source,
+        let cfb = match cfb::CompoundFile::open(std::io::Cursor::new(bytes.clone())) {
+            Ok(c) => c,
+            Err(first) => {
+                // Some writers leave stale entries in the DIFAT beyond the
+                // declared FAT sector count (observed in a private corpus
+                // file); a reader must stop at the declared count.
+                match limit_difat(&bytes)
+                    .and_then(|fixed| cfb::CompoundFile::open(std::io::Cursor::new(fixed)).ok())
+                {
+                    Some(c) => c,
+                    None => {
+                        return Err(Error::NotCompound {
+                            path,
+                            source: first,
+                        });
+                    }
+                }
             }
-        })?;
+        };
         Ok(Self { path, cfb })
     }
 
@@ -110,5 +123,79 @@ impl Container {
                     .to_string()
             })
             .collect()
+    }
+}
+
+/// The file with every DIFAT entry past the header's declared FAT sector
+/// count freed, or `None` when the file has no such entries to free.
+fn limit_difat(bytes: &[u8]) -> Option<Vec<u8>> {
+    const FREE: u32 = 0xFFFF_FFFF;
+    const END: u32 = 0xFFFF_FFFE;
+    let rd = |b: &[u8], at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
+    };
+    if bytes.get(..8)? != [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1] {
+        return None;
+    }
+    let shift = u16::from_le_bytes(bytes.get(0x1E..0x20)?.try_into().ok()?);
+    if !(7..=16).contains(&shift) {
+        return None;
+    }
+    let sector = 1usize << shift;
+    let declared = rd(bytes, 0x2C)? as usize;
+    let mut out = bytes.to_vec();
+    let mut changed = false;
+    // Header DIFAT: 109 entries.
+    for i in 0..109usize {
+        if i >= declared {
+            let at = 0x4C + i * 4;
+            if rd(&out, at)? != FREE {
+                out[at..at + 4].copy_from_slice(&FREE.to_le_bytes());
+                changed = true;
+            }
+        }
+    }
+    // DIFAT sectors: `sector/4 - 1` entries each, then the next sector.
+    let per = sector / 4 - 1;
+    let mut next = rd(bytes, 0x44)?;
+    let mut used = 109usize;
+    let mut guard = 0;
+    while next < END && guard < 1_000_000 {
+        guard += 1;
+        let base = 512usize.max(sector) + next as usize * sector;
+        for j in 0..per {
+            let at = base + j * 4;
+            if used + j >= declared && rd(&out, at)? != FREE {
+                out[at..at + 4].copy_from_slice(&FREE.to_le_bytes());
+                changed = true;
+            }
+        }
+        used += per;
+        next = rd(&out, base + per * 4)?;
+    }
+    changed.then_some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_header_difat_entry_is_freed() {
+        let mut c = cfb::CompoundFile::create(std::io::Cursor::new(Vec::new())).unwrap();
+        c.create_stream("/a").unwrap();
+        c.flush().unwrap();
+        let mut bytes = c.into_inner().into_inner();
+        // A stale entry beyond the declared FAT sector count.
+        let declared = u32::from_le_bytes(bytes[0x2C..0x30].try_into().unwrap()) as usize;
+        let at = 0x4C + (declared + 3) * 4;
+        bytes[at..at + 4].copy_from_slice(&7u32.to_le_bytes());
+        let fixed = limit_difat(&bytes).expect("something to free");
+        assert!(cfb::CompoundFile::open(std::io::Cursor::new(fixed)).is_ok());
+        // Nothing stale: nothing to do.
+        let mut clean = cfb::CompoundFile::create(std::io::Cursor::new(Vec::new())).unwrap();
+        clean.flush().unwrap();
+        assert!(limit_difat(&clean.into_inner().into_inner()).is_none());
+        assert!(limit_difat(b"not a compound file").is_none());
     }
 }
