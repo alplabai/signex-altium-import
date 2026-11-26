@@ -26,8 +26,11 @@ jobs:
       - run: cargo fmt --all -- --check
       # The vendored signex-library / signex-sketch tests need dev-dependencies
       # the trimmed manifests drop; the main repo runs them.
-      - run: cargo clippy --workspace --exclude signex-library --exclude signex-sketch --exclude signex-expr --all-targets -- -D warnings
-      - run: cargo clippy -p signex-library -p signex-sketch -p signex-expr -- -D warnings
+      # Upstream lints the vendored crates in full. The trim removes the only
+      # users of some of their items, so unused imports and dead code are
+      # allowed for them here, and for the importer crates that compile them.
+      - run: cargo clippy --workspace --exclude signex-library --exclude signex-sketch --exclude signex-expr --all-targets -- -D warnings -A unused_imports -A dead_code
+      - run: cargo clippy -p signex-library -p signex-sketch -p signex-expr -- -D warnings -A unused_imports -A dead_code
       - run: cargo test --workspace --exclude signex-library --exclude signex-sketch --exclude signex-expr
 
   license:

@@ -26,4 +26,9 @@ for crate in signex-expr signex-sketch signex-library; do
   rm -rf "$ROOT/crates/$crate/tests" "$ROOT/crates/$crate/benches" "$ROOT/crates/$crate/examples"
   python3 "$ROOT/scripts/trim_manifest.py" "$ROOT/crates/$crate/Cargo.toml"
 done
+# One vendored signex-types test reads a sample schematic from signex-app by
+# a relative path; copy just that file so the test runs here unchanged.
+ASSET=crates/signex-app/assets/sample-project/linear-regulator.snxsch
+mkdir -p "$ROOT/$(dirname "$ASSET")"
+cp "$SRC/$ASSET" "$ROOT/$ASSET"
 echo "vendored signex-expr, signex-types, signex-sketch, signex-library @ $COMMIT"
