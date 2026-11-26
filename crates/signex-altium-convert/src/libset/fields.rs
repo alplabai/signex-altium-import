@@ -324,7 +324,7 @@ fn add_parameter(
     report: &mut Report,
 ) {
     let slot = slot_alias(n).and_then(|s| template?.slot(s));
-    let key = slot.map_or_else(|| name.trim().to_string(), |s| s.name.clone());
+    let key = slot.map_or_else(|| crate::text::cell_safe(name.trim()).0, |s| s.name.clone());
     if key.is_empty() || key == signex_library::component::DESIGNATOR_PREFIX_PARAM {
         report.warn_detail(
             "part.param_dropped",

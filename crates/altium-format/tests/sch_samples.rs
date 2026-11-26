@@ -118,3 +118,36 @@ fn a_library_records_its_modified_time_when_the_file_has_one() {
         assert!(t > std::time::UNIX_EPOCH);
     }
 }
+
+fn binary_pin(mode: u8) -> Vec<u8> {
+    let mut p = vec![2, 0, 0, 0, 0]; // record 2, reserved
+    p.extend(1i16.to_le_bytes()); // owner part
+    p.push(mode);
+    p.extend([0, 0, 0, 0]); // symbols
+    p.push(0); // description
+    p.push(0); // formal type
+    p.push(4); // electrical
+    p.push(0x38); // conglomerate
+    p.extend(10i16.to_le_bytes());
+    p.extend(0i16.to_le_bytes());
+    p.extend(0i16.to_le_bytes());
+    p.extend([0, 0, 0, 0]);
+    p.push(1);
+    p.push(b'A');
+    p.push(1);
+    p.push(b'1');
+    let mut out = (p.len() as u32 | 1 << 24).to_le_bytes().to_vec();
+    out.extend(p);
+    out
+}
+
+#[test]
+fn a_binary_pin_display_mode_is_signed() {
+    for (stored, want) in [(0u8, 0), (1, 1), (0xFF, -1)] {
+        let mut s = frame("|RECORD=1|LibReference=X|PartCount=2|");
+        s.extend(binary_pin(stored));
+        let c = altium_format::sch::parse_symbol_stream(&s).unwrap();
+        assert_eq!(c.pins.len(), 1);
+        assert_eq!(c.pins[0].display_mode, want, "stored {stored}");
+    }
+}

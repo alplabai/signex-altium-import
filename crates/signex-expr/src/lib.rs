@@ -1,3 +1,6 @@
+// Added by scripts/sync-signex-crates.sh: trim_manifest.py drops the optional
+// adapters, which leaves some imports and items without users.
+#![allow(dead_code, unused_imports)]
 //! The expression engine shared by every Signex value that may be a formula:
 //! footprint sketch parameters today, part fields, sheet and project
 //! variables, BOM columns and board rules next (#1984).

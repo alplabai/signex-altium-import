@@ -164,7 +164,11 @@ fn previous_primitives(dir: &Path) -> Result<(Primitives, Primitives), String> {
         let f = SymbolFile::from_toml_str(&text)
             .map_err(|e| format!("--update: {} does not read: {e}", p.display()))?;
         for s in &f.symbols {
-            syms.insert(s.uuid, PreviousPrimitive::of_symbol(s));
+            syms.insert(
+                s.uuid,
+                PreviousPrimitive::of_symbol(s)
+                    .map_err(|e| format!("--update: {}: {e}", p.display()))?,
+            );
         }
     }
     for p in files("footprints", "snxfpt") {
@@ -173,10 +177,35 @@ fn previous_primitives(dir: &Path) -> Result<(Primitives, Primitives), String> {
         let f = FootprintFile::from_toml_str(&text)
             .map_err(|e| format!("--update: {} does not read: {e}", p.display()))?;
         for s in &f.footprints {
-            fps.insert(s.uuid, PreviousPrimitive::of_footprint(s));
+            fps.insert(
+                s.uuid,
+                PreviousPrimitive::of_footprint(s)
+                    .map_err(|e| format!("--update: {}: {e}", p.display()))?,
+            );
         }
     }
     Ok((syms, fps))
+}
+
+/// The envelope files on disk by relative path, so an unchanged one keeps
+/// its text (and times).
+fn previous_files(dir: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (sub, ext) in [("symbols", "snxsym"), ("footprints", "snxfpt")] {
+        for e in std::fs::read_dir(dir.join(sub))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == ext)
+                && let (Some(name), Ok(text)) = (p.file_name(), std::fs::read_to_string(&p))
+            {
+                out.insert(format!("{sub}/{}", name.to_string_lossy()), text);
+            }
+        }
+    }
+    out
 }
 
 /// What a run produced: the summary, and the report when one was written.
@@ -259,6 +288,7 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
                         options.previous = rows;
                         options.previous_symbols = syms;
                         options.previous_footprints = fps;
+                        options.previous_files = previous_files(&args.output);
                     }
                     Err(e) => return write_report(args, &doc, Some(e), Vec::new()),
                 }

@@ -1,3 +1,6 @@
+// Added by scripts/sync-signex-crates.sh: trim_manifest.py drops the optional
+// adapters, which leaves some imports and items without users.
+#![allow(dead_code, unused_imports)]
 //! Signex component library subsystem (v0.9-refactor-2 — DBLib model).
 //!
 //! Per `v0.9-refactor-2-plan.md`, components are **rows in TSV/JSONB

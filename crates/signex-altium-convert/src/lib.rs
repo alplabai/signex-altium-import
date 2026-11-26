@@ -16,6 +16,7 @@ pub mod libset;
 pub mod pcb;
 pub mod report;
 pub mod sch;
+mod text;
 mod units;
 
 pub use report::Report;

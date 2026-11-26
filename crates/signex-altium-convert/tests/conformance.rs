@@ -163,6 +163,17 @@ fn the_content_hash_fixtures_match_the_writers_hash() {
                 "{}",
                 row.internal_pn
             );
+            // Encoding the decoded row gives the fixture's own cells back
+            // (covers the array forms and the optional column).
+            let again = signex_altium_convert::libset::row_cells(&row).unwrap();
+            for (col, cell) in &again.cells {
+                assert_eq!(
+                    t.cell(r, col).unwrap_or(""),
+                    cell,
+                    "{}: {col}",
+                    row.internal_pn
+                );
+            }
             checked += 1;
         }
     }

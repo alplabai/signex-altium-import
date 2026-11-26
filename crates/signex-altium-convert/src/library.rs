@@ -58,6 +58,45 @@ pub fn symbols_scoped(
     out
 }
 
+/// Pin and pad text goes into TSV cells; clean it (`text.rs`).
+fn sanitize_symbol(s: &mut Symbol, report: &mut Report) {
+    let mut changed = false;
+    let mut fix = |t: &mut String| {
+        let (c, ch) = crate::text::cell_safe(t);
+        *t = c;
+        changed |= ch;
+    };
+    for p in &mut s.pins {
+        fix(&mut p.number);
+        fix(&mut p.name);
+        fix(&mut p.description);
+        for f in &mut p.function {
+            fix(f);
+        }
+    }
+    if changed {
+        report.warn(
+            "symbol.text_sanitized",
+            "control characters or a triple apostrophe in a pin text replaced",
+        );
+    }
+}
+
+fn sanitize_footprint(fp: &mut Footprint, report: &mut Report) {
+    let mut changed = false;
+    for p in &mut fp.pads {
+        let (c, ch) = crate::text::cell_safe(&p.number);
+        p.number = c;
+        changed |= ch;
+    }
+    if changed {
+        report.warn(
+            "footprint.text_sanitized",
+            "control characters or a triple apostrophe in a pad number replaced",
+        );
+    }
+}
+
 fn symbol(c: &Component, report: &mut Report) -> Symbol {
     let mut s = Symbol::empty(c.lib_reference.clone());
     s.description = c.description.clone();
@@ -115,6 +154,7 @@ fn symbol(c: &Component, report: &mut Report) -> Symbol {
             None => dropped_mode(*mode, "graphic", report),
         }
     }
+    sanitize_symbol(&mut s, report);
     s
 }
 
@@ -172,25 +212,28 @@ fn pin(p: &APin, report: &mut Report) -> SymbolPin {
     pin.name_visible = p.show_name;
     pin.designator_visible = p.show_designator;
     pin.part_number = part_of(p.owner_part_id);
-    // Schematic placement reads only the outside-edge column, so the dot
-    // (outer) and the clock (inner) both land there. A pin with both keeps
-    // the dot and loses the clock.
+    // Schematic placement reads only the outside-edge column. A dot takes
+    // it; a clock beside a dot goes to the inside-edge column, kept in the
+    // file though placement shows the dot. A clock alone is outside.
     let inner = edge_symbol(p.symbols.inner_edge, report);
     let outer = edge_symbol(p.symbols.outer_edge, report);
-    pin.outside_edge_symbol = if outer != PinSymbolKind::None {
-        outer
-    } else {
-        inner
-    };
-    if inner != PinSymbolKind::None && outer != PinSymbolKind::None {
+    if outer != PinSymbolKind::None && inner != PinSymbolKind::None {
+        pin.outside_edge_symbol = outer;
+        pin.inside_edge_symbol = inner;
         report.warn_detail(
             "symbol.pin_decoration_merged",
             format!(
-                "pin {} has an inner and an outer edge symbol; only the outer is kept",
+                "pin {} has an inner and an outer edge symbol; both are kept, placement shows the outer",
                 p.designator
             ),
             serde_json::json!({ "pin": p.designator }),
         );
+    } else {
+        pin.outside_edge_symbol = if outer != PinSymbolKind::None {
+            outer
+        } else {
+            inner
+        };
     }
     for code in [p.symbols.inside, p.symbols.outside] {
         if code != 0 {
@@ -550,6 +593,7 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
             }
         }
     }
+    sanitize_footprint(&mut fp, report);
     fp
 }
 

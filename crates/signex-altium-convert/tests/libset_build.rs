@@ -646,11 +646,11 @@ fn previous_of(
     for (path, text) in &b.files {
         if path.starts_with("symbols/") {
             for s in &SymbolFile::from_toml_str(text).unwrap().symbols {
-                syms.insert(s.uuid, PreviousPrimitive::of_symbol(s));
+                syms.insert(s.uuid, PreviousPrimitive::of_symbol(s).unwrap());
             }
         } else if path.starts_with("footprints/") {
             for f in &FootprintFile::from_toml_str(text).unwrap().footprints {
-                fps.insert(f.uuid, PreviousPrimitive::of_footprint(f));
+                fps.insert(f.uuid, PreviousPrimitive::of_footprint(f).unwrap());
             }
         }
     }
@@ -783,4 +783,48 @@ fn a_footprint_name_defined_twice_is_approximated_and_names_both_sources() {
         "{}",
         i.message
     );
+}
+
+#[test]
+fn a_part_name_the_writer_would_refuse_is_cleaned() {
+    let c = with_designator(base_component(), "BAD\tNAME'''\n", "U?");
+    let (b, r) = convert(&[schlib_of(vec![c])]);
+    assert_eq!(b.written.parts, 1);
+    let lib = snxlib(&b);
+    let t = lib.tables.values().next().unwrap();
+    assert_eq!(
+        t.cell(&t.rows[0], "internal_pn").unwrap(),
+        "BAD NAME\u{2019}\u{2019}\u{2019} "
+    );
+    assert!(r.items().iter().any(|i| i.code == "part.text_sanitized"));
+    self_check(&b);
+}
+
+#[test]
+fn a_source_saved_again_with_a_newer_time_changes_nothing() {
+    let mk = |secs: u64| {
+        let mut l = sch("simple.SchLib");
+        if let SourceBody::Sch(s) = &mut l.body {
+            s.modified = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        }
+        let mut p = pcb("Simple.PcbLib");
+        if let SourceBody::Pcb(s) = &mut p.body {
+            s.modified = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+        }
+        [l, p]
+    };
+    let (first, _) = convert(&mk(1_700_000_000));
+    let (rows, syms, fps) = previous_of(&first);
+    let mut o = LibraryOptions::fresh("Test");
+    (o.previous, o.previous_symbols, o.previous_footprints) = (rows, syms, fps);
+    o.previous_files = first
+        .files
+        .iter()
+        .filter(|(p, _)| p.starts_with("symbols/") || p.starts_with("footprints/"))
+        .cloned()
+        .collect();
+    o.now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let mut r = Report::default();
+    let again = build_library(&mk(1_750_000_000), &o, &mut r, &mut |_, _, _| {}).unwrap();
+    assert_eq!(again.files, first.files);
 }

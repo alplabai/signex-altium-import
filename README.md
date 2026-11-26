@@ -91,7 +91,7 @@ for c in &doc.components {
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --exclude signex-library --exclude signex-sketch --exclude signex-expr --all-targets -- -D warnings -A unused_imports -A dead_code
+cargo clippy --workspace --exclude signex-library --exclude signex-sketch --exclude signex-expr --all-targets -- -D warnings
 cargo test --workspace --exclude signex-library --exclude signex-sketch --exclude signex-expr
 cargo run -p altium-format --example dump -- file.SchDoc [stream] [sch|pcbbin|pcbtext|hex]
 ```

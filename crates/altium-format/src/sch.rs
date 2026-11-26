@@ -179,7 +179,8 @@ impl Pin {
         }
         r.skip(1, "pin reserved")?;
         let owner_part_id = i32::from(r.i16("owner part")?);
-        let display_mode = i32::from(r.u8("display mode")?);
+        // Signed: -1 (stored 0xFF) is an item for no particular display mode.
+        let display_mode = i32::from(r.u8("display mode")? as i8);
         let symbols = PinSymbols {
             inner_edge: r.u8("inner edge")?,
             outer_edge: r.u8("outer edge")?,

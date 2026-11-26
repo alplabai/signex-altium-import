@@ -26,6 +26,17 @@ for crate in signex-expr signex-sketch signex-library; do
   rm -rf "$ROOT/crates/$crate/tests" "$ROOT/crates/$crate/benches" "$ROOT/crates/$crate/examples"
   python3 "$ROOT/scripts/trim_manifest.py" "$ROOT/crates/$crate/Cargo.toml"
 done
+# The trim removes the only users of some items in these crates, so rustc
+# would warn about them under -D warnings. Upstream lints them in full; here
+# the two lints are allowed inside the trimmed crates only (a [lints] table
+# would be overridden by the workspace one).
+for crate in signex-expr signex-sketch signex-library; do
+  lib="$ROOT/crates/$crate/src/lib.rs"
+  { printf '%s\n' '// Added by scripts/sync-signex-crates.sh: trim_manifest.py drops the optional' \
+      '// adapters, which leaves some imports and items without users.' \
+      '#![allow(dead_code, unused_imports)]'; cat "$lib"; } > "$lib.new"
+  mv "$lib.new" "$lib"
+done
 # One vendored signex-types test reads a sample schematic from signex-app by
 # a relative path; copy just that file so the test runs here unchanged.
 ASSET=crates/signex-app/assets/sample-project/linear-regulator.snxsch

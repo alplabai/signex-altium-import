@@ -210,3 +210,41 @@ fn a_pin_with_both_edge_symbols_keeps_the_dot_and_reports_the_loss() {
         signex_altium_convert::report::Severity::Approximated
     );
 }
+
+#[test]
+fn a_clock_beside_a_dot_is_kept_in_the_inside_edge_column() {
+    use signex_library::primitive::symbol::PinSymbolKind;
+    let (f, r) = pin_with_edges(3, 1);
+    let p = &f.symbols[0].pins[0];
+    assert_eq!(p.outside_edge_symbol, PinSymbolKind::Dot);
+    assert_eq!(p.inside_edge_symbol, PinSymbolKind::ClockEdge);
+    assert!(
+        r.items()
+            .iter()
+            .any(|i| i.code == "symbol.pin_decoration_merged")
+    );
+}
+
+#[test]
+fn hostile_pin_text_is_cleaned_and_the_file_still_round_trips() {
+    let mut lib = SchLib::open(sample("simple.SchLib")).unwrap();
+    lib.components.truncate(1);
+    let pin = &mut lib.components[0].pins[0];
+    pin.name = "A\tB'''C\n".into();
+    pin.designator = "1\r".into();
+    pin.description = "x\u{1}y".into();
+    let mut report = Report::default();
+    let f = symbol_file(&lib, "t", &mut report);
+    let text = f.to_toml_string().unwrap();
+    let back = SymbolFile::from_toml_str(&text).unwrap();
+    assert_eq!(
+        back.symbols[0].pins[0].name,
+        "A B\u{2019}\u{2019}\u{2019}C "
+    );
+    assert!(
+        report
+            .items()
+            .iter()
+            .any(|i| i.code == "symbol.text_sanitized")
+    );
+}

@@ -12,6 +12,8 @@ pub const CODES: &[(&str, Severity)] = &[
     ("symbol.rounded_rect_square", A),
     ("symbol.display_mode_dropped", D),
     ("symbol.pin_decoration_merged", A),
+    ("symbol.text_sanitized", A),
+    ("footprint.text_sanitized", A),
     // Schematic sheets.
     ("sch.rounded_rect_square", A),
     ("sch.bezier_polygon", A),

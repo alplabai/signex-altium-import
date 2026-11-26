@@ -85,8 +85,13 @@ order and names.
   particular mode (-1) belongs to both (0). Items of a further mode are
   dropped and reported (`symbol.display_mode_dropped`).
 - **Pin decorations:** schematic placement reads only the outside-edge column,
-  so both the dot (outer) and the clock (inner) go there. A pin with both
-  keeps the dot and is reported (`symbol.pin_decoration_merged`).
+  so the dot (outer) and a lone clock go there. A pin with both keeps the dot
+  there and the clock in the inside-edge column, which placement ignores
+  (`symbol.pin_decoration_merged`, approximated).
+- **Text in cells:** control characters in pin names, numbers and
+  descriptions, pad numbers and part names become spaces, and a triple
+  apostrophe three typographic quotes, since the writer refuses them
+  (`symbol.text_sanitized`, `footprint.text_sanitized`, `part.text_sanitized`).
 - **Not imported:** copper drawn inside a footprint, custom pad shapes
   (regions), fills, 3D bodies.
 
@@ -157,6 +162,7 @@ Signex repository is the format; `docs/APP_INTEGRATION.md` the command).
   it; `--library-id` overrides it. Symbol, footprint and part ids come from
   the library id, the source library's name and the item's name; a repeated
   name inside one library adds `#2`, `#3`.
+- **A source saved again** without changes gives the same library: an update keeps an envelope's text, times included, when only its own times differ.
 - **Same inputs, same bytes.** Every written time is the newest
   modified time recorded in the source containers' root entries (whole
   seconds, from the input bytes, never the clock), or the Unix epoch when no
@@ -262,7 +268,9 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `symbol.bezier_polygon` | approximated | Library symbol bezier imported as its control polygon |
 | `symbol.rounded_rect_square` | approximated | Library symbol rounded rectangle imported with square corners |
 | `symbol.display_mode_dropped` | dropped | A pin or graphic of a display mode beyond the two Signex bodies |
-| `symbol.pin_decoration_merged` | approximated | A pin with an inner and an outer edge symbol keeps only the outer |
+| `symbol.pin_decoration_merged` | approximated | A pin with an inner and an outer edge symbol keeps both; placement shows the outer |
+| `symbol.text_sanitized` | approximated | Control characters or a triple apostrophe in a pin text replaced |
+| `footprint.text_sanitized` | approximated | Control characters or a triple apostrophe in a pad number replaced |
 | `part.pin_map_unread` | error | A footprint model has a pin map this reader cannot decode; part skipped |
 | `sch.rounded_rect_square` | approximated | Sheet rounded rectangle imported with square corners |
 | `sch.bezier_polygon` | approximated | Sheet bezier imported as its control polygon |
@@ -310,4 +318,4 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `footprint.name_collision` | approximated | A footprint name is already defined; parts bind to the first |
 | `library.input_unreadable` | error | An input file could not be read (library runs) |
 
-51 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.
+53 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.

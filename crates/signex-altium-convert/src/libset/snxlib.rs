@@ -50,6 +50,10 @@ pub fn row_cells(row: &ComponentRow) -> Result<LibraryRow, BuildError> {
     };
     let footprint = encode_footprint_cell(row.footprint_ref.as_ref(), &row.alternate_footprints)
         .map_err(|e| BuildError::Row(e.to_string()))?;
+    let sim = match &row.sim_ref {
+        Some(r) => json(r)?,
+        None => String::new(),
+    };
     let hash: String = row
         .content_hash
         .iter()
@@ -63,7 +67,7 @@ pub fn row_cells(row: &ComponentRow) -> Result<LibraryRow, BuildError> {
         ("state", state_cell(row.state)?),
         ("symbol_ref", json(&row.symbol_ref)?),
         ("footprint_ref", footprint),
-        ("sim_ref", String::new()),
+        ("sim_ref", sim),
         ("primary_mpn", json(&row.primary_mpn)?),
         ("alternates", json(&row.alternates)?),
         ("supply", json(&row.supply)?),
@@ -88,6 +92,12 @@ pub fn row_cells(row: &ComponentRow) -> Result<LibraryRow, BuildError> {
     let mut out = LibraryRow::default();
     for (col, cell) in cells {
         out.cells.insert(col.to_string(), cell);
+    }
+    if !row.alternate_symbols.is_empty() {
+        out.cells.insert(
+            signex_library::tables::ALTERNATE_SYMBOLS_COLUMN.to_string(),
+            json(&row.alternate_symbols)?,
+        );
     }
     Ok(out)
 }
@@ -123,10 +133,15 @@ pub fn library_text(
     let mut tables = BTreeMap::new();
     for (class, mut rows) in rows {
         rows.sort_by(|a, b| a.cells["row_id"].cmp(&b.cells["row_id"]));
+        let mut columns: Vec<String> = TABLE_HEADER.iter().map(|c| (*c).to_string()).collect();
+        let alt = signex_library::tables::ALTERNATE_SYMBOLS_COLUMN;
+        if rows.iter().any(|r| r.cells.contains_key(alt)) {
+            columns.push(alt.to_string());
+        }
         tables.insert(
             class.to_string(),
             LibraryTable {
-                columns: TABLE_HEADER.iter().map(|c| (*c).to_string()).collect(),
+                columns,
                 rows: rows.into_iter().map(Arc::new).collect(),
                 ..Default::default()
             },
