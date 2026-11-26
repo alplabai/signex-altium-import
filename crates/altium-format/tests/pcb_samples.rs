@@ -151,6 +151,33 @@ fn pcblib_lists_footprints_with_pads() {
     assert!(!cap.primitives.tracks.is_empty());
 }
 
+/// The library lists 13 footprints (the directory in `Library/Data`); the
+/// root storage `FileVersionInfo` also has a `Data` stream but is not one.
+#[test]
+fn pcblib_has_exactly_the_listed_footprints() {
+    let lib = PcbLib::open(sample("Simple.PcbLib")).unwrap();
+    let mut names: Vec<&str> = lib.footprints.iter().map(|f| f.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "CAPC1608X09L",
+            "Footprint 22",
+            "Four pads",
+            "Lines shifted",
+            "Pads Combined",
+            "SQFP50P800X800X300_HS-33T300X300",
+            "Single Pad (0,0)",
+            "Single Pad (0,0) Rotate 180",
+            "Single Pad (0,0) Rotate 270",
+            "Single Pad (0,0) Rotate 90",
+            "Single Pad (0,1)",
+            "Single Pad (1,0)",
+            "Strings on Layers",
+        ]
+    );
+}
+
 #[test]
 fn prjpcb_lists_documents() {
     let prj = Project::open(sample("simple-proj.prjpcb")).unwrap();

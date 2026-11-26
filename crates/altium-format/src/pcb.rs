@@ -559,12 +559,17 @@ impl PcbLib {
             let Some(data) = c.stream_opt(&format!("{storage}/Data"))? else {
                 continue;
             };
-            let wide = wide_strings(c.stream_opt(&format!("{storage}/WideStrings"))?.as_deref());
             let mut r = Reader::new(&data, "footprint Data");
             let name_block = r.block("footprint name")?;
-            let name = Reader::new(name_block, "footprint name")
-                .pascal_str("footprint name")
-                .unwrap_or_else(|_| storage.clone());
+            // A footprint's Data opens with a block holding exactly one
+            // length-prefixed name. Other root storages with a Data stream
+            // (`FileVersionInfo`: one `|KEY=VALUE` text record) are not
+            // footprints.
+            if name_block.first().map(|&n| n as usize + 1) != Some(name_block.len()) {
+                continue;
+            }
+            let name = crate::params::decode_ansi(&name_block[1..]);
+            let wide = wide_strings(c.stream_opt(&format!("{storage}/WideStrings"))?.as_deref());
             let mut primitives = Primitives::default();
             parse_primitives(&data[r.pos()..], &storage, &wide, &mut primitives)?;
             let params = c
