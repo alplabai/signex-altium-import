@@ -63,6 +63,7 @@ plus `import-report.json` and `import-report.md` into `--output`. It exits 0
 | `--search-path DIR` | database library: extra folders to find the libraries rows name (repeatable) |
 | `--map FILE` | database library: column mapping overrides |
 | `--models-dir DIR` | where to find 3D models a body names but the file does not hold |
+| `--json` | a machine-readable summary on stdout ([contract](docs/APP_INTEGRATION.md)) |
 | `--progress` | NDJSON progress events on stdout (implies `--json`) |
 
 A `.DbLib` (database library) is converted on its own: its rows become parts

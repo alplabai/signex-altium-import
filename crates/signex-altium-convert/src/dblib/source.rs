@@ -30,7 +30,9 @@ pub enum DbSource {
     /// A folder of `<table>.csv` files.
     Csv(PathBuf),
     /// An Access file (`.mdb`, `.accdb`); `tools` is the folder holding the
-    /// mdbtools programs, `None` for the `PATH`.
+    /// mdbtools programs, `None` for the `PATH`. No command-line option sets
+    /// it yet: the CLI always uses the `PATH`, and the tests use it to point
+    /// at a folder without the programs.
     Access {
         file: PathBuf,
         tools: Option<PathBuf>,
@@ -225,9 +227,7 @@ impl DbSource {
 pub fn parse_csv(bytes: &[u8]) -> Result<TableData, SourceError> {
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     let text = String::from_utf8_lossy(bytes);
-    let lossy = text.contains('\u{fffd}')
-        && !String::from_utf8_lossy(bytes).is_empty()
-        && std::str::from_utf8(bytes).is_err();
+    let lossy = std::str::from_utf8(bytes).is_err();
     let mut r = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
