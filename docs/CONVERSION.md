@@ -200,6 +200,30 @@ Signex repository is the format; `docs/APP_INTEGRATION.md` the command).
   with severity `error`; the run fails with an internal error if the report
   does not account for every one.
 
+### Part fields
+
+Parameters of the component map to the part's fields. Names match without
+case, spaces or underscores; a trailing number picks the pair (`Supplier 2`,
+no number means 1).
+
+| Altium parameter | Part field |
+|---|---|
+| `Manufacturer n`, `Manufacturer Part Number n` (also `MPN n`) | manufacturer part n; the lowest n is `primary_mpn` (status Primary), the others `alternates` (Approved) in n order. Either half alone gives a part with the other blank. |
+| `Supplier n`, `Supplier Part Number n`, `Supplier Order Qty n` | supply listing n (distributor, SKU, `moq`). A supplier without a part number, or the reverse, is not imported (`part.param_ambiguous`). A quantity that is not a whole number is not imported. |
+| `Datasheet` | the datasheet, unlabelled |
+| `HelpURL`, `ComponentLinkNURL` | more datasheets, labelled with the parameter name, or with `ComponentLinkNDescription` when there is one. Without `Datasheet`, the first of these is the primary document and keeps its label. |
+| `Description`, else the component's description | `description` |
+| `Comment` | not a part field (the symbol keeps its comment) |
+| a parameter the class template has a slot for (`Value`, `Tolerance`, `Power`, `Voltage`, `Current`, `Package`, `Dielectric`, `ESR`, `DCR`, `TCR`, `SRF`, `Rating`, with the usual spellings) | the slot's parameter name. A measurement slot gets a **measurement** only when the text is a number followed by a unit the slot accepts (`4.7 kOhm`, `0.1W`, `1%`, `100ppm/C`), stored in the base unit. A bare number, a bare prefix (`10k`), another unit or extra text stays text and is reported `info` (`part.param_ambiguous`). |
+| every other parameter | a text parameter named as in the source |
+
+Blank values and `*` are skipped. Control characters in a value become spaces
+and a triple apostrophe becomes three typographic quotes, because the table
+is a TOML literal string (`part.text_sanitized`, `info`). A repeated name
+keeps the later value (`part.param_dropped`). When the class template
+requires parameters the part lacks, one `info` item lists them
+(`part.template_incomplete`).
+
 ## Report codes
 
 Every approximation or loss has a stable code, `<area>.<what>`; a code never
