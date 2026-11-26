@@ -65,6 +65,26 @@ the name.
 index][u32 len][zlib]`. Inflated, it gives three `i32` values (x, y,
 length) in 1/100000 units.
 
+### Implementations (footprint links)
+
+A component's footprint and other model links are records 44 to 48 below the
+component record:
+
+- `RECORD=44` is the list, owned by the component.
+- `RECORD=45` is one model, owned by the list: `ModelName`, `ModelType`
+  (`PCBLIB` for a footprint; other kinds name other models, for example a
+  simulation), `IsCurrent=T` on the one in use, plus `DatafileCount`,
+  `ModelDatafileEntity0` and `ModelDatafileKind0`. Observed in
+  `tests/samples/simple.SchDoc` (`ModelName=R0603L`, `ModelType=PCBLIB`,
+  `IsCurrent=T`).
+- `RECORD=46` and `RECORD=48` follow each model, owned by it, and carry no
+  keys in the samples (`simple.SchDoc`). Pin maps would live below record 46;
+  **no sample holds one, so they are not decoded**: `Implementation::pin_map`
+  stays empty and a remapped pin cannot come from a file yet. Converting one
+  needs a sample with a non-trivial pin map.
+- The `SchLib` samples hold a list (44) with no models at all, so the library
+  samples bind no footprints; the binding tests build components in memory.
+
 ## PCB (`.PcbDoc`, `.PcbLib`)
 
 **Units.** Binary coordinates are `i32` in 1/10000 mil. Text records carry
