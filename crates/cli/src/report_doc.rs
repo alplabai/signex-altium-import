@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use signex_altium_convert::Report;
 use signex_altium_convert::report::{Item, ItemKind, Severity};
 
@@ -25,10 +24,9 @@ pub struct SourceFile {
 impl SourceFile {
     pub fn hash(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let digest = Sha256::digest(&bytes);
         Ok(SourceFile {
             path: path.to_path_buf(),
-            sha256: digest.iter().map(|b| format!("{b:02x}")).collect(),
+            sha256: crate::ledger::sha256_hex(&bytes),
         })
     }
 }
