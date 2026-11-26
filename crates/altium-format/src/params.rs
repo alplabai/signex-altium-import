@@ -39,10 +39,9 @@ impl Params {
     pub fn parse(raw: &[u8]) -> Self {
         let end = raw.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
         let raw = &raw[..end];
-        let mut entries: Vec<(String, String)> = Vec::new();
+        // Key, value, and whether the ANSI value escapes a `|` as `0x8E`.
+        let mut entries: Vec<(String, String, bool)> = Vec::new();
         let mut utf8: Vec<(String, String)> = Vec::new();
-        // Per entry: its ANSI value escapes a `|` as `0x8E`.
-        let mut escapes: Vec<bool> = Vec::new();
         for field in raw.split(|&b| b == b'|') {
             if field.is_empty() {
                 continue;
@@ -58,21 +57,23 @@ impl Params {
                     String::from_utf8_lossy(v).into_owned(),
                 ));
             } else {
-                escapes.push(v.contains(&PIPE_ANSI) && !v.contains(&0xA6));
-                entries.push((key, decode_value(v)));
+                let escapes = v.contains(&PIPE_ANSI) && !v.contains(&0xA6);
+                entries.push((key, decode_value(v), escapes));
             }
         }
         for (k, v) in utf8 {
             match entries
-                .iter()
-                .position(|(ek, _)| ek.eq_ignore_ascii_case(&k))
+                .iter_mut()
+                .find(|(ek, _, _)| ek.eq_ignore_ascii_case(&k))
             {
-                Some(i) if escapes[i] => entries[i].1 = v.replace(PIPE_UTF8, "|"),
-                Some(i) => entries[i].1 = v,
-                None => entries.push((k, v)),
+                Some(slot) if slot.2 => slot.1 = v.replace(PIPE_UTF8, "|"),
+                Some(slot) => slot.1 = v,
+                None => entries.push((k, v, false)),
             }
         }
-        Self { entries }
+        Self {
+            entries: entries.into_iter().map(|(k, v, _)| (k, v)).collect(),
+        }
     }
 
     pub fn from_pairs<K: Into<String>, V: Into<String>>(
@@ -199,6 +200,49 @@ mod tests {
         let p = Params::parse(b"|Name=Netlist|Text=A\x8eB\x8eC|");
         assert_eq!(p.str("Text"), "A|B|C");
         assert_eq!(p.str("Name"), "Netlist");
+    }
+
+    #[test]
+    fn repeated_and_new_utf8_keys_mix_with_escapes() {
+        // UTF-8-only keys (one repeated) after and between escaped ANSI ones.
+        let p = Params::parse(
+            b"|A=x\x8ey|%UTF8%New=n1|%UTF8%New=n2|B=b|%UTF8%A=x\xc2\xa6y|%UTF8%Other=o|%UTF8%B=c\xc2\xa6d|",
+        );
+        assert_eq!(p.str("A"), "x|y");
+        assert_eq!(p.str("New"), "n2");
+        assert_eq!(p.str("Other"), "o");
+        assert_eq!(p.str("B"), "c\u{A6}d");
+    }
+
+    #[test]
+    fn random_records_never_panic() {
+        // A small deterministic generator over the bytes that matter here.
+        let alphabet: &[&[u8]] = &[
+            b"|",
+            b"=",
+            b"%UTF8%",
+            b"A",
+            b"b",
+            b"\x8e",
+            b"\xa6",
+            b"\xc2\xa6",
+            b"\0",
+            b"\xff",
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..20_000 {
+            let mut raw = Vec::new();
+            for _ in 0..(state % 40) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                raw.extend_from_slice(alphabet[(state % alphabet.len() as u64) as usize]);
+            }
+            let p = Params::parse(&raw);
+            for (k, _) in p.iter() {
+                assert!(p.get(k).is_some());
+            }
+        }
     }
 
     #[test]
