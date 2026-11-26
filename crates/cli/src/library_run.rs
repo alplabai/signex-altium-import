@@ -254,10 +254,33 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
     let mut budget = altium_format::limits::Budget::default();
     let mut sources: Vec<SourceLib> = Vec::new();
     let mut unreadable = 0;
+    let mut db_identity: Option<String> = None;
     for (i, (path, kind)) in args.inputs.iter().zip(&kinds).enumerate() {
         let name = stem(path);
         progress.progress(i, Some(args.inputs.len()), Some(&name));
         let abs = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if *kind == Source::DbLib {
+            match crate::library_db::read_database(
+                args,
+                &abs,
+                &mut budget,
+                &mut doc.report,
+                progress,
+            ) {
+                Ok(db) => {
+                    sources.extend(db.sources);
+                    doc.sources.extend(db.files);
+                    doc.mapping = Some(db.mapping.to_toml());
+                    db_identity = abs.file_name().map(|n| n.to_string_lossy().into_owned());
+                }
+                Err(e) => {
+                    unreadable += 1;
+                    doc.report
+                        .push(library_item("library.input_unreadable", name, e));
+                }
+            }
+            continue;
+        }
         let read = SourceFile::hash(&abs).and_then(|src| {
             let bodies = match kind {
                 Source::SchLib => vec![(name.clone(), SourceBody::Sch(SchLib::open(&abs)?), false)],
@@ -266,6 +289,7 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
                     SourceBody::Pcb(PcbLib::open_with(&abs, &mut budget)?),
                     false,
                 )],
+                Source::DbLib => unreachable!("handled above"),
                 Source::IntLib => {
                     let int = IntLib::open_with(&abs, &mut budget)?;
                     for m in int.cross_ref_mismatches() {
@@ -340,7 +364,14 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
     options.library_id = args
         .library_id
         .as_deref()
-        .and_then(|s| Uuid::parse_str(s).ok());
+        .and_then(|s| Uuid::parse_str(s).ok())
+        // A database library's identity is its own file name, not the many
+        // libraries its rows name.
+        .or_else(|| {
+            db_identity
+                .as_ref()
+                .map(|n| signex_altium_convert::libset::library_id(std::slice::from_ref(n)))
+        });
     options.now = Utc::now();
     options.include_models = args.models == Models::Include;
     options.models_dir = args.models_dir.clone();
@@ -387,6 +418,7 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
         .iter()
         .map(|s| match &s.body {
             SourceBody::Sch(l) => l.components.len(),
+            SourceBody::Database(d) => d.rows.len(),
             SourceBody::Pcb(l) => l.footprints.len(),
         })
         .sum();

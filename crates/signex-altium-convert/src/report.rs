@@ -62,6 +62,7 @@ impl ItemKind {
             Some("symbol") => ItemKind::Symbol,
             Some("footprint" | "pad") => ItemKind::Footprint,
             Some("part") => ItemKind::Part,
+            Some("row") => ItemKind::Row,
             Some("model") => ItemKind::Model,
             _ => ItemKind::Library,
         }

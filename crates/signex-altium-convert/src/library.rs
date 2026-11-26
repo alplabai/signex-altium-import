@@ -516,7 +516,10 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
             ),
             None => report.warn_detail(
                 "footprint.graphic_layer_unmapped",
-                format!("footprint graphic on {} not imported", names.of(layer)),
+                format!(
+                    "graphic on {} dropped: Signex footprints have no such layer yet (signex #3133)",
+                    names.of(layer)
+                ),
                 serde_json::json!({ "layer": names.of(layer).to_string() }),
             ),
         }

@@ -131,6 +131,16 @@ impl LibraryArgs {
                 ));
             }
         }
+        let is_db = |p: &PathBuf| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("dblib"))
+        };
+        if self.inputs.iter().any(is_db) && self.inputs.len() > 1 {
+            return Err(
+                "a database library is converted on its own; give one .DbLib and no other input"
+                    .into(),
+            );
+        }
         if self.name.as_deref().is_some_and(str::is_empty) {
             return Err("--name is empty".into());
         }
@@ -145,6 +155,7 @@ pub(crate) enum Source {
     SchLib,
     PcbLib,
     IntLib,
+    DbLib,
 }
 
 pub(crate) fn classify(path: &Path) -> Result<Source, String> {
@@ -163,10 +174,7 @@ pub(crate) fn classify(path: &Path) -> Result<Source, String> {
         "schlib" => Ok(Source::SchLib),
         "pcblib" => Ok(Source::PcbLib),
         "intlib" => Ok(Source::IntLib),
-        "dblib" => Err(format!(
-            "{}: reading .dblib is not implemented yet",
-            path.display()
-        )),
+        "dblib" => Ok(Source::DbLib),
         _ => Err(format!(
             "{}: unsupported input; expected .SchLib, .PcbLib, .IntLib or .DbLib",
             path.display()
@@ -350,11 +358,7 @@ mod tests {
         assert_eq!(classify(Path::new("x.SCHLIB")), Ok(Source::SchLib));
         assert_eq!(classify(Path::new("x.pcblib")), Ok(Source::PcbLib));
         assert_eq!(classify(Path::new("x.IntLib")), Ok(Source::IntLib));
-        assert!(
-            classify(Path::new("x.DbLib"))
-                .unwrap_err()
-                .contains("not implemented")
-        );
+        assert_eq!(classify(Path::new("x.DbLib")), Ok(Source::DbLib));
         assert!(
             classify(Path::new("x.txt"))
                 .unwrap_err()

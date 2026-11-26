@@ -10,6 +10,7 @@
 
 pub mod check;
 pub mod codes;
+pub mod dblib;
 mod keepouts;
 pub mod library;
 pub mod libset;

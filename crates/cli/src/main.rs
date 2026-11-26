@@ -13,6 +13,7 @@
 mod contract;
 mod ledger;
 mod library_cmd;
+mod library_db;
 mod library_run;
 mod output_guard;
 mod progress;

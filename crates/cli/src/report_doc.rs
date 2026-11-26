@@ -13,6 +13,7 @@ use crate::contract::{CONTRACT, CONVERTER, Counts};
 
 pub const REPORT_JSON: &str = "import-report.json";
 pub const REPORT_MD: &str = "import-report.md";
+pub const MAPPING: &str = "import-mapping.toml";
 
 /// One source file the run read, with its content hash.
 #[derive(Debug, Clone)]
@@ -44,6 +45,8 @@ pub struct LibraryReport {
     /// What this run (or, for a run that wrote nothing, the previous one)
     /// wrote: the record the next `--update` deletes by.
     pub ledger: Option<crate::ledger::Ledger>,
+    /// The column mapping a database run used (`import-mapping.toml`).
+    pub mapping: Option<String>,
 }
 
 impl LibraryReport {
@@ -56,6 +59,7 @@ impl LibraryReport {
             written: Counts::default(),
             report: Report::default(),
             ledger: None,
+            mapping: None,
         }
     }
 
@@ -63,7 +67,10 @@ impl LibraryReport {
         self.report
             .items()
             .iter()
-            .filter(|i| i.kind == kind && i.severity == Severity::Error)
+            .filter(|i| {
+                (i.kind == kind || (kind == ItemKind::Part && i.kind == ItemKind::Row))
+                    && i.severity == Severity::Error
+            })
             .count()
     }
 
@@ -183,6 +190,11 @@ impl LibraryReport {
             .with_context(|| format!("writing {}", json_path.display()))?;
         signex_types::atomic_io::atomic_write(&md_path, self.to_markdown().as_bytes())
             .with_context(|| format!("writing {}", md_path.display()))?;
+        if let Some(m) = &self.mapping {
+            let p = dir.join(MAPPING);
+            signex_types::atomic_io::atomic_write(&p, m.as_bytes())
+                .with_context(|| format!("writing {}", p.display()))?;
+        }
         Ok((json_path, md_path))
     }
 }

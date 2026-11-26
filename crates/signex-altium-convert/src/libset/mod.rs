@@ -10,25 +10,24 @@ mod classes;
 mod fields;
 mod ids;
 mod models;
+mod parts;
 mod snxlib;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use altium_format::pcb::PcbLib;
 use altium_format::sch::SchLib;
 use chrono::{DateTime, Timelike, Utc};
 use serde_json::json;
-use signex_library::component::{ComponentRow, DESIGNATOR_PREFIX_PARAM, PlmReserved};
-use signex_library::param::ParamValue;
 use signex_library::primitive::Footprint;
 use signex_library::primitive::symbol::{Symbol, SymbolFile};
 use signex_library::templates::TemplateRegistry;
-use signex_library::{ComponentClass, FootprintFile, InternalPn, LifecycleState, PrimitiveRef};
+use signex_library::{FootprintFile, LifecycleState};
 use uuid::Uuid;
 
 use crate::library::{footprints_scoped, symbols_scoped};
-use crate::report::{Item, ItemKind, Report, Severity};
-use bind::{FootprintIndex, bind};
+use crate::report::Report;
+use bind::FootprintIndex;
 use snxlib::{epoch, library_text};
 
 pub use ids::library_id;
@@ -40,6 +39,37 @@ const VERSION: &str = "1.0.0";
 pub enum SourceBody {
     Sch(SchLib),
     Pcb(PcbLib),
+    /// The rows of one database table (`dbmodel`): the parts come from these,
+    /// and only the symbols and footprints they name are written.
+    Database(DatabaseSet),
+}
+
+/// One database row, its library references already resolved to names of the
+/// other sources (`SourceLib::name`).
+#[derive(Debug, Clone)]
+pub struct DbRow {
+    pub key: String,
+    pub description: String,
+    /// Parameters in column order, by the name they are recognised under.
+    pub params: Vec<(String, String)>,
+    /// (schematic library source name, component name).
+    pub symbol: (String, String),
+    /// Default footprint first, then the alternates: (PCB library source
+    /// name, footprint name).
+    pub footprints: Vec<(String, String)>,
+}
+
+/// A database table's resolved rows.
+#[derive(Debug, Clone, Default)]
+pub struct DatabaseSet {
+    /// The library table's name.
+    pub table: String,
+    pub rows: Vec<DbRow>,
+    /// Rows of the table that could not be resolved and were reported by the
+    /// caller: they count as source parts.
+    pub skipped: usize,
+    /// The parts are released (a database's rows are).
+    pub released: bool,
 }
 
 /// One source file, already read.
@@ -217,6 +247,7 @@ fn source_stamp(sources: &[SourceLib]) -> DateTime<Utc> {
         .filter_map(|s| match &s.body {
             SourceBody::Sch(l) => l.modified,
             SourceBody::Pcb(l) => l.modified,
+            SourceBody::Database(_) => None,
         })
         .max()
         .map(|t| {
@@ -287,18 +318,6 @@ pub fn slug(name: &str) -> String {
     }
 }
 
-fn error_item(code: &'static str, source: String, message: String, kind: ItemKind) -> Item {
-    Item {
-        kind,
-        source,
-        id: None,
-        code,
-        severity: Severity::Error,
-        message,
-        detail: serde_json::Value::Null,
-    }
-}
-
 pub fn build_library(
     sources: &[SourceLib],
     opts: &LibraryOptions,
@@ -310,9 +329,31 @@ pub fn build_library(
         .map(|s| match &s.body {
             SourceBody::Sch(l) => l.components.len(),
             SourceBody::Pcb(l) => l.footprints.len(),
+            SourceBody::Database(d) => d.rows.len(),
         })
         .sum();
     let mut done = 0;
+    // With a database, only the symbols and footprints its rows name are
+    // written, and its rows (not the components) are the parts.
+    let mut want_symbols: Option<std::collections::HashSet<(String, String)>> = None;
+    let mut want_footprints: Option<std::collections::HashSet<(String, String)>> = None;
+    for s in sources {
+        if let SourceBody::Database(d) = &s.body {
+            let ws = want_symbols.get_or_insert_default();
+            let wf = want_footprints.get_or_insert_default();
+            for r in &d.rows {
+                ws.insert((r.symbol.0.to_lowercase(), r.symbol.1.to_lowercase()));
+                for f in &r.footprints {
+                    wf.insert((f.0.to_lowercase(), f.1.to_lowercase()));
+                }
+            }
+        }
+    }
+    let database_mode = want_symbols.is_some();
+    let mut symbol_info: HashMap<
+        (String, String),
+        (Uuid, String, Option<altium_format::sch::Text>),
+    > = HashMap::new();
     let stamp = source_stamp(sources);
     let mut footprint_versions: HashMap<Uuid, String> = HashMap::new();
     let mut sorted: Vec<&SourceLib> = sources.iter().collect();
@@ -333,7 +374,6 @@ pub fn build_library(
     let mut files: Vec<(String, String)> = Vec::new();
     let mut source = Counts::default();
     let mut written = Counts::default();
-    let mut row_ids: Vec<Uuid> = Vec::new();
     let mut symbol_ids: Vec<Uuid> = Vec::new();
     let mut footprint_ids: Vec<Uuid> = Vec::new();
     let mut model_counts = models::ModelCounts::default();
@@ -344,9 +384,26 @@ pub fn build_library(
         let SourceBody::Pcb(lib) = &s.body else {
             continue;
         };
-        let names: Vec<&str> = lib.footprints.iter().map(|f| f.name.as_str()).collect();
-        let ids = ids::ids_for(lib_id, "footprint", &s.name, &names);
-        source.footprints += names.len();
+        let all_names: Vec<&str> = lib.footprints.iter().map(|f| f.name.as_str()).collect();
+        let all_ids = ids::ids_for(lib_id, "footprint", &s.name, &all_names);
+        let kept: Vec<usize> = (0..all_names.len())
+            .filter(|&i| {
+                want_footprints.as_ref().is_none_or(|w| {
+                    w.contains(&(s.name.to_lowercase(), all_names[i].to_lowercase()))
+                })
+            })
+            .collect();
+        let filtered;
+        let (lib, ids): (&PcbLib, Vec<Uuid>) = if kept.len() == all_names.len() {
+            (lib, all_ids)
+        } else {
+            filtered = PcbLib {
+                footprints: kept.iter().map(|&i| lib.footprints[i].clone()).collect(),
+                ..lib.clone()
+            };
+            (&filtered, kept.iter().map(|&i| all_ids[i]).collect())
+        };
+        source.footprints += lib.footprints.len();
         let fps = footprints_scoped(lib, &s.name, &ids, report);
         for (mut fp, src_fp) in fps.into_iter().zip(&lib.footprints) {
             fp.released = s.released;
@@ -410,23 +467,45 @@ pub fn build_library(
 
     // Symbols and parts.
     let templates = TemplateRegistry::new_with_builtins();
-    let mut taken_pns: HashMap<String, usize> = HashMap::new();
-    let mut rows: BTreeMap<&'static str, Vec<signex_library::LibraryRow>> = BTreeMap::new();
-    let mut classes: BTreeMap<&'static str, &'static str> = BTreeMap::new();
+    let mut parts = parts::Parts::default();
     let mut used_slugs: HashMap<String, usize> = HashMap::new();
     for s in &sorted {
         let SourceBody::Sch(lib) = &s.body else {
             continue;
         };
-        let names: Vec<&str> = lib
+        let all_names: Vec<&str> = lib
             .components
             .iter()
             .map(|c| c.lib_reference.as_str())
             .collect();
-        source.symbols += names.len();
-        source.parts += names.len();
-        let sym_ids = ids::ids_for(lib_id, "symbol", &s.name, &names);
-        let part_ids = ids::ids_for(lib_id, "part", &s.name, &names);
+        let all_sym_ids = ids::ids_for(lib_id, "symbol", &s.name, &all_names);
+        let all_part_ids = ids::ids_for(lib_id, "part", &s.name, &all_names);
+        let kept: Vec<usize> = (0..all_names.len())
+            .filter(|&i| {
+                want_symbols.as_ref().is_none_or(|w| {
+                    w.contains(&(s.name.to_lowercase(), all_names[i].to_lowercase()))
+                })
+            })
+            .collect();
+        let filtered;
+        let (lib, sym_ids, part_ids): (&SchLib, Vec<Uuid>, Vec<Uuid>) =
+            if kept.len() == all_names.len() {
+                (lib, all_sym_ids, all_part_ids)
+            } else {
+                filtered = SchLib {
+                    components: kept.iter().map(|&i| lib.components[i].clone()).collect(),
+                    ..lib.clone()
+                };
+                (
+                    &filtered,
+                    kept.iter().map(|&i| all_sym_ids[i]).collect(),
+                    kept.iter().map(|&i| all_part_ids[i]).collect(),
+                )
+            };
+        source.symbols += lib.components.len();
+        if !database_mode {
+            source.parts += lib.components.len();
+        }
         let mut symbols = symbols_scoped(lib, &s.name, &sym_ids, report);
         for sym in &mut symbols {
             let (version, created, updated) = stamp_primitive(
@@ -441,6 +520,11 @@ pub fn build_library(
             sym.updated = updated;
         }
         let sym_versions: Vec<String> = symbols.iter().map(|s| s.version.clone()).collect();
+        for (i, c) in lib.components.iter().enumerate() {
+            symbol_info
+                .entry((s.name.to_lowercase(), c.lib_reference.to_lowercase()))
+                .or_insert_with(|| (sym_ids[i], sym_versions[i].clone(), c.designator.clone()));
+        }
         written.symbols += symbols.len();
         symbol_ids.extend(symbols.iter().map(|s| s.uuid));
         if !symbols.is_empty() {
@@ -466,147 +550,107 @@ pub fn build_library(
             files.push((rel, text));
         }
 
-        for (i, comp) in lib.components.iter().enumerate() {
+        for (i, comp) in lib.components.iter().enumerate().filter(|_| !database_mode) {
             let source_name = format!("{}:{}", s.name, comp.lib_reference);
             done += 1;
             on_item(done, total, &source_name);
-            let row_id = part_ids[i];
-            report.set_scope_with_id(source_name.clone(), row_id);
+            let cx = parts::PartCx {
+                lib_id,
+                opts,
+                stamp,
+                templates: &templates,
+                index: &index,
+                footprint_versions: &footprint_versions,
+            };
+            parts.add(
+                &cx,
+                report,
+                parts::PartInput {
+                    comp,
+                    source_name,
+                    row_id: part_ids[i],
+                    symbol_id: sym_ids[i],
+                    symbol_version: sym_versions[i].clone(),
+                    released: s.released,
+                    table: None,
+                    pn: &comp.lib_reference,
+                },
+            );
+        }
+    }
 
-            let Some(binding) = bind(comp, &index, report) else {
-                // The error item says why; the part is not written.
-                report.set_scope("");
+    for s in &sorted {
+        let SourceBody::Database(d) = &s.body else {
+            continue;
+        };
+        source.parts += d.rows.len() + d.skipped;
+        let keys: Vec<String> = d
+            .rows
+            .iter()
+            .map(|r| format!("{}:{}", d.table, r.key))
+            .collect();
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let part_ids = ids::ids_for(lib_id, "part", &s.name, &key_refs);
+        for (row, row_id) in d.rows.iter().zip(part_ids) {
+            let source_name = format!("{}:{}", d.table, row.key);
+            done += 1;
+            on_item(done, total, &source_name);
+            let Some((symbol_id, symbol_version, designator)) =
+                symbol_info.get(&(row.symbol.0.to_lowercase(), row.symbol.1.to_lowercase()))
+            else {
                 continue;
             };
-
-            let prefix = classes::designator_prefix(
-                comp.designator.as_ref().map_or("", |d| d.text.as_str()),
-            );
-            let class = classes::class_for_prefix(&prefix);
-            let template = templates
-                .resolve(Uuid::nil(), class)
-                .or_else(|| templates.resolve(Uuid::nil(), "generic"));
-            let f = fields::map_fields(comp, template, report);
-            let mut parameters = f.parameters;
-            if !prefix.is_empty() {
-                parameters.insert(DESIGNATOR_PREFIX_PARAM.into(), ParamValue::Text(prefix));
-            }
-            if let Some(t) = template {
-                let missing: Vec<&str> = t
-                    .required_params
+            let comp = altium_format::sch::Component {
+                lib_reference: row.key.clone(),
+                description: row.description.clone(),
+                designator: designator.clone(),
+                parameters: row
+                    .params
                     .iter()
-                    .filter(|p| !parameters.contains_key(&p.name))
-                    .map(|p| p.name.as_str())
-                    .collect();
-                if !missing.is_empty() {
-                    report.warn_detail(
-                        "part.template_incomplete",
-                        format!("the {class} template wants {}", missing.join(", ")),
-                        json!({ "class": class, "missing": missing }),
-                    );
-                }
-            }
-
-            // Part number: the component name, `~2`, `~3` for repeats in
-            // (source path, source order).
-            let (base, cleaned) = crate::text::cell_safe(&comp.lib_reference);
-            if cleaned {
-                report.warn(
-                    "part.text_sanitized",
-                    "control characters or a triple apostrophe in the part name replaced",
-                );
-            }
-            let n = taken_pns.entry(base.clone()).or_default();
-            *n += 1;
-            let pn = if *n == 1 {
-                base.clone()
-            } else {
-                format!("{base}~{n}")
+                    .map(|(n, v)| altium_format::sch::Parameter {
+                        name: n.clone(),
+                        text: altium_format::sch::Text {
+                            text: v.clone(),
+                            ..Default::default()
+                        },
+                    })
+                    .collect(),
+                implementations: row
+                    .footprints
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, name))| altium_format::sch::Implementation {
+                        model_name: name.clone(),
+                        model_type: "PCBLIB".into(),
+                        is_current: i == 0,
+                        pin_map: Vec::new(),
+                        pin_map_unread: false,
+                    })
+                    .collect(),
+                ..Default::default()
             };
-            if *n > 1 {
-                report.warn_detail(
-                    "part.pn_collision",
-                    format!("part number {base} is taken; this part is {pn}"),
-                    json!({ "part_number": pn, "name": base }),
-                );
-            }
-
-            let mut row = ComponentRow {
-                row_id,
-                internal_pn: InternalPn::new(pn),
-                class: ComponentClass::new(class),
-                datasheet: Default::default(),
-                datasheet_label: String::new(),
-                description: f.description,
-                more_datasheets: Vec::new(),
-                state: if s.released {
-                    LifecycleState::Released
-                } else {
-                    LifecycleState::Draft
-                },
-                symbol_ref: PrimitiveRef::new(lib_id, sym_ids[i]),
-                alternate_symbols: Vec::new(),
-                footprint_ref: binding.default.map(|id| PrimitiveRef::new(lib_id, id)),
-                alternate_footprints: binding.alternate_bindings(lib_id, &footprint_versions),
-                sim_ref: None,
-                pin_map_overrides: binding.default_overrides,
-                primary_mpn: f.primary,
-                alternates: f.alternates,
-                supply: f.supply,
-                parameters,
-                plm: PlmReserved::default(),
-                version: VERSION.into(),
-                released: s.released,
-                symbol_version: sym_versions[i].clone(),
-                footprint_version: binding
-                    .default
-                    .and_then(|id| footprint_versions.get(&id).cloned())
-                    .unwrap_or_default(),
-                sim_version: String::new(),
-                created: stamp,
-                updated: stamp,
-                content_hash: [0; 32],
-                server_revision: None,
+            let cx = parts::PartCx {
+                lib_id,
+                opts,
+                stamp,
+                templates: &templates,
+                index: &index,
+                footprint_versions: &footprint_versions,
             };
-            row.set_documents(f.docs);
-            let previous = opts.previous.get(&row_id);
-            if let Some(p) = previous {
-                row.state = p.state;
-                row.released = p.released;
-                row.created = p.created;
-                row.version = p.version.clone();
-                row.updated = p.updated;
-            }
-            let made = signex_library::validate::validate_row_for_write(&row)
-                .map_err(|e| BuildError::Row(e.to_string()))
-                .and_then(|()| {
-                    row.content_hash = signex_library::hash_row_content(&row)
-                        .map_err(|e| BuildError::Row(e.to_string()))?;
-                    if previous.is_some_and(|p| {
-                        p.content_hash != row.content_hash
-                            || p.symbol_version != row.symbol_version
-                            || p.footprint_version != row.footprint_version
-                    }) {
-                        row.version = bump_patch(&row.version);
-                        row.updated = opts.now;
-                    }
-                    row_cells(&row)
-                });
-            report.set_scope("");
-            match made {
-                Ok(cells) => {
-                    classes.insert(class, classes::class_label(class));
-                    rows.entry(class).or_default().push(cells);
-                    written.parts += 1;
-                    row_ids.push(row_id);
-                }
-                Err(e) => report.push(error_item(
-                    "part.row_invalid",
+            parts.add(
+                &cx,
+                report,
+                parts::PartInput {
+                    comp: &comp,
                     source_name,
-                    format!("part not written: {e}"),
-                    ItemKind::Part,
-                )),
-            }
+                    row_id,
+                    symbol_id: *symbol_id,
+                    symbol_version: symbol_version.clone(),
+                    released: d.released,
+                    table: Some(&d.table),
+                    pn: &row.key,
+                },
+            );
         }
     }
 
@@ -614,7 +658,9 @@ pub fn build_library(
     written.models = model_counts.written;
     let name = opts.name.trim();
     let name = if name.is_empty() { "library" } else { name };
-    let text = library_text(lib_id, name, &classes, rows)?;
+    written.parts = parts.written;
+    let row_ids = parts.row_ids.clone();
+    let text = library_text(lib_id, name, &parts.classes, parts.rows)?;
     files.push((format!("{}.snxlib", slug(name)), text));
     for (rel, text) in &mut files {
         if let Some(old) = opts.previous_files.get(rel.as_str())

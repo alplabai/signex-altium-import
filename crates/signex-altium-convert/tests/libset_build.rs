@@ -1112,6 +1112,7 @@ fn a_model_named_outside_the_file_is_read_from_models_dir() {
             body: match &l.body {
                 SourceBody::Pcb(p) => SourceBody::Pcb(p.clone()),
                 SourceBody::Sch(s) => SourceBody::Sch(s.clone()),
+                SourceBody::Database(d) => SourceBody::Database(d.clone()),
             },
         };
         let b = build_library(&[src], &o, &mut r, &mut |_, _, _| {}).unwrap();

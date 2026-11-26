@@ -397,7 +397,8 @@ fn update_needs_a_library_in_the_directory() {
 fn bad_input_fails_with_a_summary() {
     let out = Tmp::new();
     let dir = out.0.join("lib");
-    for input in ["x.txt", "x.DbLib"] {
+    #[allow(clippy::single_element_loop)]
+    for input in ["x.txt"] {
         let o = run(&[
             os("library"),
             os(input),

@@ -106,8 +106,8 @@ pub fn row_cells(row: &ComponentRow) -> Result<LibraryRow, BuildError> {
 pub fn library_text(
     library_id: Uuid,
     name: &str,
-    classes: &BTreeMap<&'static str, &'static str>,
-    rows: BTreeMap<&'static str, Vec<LibraryRow>>,
+    classes: &BTreeMap<String, &'static str>,
+    rows: BTreeMap<String, Vec<LibraryRow>>,
 ) -> Result<String, BuildError> {
     let manifest = SnxlibManifest {
         format: FORMAT_TOKEN.to_string(),
@@ -125,7 +125,7 @@ pub fn library_text(
         classes: classes
             .iter()
             .map(|(key, label)| ClassEntry {
-                key: (*key).to_string(),
+                key: key.clone(),
                 label: (*label).to_string(),
             })
             .collect(),
@@ -139,7 +139,7 @@ pub fn library_text(
             columns.push(alt.to_string());
         }
         tables.insert(
-            class.to_string(),
+            class,
             LibraryTable {
                 columns,
                 rows: rows.into_iter().map(Arc::new).collect(),
