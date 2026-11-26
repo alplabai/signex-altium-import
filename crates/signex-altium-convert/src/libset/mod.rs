@@ -9,6 +9,7 @@ mod bind;
 mod classes;
 mod fields;
 mod ids;
+mod models;
 mod snxlib;
 
 use std::collections::{BTreeMap, HashMap};
@@ -48,6 +49,9 @@ pub struct SourceLib {
     /// The file's stem; names its items in the report (`<name>:<item>`).
     pub name: String,
     pub body: SourceBody,
+    /// The library's parts are released (they come from an integrated
+    /// library, which is a published artefact).
+    pub released: bool,
 }
 
 pub struct LibraryOptions {
@@ -55,6 +59,8 @@ pub struct LibraryOptions {
     pub name: String,
     /// Overrides the id derived from the source file names.
     pub library_id: Option<Uuid>,
+    /// Embed 3D models (`--models include`) or skip them.
+    pub include_models: bool,
     /// The parts of the library an `--update` run refreshes, by row id.
     pub previous: HashMap<Uuid, PreviousRow>,
     /// The symbols and footprints of the library an `--update` refreshes.
@@ -73,6 +79,7 @@ impl LibraryOptions {
         LibraryOptions {
             name: name.into(),
             library_id: None,
+            include_models: true,
             previous: HashMap::new(),
             previous_files: HashMap::new(),
             previous_symbols: HashMap::new(),
@@ -323,6 +330,7 @@ pub fn build_library(
     let mut row_ids: Vec<Uuid> = Vec::new();
     let mut symbol_ids: Vec<Uuid> = Vec::new();
     let mut footprint_ids: Vec<Uuid> = Vec::new();
+    let mut model_counts = models::ModelCounts::default();
 
     // Footprints first: parts bind to them by name.
     let mut index = FootprintIndex::default();
@@ -334,7 +342,24 @@ pub fn build_library(
         let ids = ids::ids_for(lib_id, "footprint", &s.name, &names);
         source.footprints += names.len();
         let fps = footprints_scoped(lib, &s.name, &ids, report);
-        for mut fp in fps {
+        for (mut fp, src_fp) in fps.into_iter().zip(&lib.footprints) {
+            fp.released = s.released;
+            let model = models::resolve(
+                src_fp,
+                lib,
+                opts.include_models,
+                &format!("{}:{}", s.name, src_fp.name),
+                report,
+                &mut model_counts,
+            );
+            if let Some(m) = &model {
+                fp.step_attachment = Some(signex_library::primitive::footprint::StepAttachment {
+                    content_hash: signex_library::primitive::footprint::step_model_hash(&m.bytes),
+                    filename: m.filename.clone(),
+                    offset_xyz: m.offset_xyz,
+                    rotation_xyz: m.rotation_xyz,
+                });
+            }
             let (version, created, updated) = stamp_primitive(
                 opts.previous_footprints.get(&fp.uuid),
                 &footprint_text(&fp)?,
@@ -358,7 +383,10 @@ pub fn build_library(
             let fp_uuid = fp.uuid;
             let file_id = ids::item_id(lib_id, "footprint-file", &fp.uuid.to_string());
             let rel = format!("footprints/{}.snxfpt", fp.uuid);
-            let file = FootprintFile::with_identity(fp, file_id, stamp);
+            let mut file = FootprintFile::with_identity(fp, file_id, stamp);
+            if let Some(m) = &model {
+                file.models.insert_step(&m.filename, &m.bytes);
+            }
             let text = file
                 .to_toml_string()
                 .map_err(|e| BuildError::Library(e.to_string()))?;
@@ -401,6 +429,7 @@ pub fn build_library(
                 stamp,
                 opts.now,
             );
+            sym.released = s.released;
             sym.version = version;
             sym.created = created;
             sym.updated = updated;
@@ -504,7 +533,11 @@ pub fn build_library(
                 datasheet_label: String::new(),
                 description: f.description,
                 more_datasheets: Vec::new(),
-                state: LifecycleState::Draft,
+                state: if s.released {
+                    LifecycleState::Released
+                } else {
+                    LifecycleState::Draft
+                },
                 symbol_ref: PrimitiveRef::new(lib_id, sym_ids[i]),
                 alternate_symbols: Vec::new(),
                 footprint_ref: binding.default.map(|id| PrimitiveRef::new(lib_id, id)),
@@ -517,7 +550,7 @@ pub fn build_library(
                 parameters,
                 plm: PlmReserved::default(),
                 version: VERSION.into(),
-                released: false,
+                released: s.released,
                 symbol_version: sym_versions[i].clone(),
                 footprint_version: binding
                     .default
@@ -571,6 +604,8 @@ pub fn build_library(
         }
     }
 
+    source.models = model_counts.source;
+    written.models = model_counts.written;
     let name = opts.name.trim();
     let name = if name.is_empty() { "library" } else { name };
     let text = library_text(lib_id, name, &classes, rows)?;

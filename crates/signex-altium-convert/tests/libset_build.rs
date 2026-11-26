@@ -29,6 +29,7 @@ fn stem(name: &str) -> String {
 
 fn sch(name: &str) -> SourceLib {
     SourceLib {
+        released: false,
         path: format!("/in/{name}"),
         name: stem(name),
         body: SourceBody::Sch(SchLib::open(sample(name)).unwrap()),
@@ -37,6 +38,7 @@ fn sch(name: &str) -> SourceLib {
 
 fn pcb(name: &str) -> SourceLib {
     SourceLib {
+        released: false,
         path: format!("/in/{name}"),
         name: stem(name),
         body: SourceBody::Pcb(PcbLib::open(sample(name)).unwrap()),
@@ -115,7 +117,7 @@ fn self_check(b: &Built) {
             let _: Vec<serde_json::Value> = serde_json::from_str(&cell("supply")).unwrap();
             let _: serde_json::Value = serde_json::from_str(&cell("parameters")).unwrap();
             assert_eq!(cell("content_hash").len(), 64);
-            assert_eq!(cell("state"), "Draft");
+            assert!(["Draft", "Released"].contains(&cell("state").as_str()));
             assert_eq!(cell("version"), "1.0.0");
         }
     }
@@ -220,6 +222,7 @@ fn with_designator(mut c: Component, name: &str, designator: &str) -> Component 
 
 fn schlib_of(comps: Vec<Component>) -> SourceLib {
     SourceLib {
+        released: false,
         path: "/in/parts.SchLib".into(),
         name: "parts".into(),
         body: SourceBody::Sch(SchLib {
@@ -307,6 +310,7 @@ fn pcblib_with(names: &[&str]) -> SourceLib {
         })
         .collect();
     SourceLib {
+        released: false,
         path: "/in/fp.PcbLib".into(),
         name: "fp".into(),
         body: SourceBody::Pcb(lib),
@@ -827,4 +831,227 @@ fn a_source_saved_again_with_a_newer_time_changes_nothing() {
     let mut r = Report::default();
     let again = build_library(&mk(1_750_000_000), &o, &mut r, &mut |_, _, _| {}).unwrap();
     assert_eq!(again.files, first.files);
+}
+
+// --- integrated libraries and 3D models -------------------------------------
+
+fn int_sources(path: &Path) -> Vec<SourceLib> {
+    let int = altium_format::intlib::IntLib::open(path).unwrap();
+    let name = stem(&path.file_name().unwrap().to_string_lossy());
+    let p = path.to_string_lossy().into_owned();
+    int.schlibs
+        .into_iter()
+        .map(|e| (SourceBody::Sch(e.lib), true))
+        .chain(
+            int.pcblibs
+                .into_iter()
+                .map(|e| (SourceBody::Pcb(e.lib), true)),
+        )
+        .map(|(body, released)| SourceLib {
+            released,
+            path: p.clone(),
+            name: name.clone(),
+            body,
+        })
+        .collect()
+}
+
+fn sha(b: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(b)
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect()
+}
+
+fn footprints_of(b: &Built) -> Vec<FootprintFile> {
+    b.files
+        .iter()
+        .filter(|(p, _)| p.starts_with("footprints/"))
+        .map(|(_, t)| FootprintFile::from_toml_str(t).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_packed_intlib_converts_with_released_parts() {
+    let sch_bytes = std::fs::read(sample("simple.SchLib")).unwrap();
+    let pcb_bytes = std::fs::read(sample("Simple.PcbLib")).unwrap();
+    let packed = altium_format::intlib::pack(Some(&sch_bytes), Some(&pcb_bytes), None).unwrap();
+    let dir = std::env::temp_dir().join(format!("snx-intlib-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Packed.IntLib");
+    std::fs::write(&path, packed).unwrap();
+    let (b, r) = convert(&int_sources(&path));
+    let (pair, _) = convert(&[sch("simple.SchLib"), pcb("Simple.PcbLib")]);
+    assert_eq!(b.written, pair.written);
+    self_check(&b);
+    completeness(&b, &r);
+    let lib = snxlib(&b);
+    for t in lib.tables.values() {
+        for row in &t.rows {
+            assert_eq!(t.cell(row, "state").unwrap(), "Released");
+            assert_eq!(t.cell(row, "released").unwrap(), "true");
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn embedded_step_models_attach_with_the_hash_of_their_inflated_bytes() {
+    let src = PcbLib::open(sample("Simple.PcbLib")).unwrap();
+    let (b, r) = convert(&[pcb("Simple.PcbLib")]);
+    assert_eq!(b.source.models, 2);
+    assert_eq!(b.written.models, 2);
+    completeness_models(&b, &r);
+    let files = footprints_of(&b);
+    let mut attached = 0;
+    for f in &files {
+        assert_eq!(f.footprints.len(), 1);
+        let fp = &f.footprints[0];
+        if let Some(a) = &fp.step_attachment {
+            attached += 1;
+            let model = src
+                .models
+                .iter()
+                .find(|m| m.name == a.filename)
+                .unwrap_or_else(|| panic!("{}", a.filename));
+            assert_eq!(a.content_hash, sha(model.data.as_ref().unwrap()));
+            assert_eq!(a.offset_xyz, [0.0, 0.0, 0.0]);
+            assert_eq!(a.rotation_xyz, [0.0, 0.0, 0.0]);
+            assert_eq!(f.models.len(), 1);
+            f.verify_models().unwrap();
+            assert_eq!(
+                f.step_model(fp).unwrap().unwrap(),
+                *model.data.as_ref().unwrap()
+            );
+        }
+    }
+    assert_eq!(attached, 2);
+    // Files with a model use the embedded-model token.
+    let token = |f: &FootprintFile| {
+        f.to_toml_string()
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    };
+    assert!(files.iter().any(|f| token(f).contains("1.4")));
+}
+
+fn completeness_models(b: &Built, r: &Report) {
+    let errors = r
+        .items()
+        .iter()
+        .filter(|i| i.kind == ItemKind::Model && i.severity == Severity::Error)
+        .count();
+    assert_eq!(b.source.models, b.written.models + errors);
+}
+
+#[test]
+fn models_skip_embeds_nothing_and_reports_each() {
+    let mut r = Report::default();
+    let o = LibraryOptions {
+        include_models: false,
+        ..LibraryOptions::fresh("Test")
+    };
+    let b = build_library(&[pcb("Simple.PcbLib")], &o, &mut r, &mut |_, _, _| {}).unwrap();
+    assert_eq!((b.source.models, b.written.models), (0, 0));
+    assert!(
+        footprints_of(&b)
+            .iter()
+            .all(|f| f.models.is_empty() && f.footprints[0].step_attachment.is_none())
+    );
+    assert_eq!(
+        r.items()
+            .iter()
+            .filter(|i| i.code == "model.skipped")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn models_that_cannot_be_embedded_are_reported_as_errors() {
+    for (what, code) in [
+        ("not step", "model.not_step"),
+        ("external", "model.external"),
+        ("missing", "model.missing"),
+    ] {
+        let mut l = pcb("Simple.PcbLib");
+        if let SourceBody::Pcb(lib) = &mut l.body {
+            match what {
+                "not step" => lib.models[0].data = Some(b"PK\x03\x04 not a step".to_vec()),
+                "external" => {
+                    lib.models[0].data = None;
+                    lib.models[0].embedded = false;
+                }
+                _ => lib.models[0].id = "{00000000-0000-0000-0000-000000000000}".into(),
+            }
+        }
+        let (b, r) = convert(&[l]);
+        assert_eq!((b.source.models, b.written.models), (2, 1), "{what}");
+        let i = r
+            .items()
+            .iter()
+            .find(|i| i.code == code)
+            .unwrap_or_else(|| panic!("{what}"));
+        assert_eq!((i.kind, i.severity), (ItemKind::Model, Severity::Error));
+        completeness_models(&b, &r);
+    }
+}
+
+/// The private corpus: skipped unless `ALP_PRIVATE_INTLIB_DIR` names a folder
+/// holding integrated libraries. Nothing derived from them is committed.
+#[test]
+fn private_intlibs_convert_with_matching_counts() {
+    let Some(dir) = std::env::var_os("ALP_PRIVATE_INTLIB_DIR") else {
+        eprintln!("ALP_PRIVATE_INTLIB_DIR is unset; skipping");
+        return;
+    };
+    let mut seen = 0;
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if !p
+            .extension()
+            .is_some_and(|x| x.eq_ignore_ascii_case("intlib"))
+        {
+            continue;
+        }
+        seen += 1;
+        let int = altium_format::intlib::IntLib::open(&p).unwrap();
+        let comps: usize = int.schlibs.iter().map(|s| s.lib.components.len()).sum();
+        let fps: usize = int.pcblibs.iter().map(|s| s.lib.footprints.len()).sum();
+        assert!(
+            int.cross_ref_mismatches().is_empty(),
+            "{:?}",
+            int.cross_ref_mismatches()
+        );
+        let (b, r) = convert(&int_sources(&p));
+        self_check(&b);
+        completeness(&b, &r);
+        completeness_models(&b, &r);
+        assert_eq!(b.source.parts, comps);
+        assert_eq!(b.source.footprints, fps);
+        assert_eq!(b.written.footprints, fps);
+        // Model hashes are those of the inflated streams.
+        let mut hashes: Vec<String> = int
+            .pcblibs
+            .iter()
+            .flat_map(|s| s.lib.models.iter())
+            .filter_map(|m| m.data.as_ref().map(|d| sha(d)))
+            .collect();
+        hashes.sort();
+        hashes.dedup();
+        for f in footprints_of(&b) {
+            f.verify_models().unwrap();
+            if let Some(a) = &f.footprints[0].step_attachment {
+                assert!(hashes.binary_search(&a.content_hash).is_ok());
+            }
+        }
+        // Converting twice is byte-identical.
+        let (again, _) = convert(&int_sources(&p));
+        assert_eq!(again.files, b.files);
+    }
+    assert!(seen > 0, "no .IntLib in the folder");
 }

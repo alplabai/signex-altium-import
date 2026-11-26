@@ -65,8 +65,18 @@ pub const CODES: &[(&str, Severity)] = &[
     ("part.template_incomplete", I),
     ("part.row_invalid", E),
     ("footprint.name_collision", A),
+    // 3D models.
+    ("model.body_without_model", I),
+    ("model.skipped", I),
+    ("model.extra_body", E),
+    ("model.missing", E),
+    ("model.external", E),
+    ("model.unreadable", E),
+    ("model.not_step", E),
+    ("model.placement_approximated", A),
     // Library runs (`signex-altium-import library`).
     ("library.input_unreadable", E),
+    ("library.crossref_mismatch", I),
 ];
 
 /// The severity of a catalogued code. An uncatalogued code is a bug in the

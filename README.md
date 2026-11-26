@@ -9,7 +9,7 @@ One-way converter from Altium Designer files to Signex native files.
 | `.PcbDoc` | `.snxpcb` | supported |
 | `.SchLib` | `.snxsym` (every symbol in one file) | supported |
 | `.PcbLib` | `.snxfpt` (every footprint in one file) | supported |
-| `.SchLib` + `.PcbLib` (`library`) | one Signex library directory | supported |
+| `.SchLib`, `.PcbLib`, `.IntLib` (`library`) | one Signex library directory | supported |
 
 Source-available under **FSL-1.1-ALv2**, like
 [Signex](https://github.com/alplabai/signex); see [License](#license). The

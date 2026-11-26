@@ -180,10 +180,9 @@ pub fn pack(
         z.finish()
     };
     let mut c = cfb::CompoundFile::create(std::io::Cursor::new(Vec::new()))?;
-    let put =
-        |c: &mut cfb::CompoundFile<std::io::Cursor<Vec<u8>>>, path: &str, bytes: &[u8]| {
-            c.create_stream(path).and_then(|mut s| s.write_all(bytes))
-        };
+    let put = |c: &mut cfb::CompoundFile<std::io::Cursor<Vec<u8>>>, path: &str, bytes: &[u8]| {
+        c.create_stream(path).and_then(|mut s| s.write_all(bytes))
+    };
     if let Some(b) = sch {
         c.create_storage("/SchLib")?;
         put(&mut c, "/SchLib/0.schlib", &deflate(b)?)?;

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use altium_format::intlib::IntLib;
 use altium_format::pcb::PcbLib;
 use altium_format::sch::SchLib;
 use chrono::{DateTime, Utc};
@@ -16,7 +17,7 @@ use uuid::Uuid;
 
 use crate::contract::{Counts, Exit, LibrarySummary};
 use crate::ledger::Ledger;
-use crate::library_cmd::{LibraryArgs, Source, check_output, classify};
+use crate::library_cmd::{LibraryArgs, Models, Source, check_output, classify};
 use crate::output_guard::Guard;
 use crate::progress::Progress;
 use crate::report_doc::{LibraryReport, SourceFile};
@@ -256,19 +257,46 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
         progress.progress(i, Some(args.inputs.len()), Some(&name));
         let abs = path.canonicalize().unwrap_or_else(|_| path.clone());
         let read = SourceFile::hash(&abs).and_then(|src| {
-            let body = match kind {
-                Source::SchLib => SourceBody::Sch(SchLib::open(&abs)?),
-                Source::PcbLib => SourceBody::Pcb(PcbLib::open(&abs)?),
+            let bodies = match kind {
+                Source::SchLib => vec![(SourceBody::Sch(SchLib::open(&abs)?), false)],
+                Source::PcbLib => vec![(SourceBody::Pcb(PcbLib::open(&abs)?), false)],
+                Source::IntLib => {
+                    let int = IntLib::open(&abs)?;
+                    for m in int.cross_ref_mismatches() {
+                        doc.report.push(Item {
+                            kind: ItemKind::Library,
+                            source: name.clone(),
+                            id: None,
+                            code: "library.crossref_mismatch",
+                            severity: Severity::Info,
+                            message: m,
+                            detail: serde_json::Value::Null,
+                        });
+                    }
+                    // Integrated libraries are published: their parts are released.
+                    int.schlibs
+                        .into_iter()
+                        .map(|e| (SourceBody::Sch(e.lib), true))
+                        .chain(
+                            int.pcblibs
+                                .into_iter()
+                                .map(|e| (SourceBody::Pcb(e.lib), true)),
+                        )
+                        .collect()
+                }
             };
-            Ok((src, body))
+            Ok((src, bodies))
         });
         match read {
-            Ok((src, body)) => {
-                sources.push(SourceLib {
-                    path: abs.to_string_lossy().into_owned(),
-                    name,
-                    body,
-                });
+            Ok((src, bodies)) => {
+                for (body, released) in bodies {
+                    sources.push(SourceLib {
+                        released,
+                        path: abs.to_string_lossy().into_owned(),
+                        name: name.clone(),
+                        body,
+                    });
+                }
                 doc.sources.push(src);
             }
             Err(e) => {
@@ -297,6 +325,7 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
         .as_deref()
         .and_then(|s| Uuid::parse_str(s).ok());
     options.now = Utc::now();
+    options.include_models = args.models == Models::Include;
     let mut existing = None;
     let mut usable: Option<Ledger> = None;
     if args.update {

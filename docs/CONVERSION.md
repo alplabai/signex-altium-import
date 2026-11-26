@@ -223,8 +223,29 @@ Signex repository is the format; `docs/APP_INTEGRATION.md` the command).
   own patch version rises (with `updated` = now) when its content hash or
   either primitive version changed. A part row, symbol or footprint on disk
   that cannot be read fails the run before anything is written.
-- **Not carried yet:** embedded 3D models, `.IntLib` and `.DbLib` sources,
-  folder inputs, simulation models.
+- **Integrated libraries (`.IntLib`)** contribute their embedded schematic
+  and footprint libraries as if they had been given separately, under the
+  `.IntLib`'s name, and their parts are `Released` (state and `released`
+  flag, on symbols and footprints too). The cross-reference stream is only a
+  cross-check: a different entry count or a component name it lacks is
+  reported (`library.crossref_mismatch`, info). An `.IntLib` and a
+  `.SchLib` or `.PcbLib` of the same name cannot be given together.
+- **3D models.** A footprint's component body names a model of the library's
+  model table. A STEP model becomes the footprint's `step_attachment` and a
+  `[[models]]` entry in the footprint's own file (format 1.4); its hash is the
+  SHA-256 of the inflated bytes. Placement: Signex turns a model about x, then
+  y, then z in its own y-up frame, adds the offset, and then flips into the
+  footprint's y-down frame, and Altium's placement is y-up already, so the
+  offset is (`MODEL.2D.X`, `MODEL.2D.Y`, `MODEL.3D.DZ`) in mm and the rotation
+  (`ROTX`, `ROTY`, `ROTZ` + `MODEL.2D.ROTATION`) in degrees, unchanged. That
+  Altium's turn order equals Signex's is not verified in a 3D view; a body
+  with a 2D rotation or a bottom-side projection is reported
+  (`model.placement_approximated`). `--models skip` embeds none and reports
+  each (`model.skipped`, info; skipped models are not counted). A model that
+  is not STEP, not embedded, unreadable or missing from the table, and a
+  second model on one footprint, are not written and reported as `error`
+  items of kind `model`. A body without a model is reported as info.
+- **Not carried yet:** `.DbLib` sources, folder inputs, simulation models.
 - **Completeness.** Every source component is a written part or a part item
   with severity `error`; the run fails with an internal error if the report
   does not account for every one.
@@ -317,6 +338,15 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `part.template_incomplete` | info | The class template wants parameters the part lacks |
 | `part.row_invalid` | error | The part row failed the writer's checks; part not written |
 | `footprint.name_collision` | approximated | A footprint name is already defined; parts bind to the first |
+| `model.body_without_model` | info | A body with no 3D model is not imported |
+| `model.skipped` | info | A model skipped by `--models skip` |
+| `model.extra_body` | error | A footprint holds one model; a further body's model is not imported |
+| `model.missing` | error | The body's model is not in the library's model table |
+| `model.external` | error | The model is not embedded in the library |
+| `model.unreadable` | error | The model's stream is missing or does not inflate |
+| `model.not_step` | error | The model is not a STEP file |
+| `model.placement_approximated` | approximated | A 2D rotation is added to the z turn, or a bottom-side projection is not applied |
+| `library.crossref_mismatch` | info | An integrated library's cross-reference disagrees with its schematic library |
 | `library.input_unreadable` | error | An input file could not be read (library runs) |
 
-54 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.
+63 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.

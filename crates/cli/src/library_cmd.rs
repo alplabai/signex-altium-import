@@ -115,7 +115,16 @@ impl LibraryArgs {
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
                 .to_lowercase();
-            if !seen.insert((ext, stem)) {
+            // An integrated library holds one library of each kind.
+            let kinds: &[&str] = if ext == "intlib" {
+                &["schlib", "pcblib"]
+            } else {
+                &[ext.as_str()]
+            };
+            if kinds
+                .iter()
+                .any(|k| !seen.insert((k.to_string(), stem.clone())))
+            {
                 return Err(format!(
                     "{}: another input of the same kind has this file name; rename one",
                     p.display()
@@ -131,9 +140,11 @@ impl LibraryArgs {
 
 /// A source format `library` knows by extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum Source {
     SchLib,
     PcbLib,
+    IntLib,
 }
 
 pub(crate) fn classify(path: &Path) -> Result<Source, String> {
@@ -151,8 +162,9 @@ pub(crate) fn classify(path: &Path) -> Result<Source, String> {
     match ext.as_str() {
         "schlib" => Ok(Source::SchLib),
         "pcblib" => Ok(Source::PcbLib),
-        "intlib" | "dblib" => Err(format!(
-            "{}: reading .{ext} is not implemented yet",
+        "intlib" => Ok(Source::IntLib),
+        "dblib" => Err(format!(
+            "{}: reading .dblib is not implemented yet",
             path.display()
         )),
         _ => Err(format!(
@@ -337,8 +349,9 @@ mod tests {
     fn input_kinds() {
         assert_eq!(classify(Path::new("x.SCHLIB")), Ok(Source::SchLib));
         assert_eq!(classify(Path::new("x.pcblib")), Ok(Source::PcbLib));
+        assert_eq!(classify(Path::new("x.IntLib")), Ok(Source::IntLib));
         assert!(
-            classify(Path::new("x.IntLib"))
+            classify(Path::new("x.DbLib"))
                 .unwrap_err()
                 .contains("not implemented")
         );

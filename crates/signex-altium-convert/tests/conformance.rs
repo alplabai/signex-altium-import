@@ -190,6 +190,7 @@ fn sample(name: &str) -> PathBuf {
 fn this_converters_own_output_reads_and_rewrites_byte_identical() {
     let sources = vec![
         SourceLib {
+            released: false,
             path: "/in/simple.SchLib".into(),
             name: "simple".into(),
             body: SourceBody::Sch(
@@ -197,6 +198,7 @@ fn this_converters_own_output_reads_and_rewrites_byte_identical() {
             ),
         },
         SourceLib {
+            released: false,
             path: "/in/Simple.PcbLib".into(),
             name: "Simple".into(),
             body: SourceBody::Pcb(

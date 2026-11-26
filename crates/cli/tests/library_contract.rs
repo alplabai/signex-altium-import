@@ -397,7 +397,7 @@ fn update_needs_a_library_in_the_directory() {
 fn bad_input_fails_with_a_summary() {
     let out = Tmp::new();
     let dir = out.0.join("lib");
-    for input in ["x.txt", "x.IntLib"] {
+    for input in ["x.txt", "x.DbLib"] {
         let o = run(&[
             os("library"),
             os(input),
@@ -660,4 +660,47 @@ fn update_with_a_symlinked_folder_does_not_walk_it() {
     );
     assert!(stale.exists());
     assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1);
+}
+
+#[test]
+fn an_intlib_input_converts_with_released_parts_and_models() {
+    let out = Tmp::new();
+    let packed = altium_format::intlib::pack(
+        Some(&std::fs::read(sample("simple.SchLib")).unwrap()),
+        Some(&std::fs::read(sample("Simple.PcbLib")).unwrap()),
+        None,
+    )
+    .unwrap();
+    let input = out.0.join("Packed.IntLib");
+    std::fs::write(&input, packed).unwrap();
+    let dir = out.0.join("lib");
+    let o = run(&[
+        os("library"),
+        input.as_os_str(),
+        os("--output"),
+        dir.as_os_str(),
+        os("--json"),
+    ]);
+    let s = lines(&o.stdout).pop().unwrap();
+    schema().validate(&s).unwrap();
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(s["counts"]["models"], 2);
+    assert!(
+        std::fs::read_to_string(snxlib_path(&dir))
+            .unwrap()
+            .contains("\tReleased\t")
+    );
+    // Without models, none are written.
+    let dir2 = out.0.join("lib2");
+    let o = run(&[
+        os("library"),
+        input.as_os_str(),
+        os("--output"),
+        dir2.as_os_str(),
+        os("--models"),
+        os("skip"),
+        os("--json"),
+    ]);
+    let s = lines(&o.stdout).pop().unwrap();
+    assert_eq!(s["counts"]["models"], 0);
 }

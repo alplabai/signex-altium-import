@@ -65,6 +65,46 @@ the name.
 index][u32 len][zlib]`. Inflated, it gives three `i32` values (x, y,
 length) in 1/100000 units.
 
+### Integrated library (`.IntLib`)
+
+Observed in a private corpus file (two integrated libraries; no sample is
+committed). The compound file holds, at its root:
+
+- `SchLib/<n>.schlib` and `PCBLib/<n>.pcblib`: one embedded library each, in
+  numbered streams (one of each in the observed files). The stream is a type
+  byte `0x02` followed by a zlib stream (`78 xx`); the inflated bytes are
+  themselves a compound file, a complete `.SchLib` or `.PcbLib`, read by the
+  existing readers.
+- `Version.Txt`: five bytes.
+- `LibCrossRef.Txt` and `Parameters   .bin` (three spaces in the name): same
+  type byte and zlib framing. The cross-reference opens with a `u32` entry
+  count equal to the number of schematic components, then per-entry
+  length-prefixed strings (component name, a path inside the file, a
+  description, a source path, the footprint name). It is read only as a
+  cross-check (count and names), never for bindings. `Parameters` holds
+  per-component parameter text and is not read.
+- `CKT/<n>.ckt` simulation models in one of the files: not read.
+
+A stream that is empty, has another type byte, does not inflate, or inflates
+to something that is not a compound file is an error, as is a file with no
+embedded library at all.
+
+### Component bodies and the model table (`.PcbLib`)
+
+Observed in `tests/samples/Simple.PcbLib`.
+
+- A footprint's primitive stream holds record type 12, a component body: the
+  common 13-byte header, five bytes, then a length-prefixed text block of
+  `KEY=value` pairs. The keys used: `MODELID` (a GUID in braces),
+  `MODEL.NAME`, `MODEL.EMBED`, `MODEL.2D.X` / `MODEL.2D.Y` (lengths in mil),
+  `MODEL.2D.ROTATION`, `MODEL.3D.ROTX` / `ROTY` / `ROTZ` (degrees),
+  `MODEL.3D.DZ` (length), `BODYPROJECTION`, `OVERALLHEIGHT`. Outline geometry
+  follows the text and is not read.
+- `Library/Models/Data` is a run of length-prefixed text records, one per
+  model: `ID` (the GUID a body names), `NAME`, `EMBED`, `ROTX/Y/Z`, `DZ`,
+  `CHECKSUM`. Record *i* belongs to stream `Library/Models/<i>`, a bare zlib
+  stream (no type byte) holding the model file; in the sample, a STEP file.
+
 ### Container time
 
 A library's compound-file root entry may record a modified time; a zero time
