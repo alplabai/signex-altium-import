@@ -35,6 +35,7 @@ clap = { version = "4", features = ["derive"] }
 cfb = "0.10"
 # Raw-DEFLATE for the embedded-model / packed streams. MIT OR Apache-2.0.
 flate2 = "1"
+base64 = "0.22"
 encoding_rs = "0.8"
 
 signex-expr = { path = "crates/signex-expr" }

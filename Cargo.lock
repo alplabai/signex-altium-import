@@ -1145,8 +1145,10 @@ name = "signex-library"
 version = "0.15.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "csv",
+ "flate2",
  "serde",
  "serde_json",
  "sha2",
