@@ -154,27 +154,34 @@ pub fn map_fields(
             continue;
         }
         if n == "description" {
+            if !description.is_empty() {
+                report.warn_detail(
+                    "part.param_dropped",
+                    format!("parameter {:?} repeats the description; the later value replaced the earlier", p.name),
+                    json!({ "parameter": p.name }),
+                );
+            }
             description = text;
             continue;
         }
         if let Some(i) = first_indexed(&n, &["manufacturerpartnumber", "manufacturerpn", "mpn"]) {
-            mpn.entry(i).or_insert(text);
+            put(&mut mpn, i, text, &p.name, report);
             continue;
         }
         if let Some(i) = first_indexed(&n, &["manufacturer", "mfr"]) {
-            mfr.entry(i).or_insert(text);
+            put(&mut mfr, i, text, &p.name, report);
             continue;
         }
         if let Some(i) = first_indexed(&n, &["supplierpartnumber", "supplierpn"]) {
-            sku.entry(i).or_insert(text);
+            put(&mut sku, i, text, &p.name, report);
             continue;
         }
         if let Some(i) = first_indexed(&n, &["supplierorderqty", "supplierqty"]) {
-            qty.entry(i).or_insert(text);
+            put(&mut qty, i, text, &p.name, report);
             continue;
         }
         if let Some(i) = first_indexed(&n, &["supplier"]) {
-            sup.entry(i).or_insert(text);
+            put(&mut sup, i, text, &p.name, report);
             continue;
         }
         match n.as_str() {
@@ -229,6 +236,20 @@ pub fn map_fields(
         alternates,
         supply,
         parameters,
+    }
+}
+
+/// Record a numbered value; a repeat of the same number keeps the later
+/// value and says so.
+fn put(map: &mut BTreeMap<u32, String>, index: u32, text: String, name: &str, report: &mut Report) {
+    if map.insert(index, text).is_some() {
+        report.warn_detail(
+            "part.param_dropped",
+            format!(
+                "parameter {name:?} repeats number {index}; the later value replaced the earlier"
+            ),
+            json!({ "parameter": name, "index": index }),
+        );
     }
 }
 
@@ -528,6 +549,29 @@ mod tests {
     fn blank_and_star_values_and_comment_are_skipped() {
         let (f, r) = map("generic", &[("Comment", "10k"), ("X", "*"), ("Y", " ")]);
         assert!(f.parameters.is_empty() && r.is_empty());
+    }
+
+    #[test]
+    fn a_repeated_number_or_description_keeps_the_later_and_reports() {
+        let (f, r) = map(
+            "generic",
+            &[
+                ("Manufacturer", "Acme"),
+                ("Manufacturer 1", "Other"),
+                ("Manufacturer Part Number", "A"),
+                ("Description", "one"),
+                ("Description", "two"),
+            ],
+        );
+        assert_eq!(f.primary.manufacturer, "Other");
+        assert_eq!(f.description, "two");
+        assert_eq!(
+            r.items()
+                .iter()
+                .filter(|i| i.code == "part.param_dropped")
+                .count(),
+            2
+        );
     }
 
     #[test]
