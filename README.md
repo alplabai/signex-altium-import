@@ -9,7 +9,7 @@ One-way converter from Altium Designer files to Signex native files.
 | `.PcbDoc` | `.snxpcb` | supported |
 | `.SchLib` | `.snxsym` (every symbol in one file) | supported |
 | `.PcbLib` | `.snxfpt` (every footprint in one file) | supported |
-| `.SchLib`, `.PcbLib`, `.IntLib` (`library`) | one Signex library directory | supported |
+| `.SchLib`, `.PcbLib`, `.IntLib`, `.DbLib` (`library`) | one Signex library directory | supported |
 
 Source-available under **FSL-1.1-ALv2**, like
 [Signex](https://github.com/alplabai/signex); see [License](#license). The
@@ -59,8 +59,18 @@ plus `import-report.json` and `import-report.md` into `--output`. It exits 0
 | `--update` | refresh a library this tool wrote; deletes only what it wrote, keeps what you added |
 | `--name`, `--library-id` | library name; override the derived id |
 | `--models include\|skip` | embed STEP models (default) or leave them out |
+| `--db PATH` | database library: the database to read (CSV folder, Access file) instead of the stored one |
+| `--search-path DIR` | database library: extra folders to find the libraries rows name (repeatable) |
+| `--map FILE` | database library: column mapping overrides |
 | `--models-dir DIR` | where to find 3D models a body names but the file does not hold |
 | `--progress` | NDJSON progress events on stdout (implies `--json`) |
+
+A `.DbLib` (database library) is converted on its own: its rows become parts
+and the libraries they name supply the symbols and footprints. Reading the
+Access database needs **mdbtools** on Linux (`mdb-tables` and `mdb-export` are
+run as separate programs; install the `mdbtools` package), or a folder of
+per-table `.csv` files given with `--db`. Direct connections through the
+Access driver on Windows are not implemented yet; use `--db <folder>` there.
 
 `docs/CONVERSION.md` lists what each Altium object becomes and every report
 code.

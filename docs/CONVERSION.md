@@ -307,10 +307,67 @@ requires parameters the part lacks, one `info` item lists them
 
 ## Behaviour changes
 
+- The single-file warning for a footprint graphic on a layer with no list now
+  reads "graphic on <layer> dropped: Signex footprints have no such layer yet
+  (signex #3133)" (the `--json` summary message changed; the code and the
+  count did not).
 - Footprint pads carry the library format's named layer tokens (`Top Layer|Top
   Solder|Top Paste`, ...), not the editor's (`F.Cu`, ...), in every
   `.snxfpt` this tool writes, the single-file `.PcbLib` conversion included:
   the editor spelling made a footprint unplaceable on a board.
+
+## Database libraries
+
+`signex-altium-import library Parts.DbLib --output <dir>` converts a database
+library: its rows become parts, and the schematic and footprint libraries the
+rows name supply their symbols and footprints. A `.DbLib` is given on its own.
+
+- **Tables.** Each enabled table becomes one library table named after it; a
+  disabled table is reported (`table.disabled`, info). A table the database
+  does not hold is reported (`table.missing`, error).
+- **Key.** The column whose field map has `FieldType=0` is the part number.
+  A repeated key gets `~2`, `~3` (`part.pn_collision`). A row without a key
+  value is skipped (`row.key_missing`); a table with no key field has all its
+  rows skipped (`table.no_key`).
+- **Columns.** Each column becomes, in this order of precedence: what the
+  `--map` file says; else the database library's own field map (the key, a
+  reserved name, or a parameter name); else a parameter named like the column.
+  The same recognition as for symbol parameters then applies by name:
+  `Manufacturer`/`Manufacturer Part Number` (numbered variants are
+  alternates), `Supplier n`/`Supplier Part Number n`/`Supplier Order Qty n`,
+  `Datasheet`, `HelpURL`, `ComponentLinkNURL`, and the class template's
+  slots (a measurement only when the value parses with a unit).
+- **Reserved names.** `[Library Ref]` and `[Library Path]` name the symbol,
+  `[Footprint Ref]`/`[Footprint Path]` the footprint, `[Footprint Ref n]`/
+  `[Footprint Path n]` (n = 2, 3, ...) the alternate footprints in order,
+  `[Description]` the description. Simulation fields (`[Sim ...]`) are
+  reported once per table (`table.sim_skipped`, info) and not imported.
+- **Paths.** A library path is looked up as given, then relative to the
+  `.DbLib`, then by file name (without case; `\` and `/` both separate) in the
+  `--search-path` folders and the `.DbLib`'s own search path (relative to it,
+  with sub-folders when it says so). Paths from another machine therefore
+  resolve by their file name. Each library is read once, however many rows
+  name it, and only the symbols and footprints rows name are written.
+- **Skipped rows.** A row whose symbol, or any footprint it names, cannot be
+  found is skipped and reported as an `error` (`row.symbol_missing`,
+  `row.symbol_library_missing`, `row.footprint_missing`,
+  `row.footprint_library_missing`), so the run exits 2. A row that names no
+  footprint gets a part without one. Parts are `released`.
+- **The database.** `--db` overrides the stored one: a folder of per-table
+  `<table>.csv` files, an Access file, or a connection string naming one.
+  Otherwise the stored path is looked up like a library path. On Linux an
+  Access file (`.mdb`, `.accdb`) is read by running `mdb-tables` and
+  `mdb-export` (mdbtools, GPL) as separate processes; they are never linked
+  or bundled, and a missing mdbtools gives an error with the install hint.
+  Direct connections through the Access driver (Windows) are not
+  implemented: use `--db <folder>` there. Other database kinds: export the
+  tables to CSV.
+- **The mapping file.** `--map map.toml` has one table per database table
+  (`[tables."Resistors"]`), with `"<column>" = "<target>"` entries; a target
+  is `[Key]`, `[Skip]`, a reserved name, or a parameter name (a column named
+  `Maker` mapped to `Manufacturer` is read as the manufacturer). The mapping
+  every table actually used is written as `import-mapping.toml` beside the
+  report in the same format; passing it back reproduces the run.
 
 ## Report codes
 
@@ -336,7 +393,7 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `sch.image_dropped` | dropped | Embedded image not imported |
 | `sch.record_dropped` | dropped | Other schematic record type not imported (detail `record`) |
 | `footprint.courtyard_text_dropped` | dropped | Text on a courtyard layer not imported |
-| `footprint.graphic_layer_unmapped` | dropped | Footprint graphic on a layer with no slot not imported (detail `layer`) |
+| `footprint.graphic_layer_unmapped` | dropped | Footprint graphic on a layer the format has no list for (mechanical, assembly beyond fab, ...) dropped; tracked as signex #3133 (detail `layer`) |
 | `footprint.copper_track_dropped` | dropped | Copper track inside a library footprint not imported |
 | `footprint.fill_dropped` | dropped | Fill inside a library footprint not imported |
 | `footprint.region_dropped` | dropped | Region (custom pad shape) inside a library footprint not imported |
@@ -387,6 +444,15 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `library.crossref_mismatch` | info | An integrated library's cross-reference disagrees with its schematic library |
 | `library.kept_edited` | info | A file this converter wrote that left the source was edited since; kept |
 | `library.kept_referenced` | info | A file that left the source is kept because a row you added still uses it |
+| `table.disabled` | info | A table disabled in the database library is skipped |
+| `table.missing` | error | An enabled table is not in the database |
+| `table.no_key` | error | A table has no key field; its rows are skipped |
+| `table.sim_skipped` | info | Simulation fields of a table are not imported |
+| `row.key_missing` | error | A row has no key value; skipped |
+| `row.symbol_missing` | error | A row names no symbol, or the library has no such symbol; skipped |
+| `row.symbol_library_missing` | error | A row's symbol library was not found or could not be read; skipped |
+| `row.footprint_missing` | error | A footprint a row names is not in its library; skipped |
+| `row.footprint_library_missing` | error | A footprint library a row names was not found or could not be read; skipped |
 | `library.input_unreadable` | error | An input file could not be read (library runs) |
 
-65 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.
+74 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.

@@ -80,8 +80,15 @@ Status: `.SchLib` and `.PcbLib` inputs convert into one library
 this converter wrote and refuses one with another id. `.IntLib` inputs convert
 (parts released), and STEP models are embedded in footprint files
 (`--models skip` leaves them out; `--models-dir` supplies models a body
-names but the file does not hold). `.DbLib` and folder inputs are
-advertised by `describe` but refused until their readers land. `--help` and
+names but the file does not hold). `.DbLib` inputs convert
+(`docs/CONVERSION.md`, "Database libraries"): `--db` overrides the stored
+database (a folder of per-table CSV files, an Access file, or a connection
+string naming one), `--search-path` adds folders the rows' library paths are
+looked up in (repeatable, searched in order), `--map` overrides the column
+mapping, and `import-mapping.toml` beside the report holds the mapping the run
+used. A database library is given on its own, and rows that cannot be
+resolved are `error` items (exit 2). Folder inputs are advertised by
+`describe` but refused until their readers land. `--help` and
 `--version` print no summary. A failed run removes the library files it
 wrote, keeps `import-report.*` once the source was read, and leaves a
 library that existed before `--update` as it was. A dry run writes only the

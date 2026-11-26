@@ -112,6 +112,24 @@ Observed in `tests/samples/Simple.PcbLib`.
   `CHECKSUM`. Record *i* belongs to stream `Library/Models/<i>`, a bare zlib
   stream (no type byte) holding the model file; in the sample, a STEP file.
 
+### Database library (`.DbLib`)
+
+Observed in a private corpus file. An INI text file in the local code page
+(no byte-order mark). `[DatabaseLinks]` holds `ConnectionString`,
+`LibraryDatabaseType`, `LibraryDatabasePath`, `DatabasePathRelative`,
+`LibrarySearchPath` (folders joined by `;`, relative to the file),
+`SearchSubDirectories`, quoting keys and others. Each table is a `[TableN]`
+with `TableName`, `SchemaName`, `Enabled` (`True`/`False` or `1`/`0`),
+`UserWhere` and `UserWhereText`. Each column mapping is a `[FieldMapN]` with
+one `Options=` line of `key=value` pairs joined by `|`: `FieldName`
+(`<table>.<column>`), `TableNameOnly`, `FieldNameOnly`, `FieldType`,
+`ParameterName` (a parameter, or a reserved name in brackets such as
+`[Library Ref]`, `[Footprint Path 2]`), and the add, update and remove modes.
+`FieldType=0` marks the key field: exactly one per enabled table. Columns of
+a table without a field map exist in the database and are parameters of their
+own name. Field maps belong to a table by `TableNameOnly`. Disabled tables
+may have no field maps.
+
 ### Container time
 
 A library's compound-file root entry may record a modified time; a zero time
