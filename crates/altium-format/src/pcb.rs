@@ -346,6 +346,17 @@ pub enum Primitive {
     Region(Region),
 }
 
+/// A component body (record 12): a 3D model placement, from its text
+/// parameters (`MODELID`, `MODEL.NAME`, `MODEL.3D.ROTX`, ...). Layout
+/// observed in `tests/samples/Simple.PcbLib`: the common header, five
+/// bytes, then the parameter text as a length-prefixed block; the outline
+/// geometry after it is not read.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Body {
+    pub common: Common,
+    pub params: Params,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Primitives {
     pub arcs: Vec<Arc>,
@@ -355,6 +366,7 @@ pub struct Primitives {
     pub texts: Vec<Text>,
     pub fills: Vec<Fill>,
     pub regions: Vec<Region>,
+    pub bodies: Vec<Body>,
     /// Primitive type ids this model skips, with counts.
     pub skipped: HashMap<u8, usize>,
 }
@@ -449,6 +461,67 @@ pub struct PcbLib {
     pub layer_kinds: HashMap<u8, LayerKind>,
     /// The container's root-entry modified time, if it records one.
     pub modified: Option<std::time::SystemTime>,
+    /// The embedded model table (`Library/Models`), in stream order.
+    pub models: Vec<LibModel>,
+}
+
+/// One entry of a library's model table: its record in `Library/Models/Data`
+/// and the inflated bytes of numbered stream `Library/Models/<index>`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LibModel {
+    /// The GUID a body's `MODELID` names, braces included.
+    pub id: String,
+    pub name: String,
+    pub embedded: bool,
+    /// The model file's bytes; `None` when not embedded or unreadable.
+    pub data: Option<Vec<u8>>,
+    /// Why `data` is absent although the model claims to be embedded.
+    pub problem: Option<String>,
+}
+
+/// Largest model accepted after inflating.
+const MAX_MODEL: u64 = 256 * 1024 * 1024;
+
+fn read_models(c: &mut Container) -> Result<Vec<LibModel>> {
+    let Some(table) = c.stream_opt("Library/Models/Data")? else {
+        return Ok(Vec::new());
+    };
+    let records = text_records(Some(&table), "Library/Models/Data")?;
+    let mut out = Vec::new();
+    for (i, p) in records.iter().enumerate() {
+        let embedded = !p
+            .get("EMBED")
+            .is_some_and(|v| v.eq_ignore_ascii_case("FALSE"));
+        let mut m = LibModel {
+            id: p.string("ID"),
+            name: p.string("NAME"),
+            embedded,
+            ..Default::default()
+        };
+        if embedded {
+            match c.stream_opt(&format!("Library/Models/{i}")) {
+                Ok(Some(raw)) => {
+                    let mut buf = Vec::new();
+                    let res = std::io::Read::read_to_end(
+                        &mut std::io::Read::take(
+                            flate2::read::ZlibDecoder::new(&raw[..]),
+                            MAX_MODEL + 1,
+                        ),
+                        &mut buf,
+                    );
+                    match res {
+                        Ok(_) if buf.len() as u64 <= MAX_MODEL => m.data = Some(buf),
+                        Ok(_) => m.problem = Some("model stream is too large".into()),
+                        Err(e) => m.problem = Some(format!("model stream does not inflate: {e}")),
+                    }
+                }
+                Ok(None) => m.problem = Some(format!("model stream Library/Models/{i} is missing")),
+                Err(e) => m.problem = Some(e.to_string()),
+            }
+        }
+        out.push(m);
+    }
+    Ok(out)
 }
 
 impl PcbLib {
@@ -469,6 +542,7 @@ impl PcbLib {
                 lib.params = Params::parse(block);
             }
         }
+        lib.models = read_models(c)?;
         lib.layer_kinds = layer_kinds(c.stream_opt("Library/LayerKindMapping/Data")?.as_deref());
         for storage in c.root_storages() {
             if storage == "Library" {
@@ -574,7 +648,16 @@ pub fn parse_primitives(
             }
             6 => out.push(Primitive::Fill(fill(r.block("fill")?, stream)?)),
             11 => out.push(Primitive::Region(region(r.block("region")?, stream)?)),
-            // 12 component body, 16 dimension, ...: single-block records.
+            12 => {
+                let block = r.block("component body")?;
+                // Boards count bodies as skipped (the board converter reports
+                // them); libraries read them.
+                *out.skipped.entry(12).or_default() += 1;
+                if let Ok(b) = body(block, stream) {
+                    out.bodies.push(b);
+                }
+            }
+            // 16 dimension, ...: single-block records.
             0 => break,
             other => {
                 r.block("skipped primitive")?;
@@ -583,6 +666,17 @@ pub fn parse_primitives(
         }
     }
     Ok(())
+}
+
+fn body(b: &[u8], s: &str) -> Result<Body> {
+    let mut r = Reader::new(b, s);
+    let common = common(&mut r)?;
+    r.skip(5, "body reserved")?;
+    let text = r.block("body parameters")?;
+    Ok(Body {
+        common,
+        params: Params::parse(text),
+    })
 }
 
 fn track(b: &[u8], s: &str) -> Result<Track> {

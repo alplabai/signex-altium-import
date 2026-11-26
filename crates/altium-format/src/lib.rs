@@ -14,6 +14,7 @@
 pub mod bin;
 pub mod container;
 pub mod error;
+pub mod intlib;
 pub mod params;
 pub mod pcb;
 pub mod prj;
