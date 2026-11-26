@@ -52,17 +52,45 @@ fn library_item(code: &'static str, source: String, message: String) -> Item {
     }
 }
 
-/// The `.snxlib` files directly in `dir`.
-fn snxlibs(dir: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+/// The regular files of the expected form directly in `dir/sub` (`sub` empty
+/// for `dir` itself): no symlinks, plain `<name>.<ext>` names, and for
+/// footprints a UUID stem. The folder itself must be a real folder. Nothing
+/// from a report or an undo log, and nothing outside `dir`.
+fn plain_files(dir: &Path, sub: &str, ext: &str, uuid_stem: bool) -> Vec<PathBuf> {
+    let folder = if sub.is_empty() {
+        dir.to_path_buf()
+    } else {
+        dir.join(sub)
+    };
+    if !std::fs::symlink_metadata(&folder).is_ok_and(|m| m.is_dir()) {
+        return Vec::new();
+    }
+    let mut v: Vec<PathBuf> = std::fs::read_dir(&folder)
         .into_iter()
         .flatten()
         .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file() && !t.is_symlink()))
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "snxlib"))
+        .filter(|p| {
+            let (Some(name), Some(stem)) = (
+                p.file_name().and_then(|n| n.to_str()),
+                p.file_stem().and_then(|n| n.to_str()),
+            ) else {
+                return false;
+            };
+            p.extension().is_some_and(|e| e == ext)
+                && !stem.is_empty()
+                && !name.contains(['/', '\\'])
+                && (!uuid_stem || Uuid::parse_str(stem).is_ok())
+        })
         .collect();
     v.sort();
     v
+}
+
+/// The `.snxlib` files directly in `dir`.
+fn snxlibs(dir: &Path) -> Vec<PathBuf> {
+    plain_files(dir, "", "snxlib", false)
 }
 
 /// The library an `--update` run refreshes: its path and id.
@@ -149,16 +177,7 @@ type Primitives = HashMap<Uuid, PreviousPrimitive>;
 fn previous_primitives(dir: &Path) -> Result<(Primitives, Primitives), String> {
     let mut syms = HashMap::new();
     let mut fps = HashMap::new();
-    let files = |sub: &str, ext: &str| -> Vec<PathBuf> {
-        std::fs::read_dir(dir.join(sub))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == ext))
-            .collect()
-    };
-    for p in files("symbols", "snxsym") {
+    for p in plain_files(dir, "symbols", "snxsym", false) {
         let text =
             std::fs::read_to_string(&p).map_err(|e| format!("--update: {}: {e}", p.display()))?;
         let f = SymbolFile::from_toml_str(&text)
@@ -171,7 +190,7 @@ fn previous_primitives(dir: &Path) -> Result<(Primitives, Primitives), String> {
             );
         }
     }
-    for p in files("footprints", "snxfpt") {
+    for p in plain_files(dir, "footprints", "snxfpt", true) {
         let text =
             std::fs::read_to_string(&p).map_err(|e| format!("--update: {}: {e}", p.display()))?;
         let f = FootprintFile::from_toml_str(&text)
@@ -191,16 +210,9 @@ fn previous_primitives(dir: &Path) -> Result<(Primitives, Primitives), String> {
 /// its text (and times).
 fn previous_files(dir: &Path) -> HashMap<String, String> {
     let mut out = HashMap::new();
-    for (sub, ext) in [("symbols", "snxsym"), ("footprints", "snxfpt")] {
-        for e in std::fs::read_dir(dir.join(sub))
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let p = e.path();
-            if p.extension().is_some_and(|x| x == ext)
-                && let (Some(name), Ok(text)) = (p.file_name(), std::fs::read_to_string(&p))
-            {
+    for (sub, ext, uuid) in [("symbols", "snxsym", false), ("footprints", "snxfpt", true)] {
+        for p in plain_files(dir, sub, ext, uuid) {
+            if let (Some(name), Ok(text)) = (p.file_name(), std::fs::read_to_string(&p)) {
                 out.insert(format!("{sub}/{}", name.to_string_lossy()), text);
             }
         }
@@ -279,16 +291,20 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
     options.now = Utc::now();
     let mut existing = None;
     if args.update {
-        match existing_library(&args.output) {
+        let canon = args
+            .output
+            .canonicalize()
+            .unwrap_or_else(|_| args.output.clone());
+        match existing_library(&canon) {
             Ok((path, lib)) => {
                 let prev = previous_rows(&lib)
-                    .and_then(|rows| previous_primitives(&args.output).map(|(s, f)| (rows, s, f)));
+                    .and_then(|rows| previous_primitives(&canon).map(|(s, f)| (rows, s, f)));
                 match prev {
                     Ok((rows, syms, fps)) => {
                         options.previous = rows;
                         options.previous_symbols = syms;
                         options.previous_footprints = fps;
-                        options.previous_files = previous_files(&args.output);
+                        options.previous_files = previous_files(&canon);
                     }
                     Err(e) => return write_report(args, &doc, Some(e), Vec::new()),
                 }
@@ -352,7 +368,7 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
             return write_report(args, &doc, Some(msg), Vec::new());
         }
     };
-    let mut guard = Guard::new();
+    let mut guard = Guard::new(&dir);
     let mut written = Vec::new();
     let res = write_files(
         &mut guard,
@@ -411,15 +427,9 @@ fn write_files(
     if let Some(old) = old_snxlib {
         let keep: std::collections::HashSet<PathBuf> = written.iter().cloned().collect();
         let mut stale: Vec<PathBuf> = vec![old.clone()];
-        for sub in ["symbols", "footprints"] {
-            if let Ok(rd) = std::fs::read_dir(dir.join(sub)) {
-                stale.extend(rd.flatten().map(|e| e.path()));
-            }
-        }
-        for p in stale
-            .into_iter()
-            .filter(|p| !keep.contains(p) && p.is_file())
-        {
+        stale.extend(plain_files(dir, "symbols", "snxsym", false));
+        stale.extend(plain_files(dir, "footprints", "snxfpt", true));
+        for p in stale.into_iter().filter(|p| !keep.contains(p)) {
             guard.remove(&p)?;
         }
     }

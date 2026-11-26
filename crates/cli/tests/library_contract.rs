@@ -486,3 +486,64 @@ fn two_inputs_with_one_file_name_are_refused() {
     let s = lines(&o.stdout).pop().unwrap();
     assert!(s["error"].as_str().unwrap().contains("same kind"));
 }
+
+#[cfg(unix)]
+#[test]
+fn update_never_deletes_or_reads_through_symlinks() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    library_run(&dir, &[]);
+    let victim = out.0.join("victim.txt");
+    std::fs::write(&victim, "keep").unwrap();
+    let outside_dir = out.0.join("outside");
+    std::fs::create_dir(&outside_dir).unwrap();
+    let outside_fp = outside_dir.join("00000000-0000-0000-0000-0000000000aa.snxfpt");
+    std::fs::write(&outside_fp, "keep").unwrap();
+    // A symlinked envelope, a symlinked folder entry, and odd names that are
+    // not of the expected forms.
+    let fps = dir.join("footprints");
+    std::os::unix::fs::symlink(
+        &victim,
+        fps.join("00000000-0000-0000-0000-0000000000bb.snxfpt"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&victim, dir.join("symbols/evil.snxsym")).unwrap();
+    std::fs::write(fps.join("not-a-uuid.snxfpt"), "keep").unwrap();
+    std::fs::write(dir.join("symbols/notes.txt"), "keep").unwrap();
+    let (_, s) = library_run(&dir, &["--update"]);
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+    assert!(outside_fp.exists());
+    // Not of the expected form: not ours to delete.
+    assert!(fps.join("not-a-uuid.snxfpt").exists());
+    assert!(dir.join("symbols/notes.txt").exists());
+    // The symlinks themselves are left alone too.
+    assert!(
+        std::fs::symlink_metadata(dir.join("symbols/evil.snxsym"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn update_with_a_symlinked_folder_does_not_walk_it() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    library_run(&dir, &[]);
+    let elsewhere = out.0.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let stale = elsewhere.join("00000000-0000-0000-0000-0000000000cc.snxfpt");
+    std::fs::write(&stale, "keep").unwrap();
+    std::fs::remove_dir_all(dir.join("footprints")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, dir.join("footprints")).unwrap();
+    let (o, _) = library_run(&dir, &["--update"]);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "writing through a symlinked folder is refused"
+    );
+    assert!(stale.exists());
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1);
+}

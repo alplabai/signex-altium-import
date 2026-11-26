@@ -161,6 +161,14 @@ impl LibraryReport {
     pub fn write(&self, dir: &Path) -> Result<(PathBuf, PathBuf)> {
         let json_path = dir.join(REPORT_JSON);
         let md_path = dir.join(REPORT_MD);
+        for p in [&json_path, &md_path] {
+            if std::fs::symlink_metadata(p).is_ok_and(|m| !m.is_file()) {
+                anyhow::bail!(
+                    "{} is not a regular file; refusing to write it",
+                    p.display()
+                );
+            }
+        }
         let mut text = serde_json::to_string_pretty(&self.to_json())?;
         text.push('\n');
         signex_types::atomic_io::atomic_write(&json_path, text.as_bytes())
