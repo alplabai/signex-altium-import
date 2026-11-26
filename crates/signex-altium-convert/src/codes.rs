@@ -9,7 +9,7 @@ pub const CODES: &[(&str, Severity)] = &[
     // Library symbols.
     ("symbol.pin_ieee_unmapped", D),
     ("symbol.bezier_polygon", A),
-    ("symbol.rounded_rect_square", A),
+    ("symbol.rounded_rect_radius", A),
     ("symbol.display_mode_dropped", D),
     ("symbol.pin_decoration_merged", A),
     ("symbol.text_sanitized", A),
@@ -26,7 +26,7 @@ pub const CODES: &[(&str, Severity)] = &[
     ("footprint.fill_dropped", D),
     ("footprint.region_dropped", D),
     ("footprint.courtyard_open_bbox", A),
-    ("footprint.pad_octagon_rect", A),
+    ("footprint.pad_octagon_custom", A),
     ("pad.slot_not_placeable", A),
     // Boards.
     ("pcb.keepout_line_no_width", D),
@@ -78,6 +78,7 @@ pub const CODES: &[(&str, Severity)] = &[
     ("library.input_unreadable", E),
     ("library.crossref_mismatch", I),
     ("library.kept_referenced", I),
+    ("library.kept_edited", I),
 ];
 
 /// The severity of a catalogued code. An uncatalogued code is a bug in the

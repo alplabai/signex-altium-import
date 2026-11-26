@@ -166,3 +166,30 @@ mod intlib_packed {
         assert!(m.iter().any(|x| x.contains("not in the cross-reference")));
     }
 }
+
+mod shared_budget {
+    use altium_format::intlib::{IntLib, pack};
+    use altium_format::limits::Budget;
+
+    #[test]
+    fn two_inputs_share_one_budget() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/samples");
+        let sch = std::fs::read(root.join("simple.SchLib")).unwrap();
+        let bytes = pack(Some(&sch), None, None).unwrap();
+        // One input fits a small budget; the second, charged to the same
+        // budget, does not.
+        let mut b = Budget::with_limit(sch.len() as u64 + 1000);
+        assert!(
+            IntLib::from_container_with(
+                &mut altium_format::Container::from_bytes("a".into(), bytes.clone()).unwrap(),
+                &mut b
+            )
+            .is_ok()
+        );
+        let second = IntLib::from_container_with(
+            &mut altium_format::Container::from_bytes("b".into(), bytes).unwrap(),
+            &mut b,
+        );
+        assert!(second.is_err(), "the run budget is spent");
+    }
+}

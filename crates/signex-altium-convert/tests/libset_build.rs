@@ -1076,3 +1076,61 @@ fn private_intlibs_convert_with_matching_counts() {
     }
     assert!(seen > 0, "no .IntLib in the folder");
 }
+
+#[test]
+fn a_model_named_outside_the_file_is_read_from_models_dir() {
+    let dir = std::env::temp_dir().join(format!("snx-mdir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let step = b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;\n";
+    std::fs::write(dir.join("my-part.STEP"), step).unwrap();
+    let mut l = pcb("Simple.PcbLib");
+    // Make the first model external: drop it from the table and the embed flag.
+    if let SourceBody::Pcb(lib) = &mut l.body {
+        let id = lib.models[0].id.clone();
+        for f in &mut lib.footprints {
+            for b in &mut f.primitives.bodies {
+                if b.params.string("MODELID") == id {
+                    b.params = altium_format::Params::from_pairs([
+                        ("MODELID", id.as_str()),
+                        ("MODEL.NAME", "C:\\somewhere\\My-Part.step"),
+                    ]);
+                }
+            }
+        }
+        lib.models.remove(0);
+    }
+    let run = |with_dir: bool| {
+        let mut r = Report::default();
+        let o = LibraryOptions {
+            models_dir: with_dir.then(|| dir.clone()),
+            ..LibraryOptions::fresh("T")
+        };
+        let src = SourceLib {
+            released: false,
+            path: l.path.clone(),
+            name: l.name.clone(),
+            body: match &l.body {
+                SourceBody::Pcb(p) => SourceBody::Pcb(p.clone()),
+                SourceBody::Sch(s) => SourceBody::Sch(s.clone()),
+            },
+        };
+        let b = build_library(&[src], &o, &mut r, &mut |_, _, _| {}).unwrap();
+        (b, r)
+    };
+    let (b, _) = run(true);
+    assert_eq!((b.source.models, b.written.models), (2, 2));
+    let hashes: Vec<String> = footprints_of(&b)
+        .iter()
+        .filter_map(|f| {
+            f.footprints[0]
+                .step_attachment
+                .as_ref()
+                .map(|a| a.content_hash.clone())
+        })
+        .collect();
+    assert!(hashes.contains(&sha(step)));
+    let (b, r) = run(false);
+    assert_eq!(b.written.models, 1);
+    assert!(r.items().iter().any(|i| i.code == "model.external"));
+    std::fs::remove_dir_all(dir).unwrap();
+}

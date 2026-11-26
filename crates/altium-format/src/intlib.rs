@@ -109,6 +109,16 @@ impl IntLib {
     }
 
     pub fn from_container(c: &mut Container) -> Result<Self> {
+        Self::from_container_with(c, &mut Budget::default())
+    }
+
+    /// As [`IntLib::open`], charging inflation to a budget shared by the run.
+    pub fn open_with(path: impl AsRef<std::path::Path>, budget: &mut Budget) -> Result<Self> {
+        let mut c = Container::open(path)?;
+        Self::from_container_with(&mut c, budget)
+    }
+
+    pub fn from_container_with(c: &mut Container, budget: &mut Budget) -> Result<Self> {
         let mut lib = IntLib {
             modified: c.modified(),
             ..Default::default()
@@ -120,14 +130,13 @@ impl IntLib {
                 "SchLib/*.schlib or PCBLib/*.pcblib".into(),
             ));
         }
-        let mut budget = Budget::default();
         let open = |c: &mut Container, budget: &mut Budget, name: &str| -> Result<Container> {
             let raw = c.stream(name)?;
             let inner = inflate_embedded_with(budget, name, &raw)?;
             Container::from_bytes(std::path::PathBuf::from(name), inner)
         };
         for name in sch {
-            let mut inner = open(c, &mut budget, &name)?;
+            let mut inner = open(c, budget, &name)?;
             let l = SchLib::from_container(&mut inner)?;
             lib.schlibs.push(Embedded {
                 stream: name,
@@ -135,8 +144,8 @@ impl IntLib {
             });
         }
         for name in pcb {
-            let mut inner = open(c, &mut budget, &name)?;
-            let l = PcbLib::from_container_with(&mut inner, &mut budget)?;
+            let mut inner = open(c, budget, &name)?;
+            let l = PcbLib::from_container_with(&mut inner, budget)?;
             lib.pcblibs.push(Embedded {
                 stream: name,
                 lib: l,
@@ -150,7 +159,7 @@ impl IntLib {
         if let Some(n) = xref
             && let Ok(raw) = c.stream(&n)
         {
-            lib.cross_ref = inflate_embedded_with(&mut budget, &n, &raw).ok();
+            lib.cross_ref = inflate_embedded_with(budget, &n, &raw).ok();
         }
         Ok(lib)
     }

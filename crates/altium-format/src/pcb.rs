@@ -516,6 +516,16 @@ impl PcbLib {
         Self::from_container(&mut c)
     }
 
+    /// As [`PcbLib::open`], charging model inflation to a budget shared by
+    /// the run (`limits.rs`).
+    pub fn open_with(
+        path: impl AsRef<std::path::Path>,
+        budget: &mut crate::limits::Budget,
+    ) -> Result<Self> {
+        let mut c = Container::open(path)?;
+        Self::from_container_with(&mut c, budget)
+    }
+
     pub fn from_container(c: &mut Container) -> Result<Self> {
         Self::from_container_with(c, &mut crate::limits::Budget::default())
     }

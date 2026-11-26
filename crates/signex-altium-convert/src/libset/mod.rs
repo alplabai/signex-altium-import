@@ -61,6 +61,10 @@ pub struct LibraryOptions {
     pub library_id: Option<Uuid>,
     /// Embed 3D models (`--models include`) or skip them.
     pub include_models: bool,
+    /// `--models-dir`: where bodies that name a model outside the file look.
+    pub models_dir: Option<std::path::PathBuf>,
+    /// What is left of the run's budget for model bytes read from disk.
+    pub external_budget: std::cell::RefCell<altium_format::limits::Budget>,
     /// The parts of the library an `--update` run refreshes, by row id.
     pub previous: HashMap<Uuid, PreviousRow>,
     /// The symbols and footprints of the library an `--update` refreshes.
@@ -80,6 +84,8 @@ impl LibraryOptions {
             name: name.into(),
             library_id: None,
             include_models: true,
+            models_dir: None,
+            external_budget: Default::default(),
             previous: HashMap::new(),
             previous_files: HashMap::new(),
             previous_symbols: HashMap::new(),
@@ -347,7 +353,7 @@ pub fn build_library(
             let model = models::resolve(
                 src_fp,
                 lib,
-                opts.include_models,
+                opts,
                 &format!("{}:{}", s.name, src_fp.name),
                 report,
                 &mut model_counts,

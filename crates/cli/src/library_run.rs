@@ -250,6 +250,8 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
 
     // Read.
     progress.phase("read", Some(args.inputs.len()));
+    // One inflate budget for the whole run (`altium_format::limits`).
+    let mut budget = altium_format::limits::Budget::default();
     let mut sources: Vec<SourceLib> = Vec::new();
     let mut unreadable = 0;
     for (i, (path, kind)) in args.inputs.iter().zip(&kinds).enumerate() {
@@ -259,9 +261,13 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
         let read = SourceFile::hash(&abs).and_then(|src| {
             let bodies = match kind {
                 Source::SchLib => vec![(name.clone(), SourceBody::Sch(SchLib::open(&abs)?), false)],
-                Source::PcbLib => vec![(name.clone(), SourceBody::Pcb(PcbLib::open(&abs)?), false)],
+                Source::PcbLib => vec![(
+                    name.clone(),
+                    SourceBody::Pcb(PcbLib::open_with(&abs, &mut budget)?),
+                    false,
+                )],
                 Source::IntLib => {
-                    let int = IntLib::open(&abs)?;
+                    let int = IntLib::open_with(&abs, &mut budget)?;
                     for m in int.cross_ref_mismatches() {
                         doc.report.push(Item {
                             kind: ItemKind::Library,
@@ -337,6 +343,10 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
         .and_then(|s| Uuid::parse_str(s).ok());
     options.now = Utc::now();
     options.include_models = args.models == Models::Include;
+    options.models_dir = args.models_dir.clone();
+    options.external_budget = std::cell::RefCell::new(budget.clone());
+    options.models_dir = args.models_dir.clone();
+    options.external_budget = std::cell::RefCell::new(budget.clone());
     let mut existing = None;
     let mut usable: Option<Ledger> = None;
     if args.update {
@@ -488,6 +498,16 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
             continue;
         };
         if crate::ledger::sha256_hex(&bytes) != *hash {
+            doc.report.push(Item {
+                kind: ItemKind::Library,
+                source: rel.clone(),
+                id: None,
+                code: "library.kept_edited",
+                severity: Severity::Info,
+                message: format!("{rel} left the source but was edited since it was written; kept"),
+                detail: serde_json::Value::Null,
+            });
+            ledger_files.insert(rel.clone(), hash.clone());
             continue;
         }
         if let Some(pn) = referenced_by_kept_row(rel, &bytes, &kept_refs) {

@@ -822,6 +822,15 @@ fn an_update_deletes_a_ledgered_file_only_while_its_bytes_still_match() {
     assert_eq!(s["ok"], true, "{s}");
     assert_eq!(footprint_stems(&dir), vec![stems[0].clone()]);
     assert_eq!(std::fs::read_to_string(&edited).unwrap(), t);
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("import-report.json")).unwrap()).unwrap();
+    assert!(
+        report["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "library.kept_edited")
+    );
 }
 
 #[test]

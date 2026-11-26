@@ -70,7 +70,7 @@ pub struct ModelCounts {
 pub fn resolve(
     src: &SrcFootprint,
     lib: &PcbLib,
-    include: bool,
+    opts: &super::LibraryOptions,
     source: &str,
     report: &mut Report,
     counts: &mut ModelCounts,
@@ -91,7 +91,7 @@ pub fn resolve(
     if with.is_empty() {
         return None;
     }
-    if !include {
+    if !opts.include_models {
         for b in &with {
             report.push(item(
                 "model.skipped",
@@ -127,36 +127,61 @@ pub fn resolve(
     // A body that does not say its model is embedded names a model kept
     // outside the file (observed in a private corpus: integrated libraries
     // whose bodies name 3D models stored nowhere in the file).
-    if !body
+    let not_embedded = !body
         .params
         .string("MODEL.EMBED")
         .eq_ignore_ascii_case("TRUE")
-        && find(lib, &id).is_none()
-    {
-        return fail(
-            "model.external",
-            format!("model {name} is not stored in the library"),
-            report,
-        );
-    }
-    let Some(m) = find(lib, &id) else {
-        return fail(
-            "model.missing",
-            format!("model {name} is not in the library's model table"),
-            report,
-        );
+        && find(lib, &id).is_none();
+    let from_disk: Option<Vec<u8>> = if not_embedded {
+        // Named outside the file: look in `--models-dir`.
+        match opts
+            .models_dir
+            .as_deref()
+            .and_then(|d| from_dir(d, &name, &opts.external_budget))
+        {
+            Some(Ok(b)) => Some(b),
+            Some(Err(e)) => {
+                return fail(
+                    "model.unreadable",
+                    format!("model {name} not imported: {e}"),
+                    report,
+                );
+            }
+            None => {
+                return fail(
+                    "model.external",
+                    format!("model {name} is not stored in the library"),
+                    report,
+                );
+            }
+        }
+    } else {
+        None
     };
-    let Some(bytes) = m.data.as_ref() else {
-        let (code, why) = match &m.problem {
-            Some(p) => ("model.unreadable", p.clone()),
-            None => (
-                "model.external",
-                "the model is not embedded in the library".to_string(),
-            ),
-        };
-        return fail(code, format!("model {name} not imported: {why}"), report);
+    let bytes: Vec<u8> = match from_disk {
+        Some(b) => b,
+        None => {
+            let Some(m) = find(lib, &id) else {
+                return fail(
+                    "model.missing",
+                    format!("model {name} is not in the library's model table"),
+                    report,
+                );
+            };
+            let Some(bytes) = m.data.as_ref() else {
+                let (code, why) = match &m.problem {
+                    Some(p) => ("model.unreadable", p.clone()),
+                    None => (
+                        "model.external",
+                        "the model is not embedded in the library".to_string(),
+                    ),
+                };
+                return fail(code, format!("model {name} not imported: {why}"), report);
+            };
+            bytes.clone()
+        }
     };
-    if !is_step(bytes) {
+    if !is_step(&bytes) {
         return fail(
             "model.not_step",
             format!("model {name} is not a STEP file; not imported"),
@@ -187,7 +212,7 @@ pub fn resolve(
     counts.written += 1;
     Some(Resolved {
         filename,
-        bytes: bytes.clone(),
+        bytes,
         offset_xyz: [
             round6(mil("MODEL.2D.X")),
             round6(mil("MODEL.2D.Y")),
@@ -200,3 +225,63 @@ pub fn resolve(
         ],
     })
 }
+
+/// The model `name` in `dir` (one folder, no links), matched without case,
+/// also as `<stem>.step` and `<stem>.stp`: a regular file of at most 256 MiB,
+/// charged to the run's budget. `None` when there is no such file.
+fn from_dir(
+    dir: &std::path::Path,
+    name: &str,
+    budget: &std::cell::RefCell<altium_format::limits::Budget>,
+) -> Option<Result<Vec<u8>, String>> {
+    let base = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_lowercase();
+    if base.is_empty() {
+        return None;
+    }
+    let stem = base
+        .rsplit_once('.')
+        .map_or(base.as_str(), |x| x.0)
+        .to_string();
+    let wanted = [
+        base.clone(),
+        format!("{stem}.step"),
+        format!("{stem}.stp"),
+        format!("{base}.step"),
+        format!("{base}.stp"),
+    ];
+    let dir = dir.canonicalize().ok()?;
+    let mut hits: Vec<(usize, std::path::PathBuf)> = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file() && !t.is_symlink()))
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().to_lowercase();
+            wanted.iter().position(|w| *w == n).map(|i| (i, e.path()))
+        })
+        .collect();
+    hits.sort();
+    let (_, path) = hits.into_iter().next()?;
+    if !path.canonicalize().ok()?.starts_with(&dir) {
+        return None;
+    }
+    let len = std::fs::metadata(&path).ok()?.len();
+    if len > MAX_EXTERNAL {
+        return Some(Err(format!("{} is larger than 256 MiB", path.display())));
+    }
+    let mut b = budget.borrow_mut();
+    if len > b.remaining() {
+        return Some(Err("the run's budget for model data is spent".into()));
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => return Some(Err(format!("{}: {e}", path.display()))),
+    };
+    b.charge(bytes.len() as u64);
+    Some(Ok(bytes))
+}
+
+const MAX_EXTERNAL: u64 = 256 * 1024 * 1024;

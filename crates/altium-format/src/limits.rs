@@ -38,6 +38,11 @@ impl Budget {
         self.remaining
     }
 
+    /// Charge `bytes` read from disk (not inflated) to the budget.
+    pub fn charge(&mut self, bytes: u64) {
+        self.remaining = self.remaining.saturating_sub(bytes);
+    }
+
     /// Inflate a zlib stream, charging the result to the budget.
     pub fn inflate_zlib(&mut self, what: &str, data: &[u8]) -> Result<Vec<u8>> {
         let ratio_limit = (data.len() as u64)
