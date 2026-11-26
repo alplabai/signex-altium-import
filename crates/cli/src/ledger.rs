@@ -3,7 +3,7 @@
 //! the record is untrusted input: any entry of the wrong shape, a foreign
 //! converter or another library's id means no record, and nothing is deleted.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -18,8 +18,10 @@ pub struct Ledger {
     pub rows: BTreeSet<Uuid>,
     pub symbols: BTreeSet<Uuid>,
     pub footprints: BTreeSet<Uuid>,
-    /// Paths relative to the library root, in the three expected forms.
-    pub files: BTreeSet<String>,
+    /// Paths relative to the library root, in the three expected forms, with
+    /// the SHA-256 (lower-case hex) of the bytes written. A file is deleted
+    /// only while its bytes still match.
+    pub files: BTreeMap<String, String>,
 }
 
 /// More entries than any real library; a bigger record is not ours.
@@ -33,6 +35,19 @@ fn uuids(v: &Value) -> Option<BTreeSet<Uuid>> {
             let u = Uuid::parse_str(s).ok()?;
             (u.to_string() == s).then_some(u)
         })
+        .collect()
+}
+
+fn is_sha256(h: &str) -> bool {
+    h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Lower-case hex SHA-256 of `bytes`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
         .collect()
 }
 
@@ -66,7 +81,7 @@ impl Ledger {
             "rows": ids(&self.rows),
             "symbols": ids(&self.symbols),
             "footprints": ids(&self.footprints),
-            "files": self.files,
+            "files": self.files.iter().map(|(p, h)| json!({ "path": p, "sha256": h })).collect::<Vec<_>>(),
         })
     }
 
@@ -81,9 +96,13 @@ impl Ledger {
             .get("files")?
             .as_array()
             .filter(|a| a.len() <= MAX_ENTRIES)?;
-        let files: BTreeSet<String> = files
+        let files: BTreeMap<String, String> = files
             .iter()
-            .map(|f| f.as_str().filter(|p| expected_path(p)).map(str::to_string))
+            .map(|f| {
+                let path = f.get("path")?.as_str().filter(|p| expected_path(p))?;
+                let hash = f.get("sha256")?.as_str().filter(|h| is_sha256(h))?;
+                Some((path.to_string(), hash.to_string()))
+            })
             .collect::<Option<_>>()?;
         let library_id = match report.get("library_id")? {
             Value::String(s) => Some(Uuid::parse_str(s).ok()?),
@@ -115,6 +134,10 @@ impl Ledger {
 mod tests {
     use super::*;
 
+    fn f(p: &str) -> Value {
+        json!({ "path": p, "sha256": "0".repeat(64) })
+    }
+
     fn good() -> Value {
         json!({
             "library_id": "5b0f3b0e-0000-4000-8000-000000000001",
@@ -123,8 +146,8 @@ mod tests {
                 "rows": ["5b0f3b0e-0000-4000-8000-000000000002"],
                 "symbols": [],
                 "footprints": ["5b0f3b0e-0000-4000-8000-000000000003"],
-                "files": ["a.snxlib", "symbols/x.snxsym",
-                          "footprints/5b0f3b0e-0000-4000-8000-000000000003.snxfpt"],
+                "files": [f("a.snxlib"), f("symbols/x.snxsym"),
+                          f("footprints/5b0f3b0e-0000-4000-8000-000000000003.snxfpt")],
             }
         })
     }
@@ -169,6 +192,15 @@ mod tests {
         assert!(
             Ledger::from_report(&v).is_none(),
             "ids are canonical lower case"
+        );
+        let mut v = good();
+        v["ledger"]["files"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"path": "b.snxlib", "sha256": "xyz"}));
+        assert!(
+            Ledger::from_report(&v).is_none(),
+            "a malformed hash is not a record"
         );
         assert!(Ledger::from_report(&json!({})).is_none());
     }

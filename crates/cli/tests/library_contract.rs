@@ -704,3 +704,142 @@ fn an_intlib_input_converts_with_released_parts_and_models() {
     let s = lines(&o.stdout).pop().unwrap();
     assert_eq!(s["counts"]["models"], 0);
 }
+
+fn first_row(text: &str) -> String {
+    text.lines()
+        .find(|l| l.len() > 40 && l.as_bytes()[8] == b'-' && l.split('\t').count() > 20)
+        .unwrap()
+        .to_string()
+}
+
+fn footprint_stems(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir.join("footprints"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path().file_stem().unwrap().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn an_update_does_not_overwrite_a_symbol_file_the_user_put_there() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib"], &[]);
+    let user = dir.join("symbols/simple.snxsym");
+    let mine = std::fs::read_to_string(&user).unwrap();
+    let theirs = mine.replacen("display_name = \"simple\"", "display_name = \"theirs\"", 1);
+    assert_ne!(mine, theirs);
+    std::fs::write(&user, &theirs).unwrap();
+    // No record of what was written: the file is not ours.
+    std::fs::remove_file(dir.join("import-report.json")).unwrap();
+    let (_, s) = run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
+    let names: Vec<String> = std::fs::read_dir(dir.join("symbols"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}: ours went to a uuid name");
+}
+
+#[test]
+fn an_update_keeps_a_ledgered_footprint_a_kept_row_still_uses() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib", "Simple.PcbLib"], &[]);
+    let stems = footprint_stems(&dir);
+    let used = stems[0].clone();
+    let lib = snxlib_path(&dir);
+    let text = std::fs::read_to_string(&lib).unwrap();
+    let row = first_row(&text);
+    let mut c: Vec<String> = row.split('\t').map(str::to_string).collect();
+    c[0] = "ffffffff-0000-4000-8000-000000000001".into();
+    c[1] = "USER-USES-FP".into();
+    c[6] = format!(r#"{{"library_id":"{ID}","uuid":"{used}"}}"#);
+    std::fs::write(
+        &lib,
+        text.replacen(&row, &format!("{row}\n{}", c.join("\t")), 1),
+    )
+    .unwrap();
+    let (_, s) = run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(
+        footprint_stems(&dir),
+        vec![used.clone()],
+        "only the used one stays"
+    );
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("import-report.json")).unwrap()).unwrap();
+    assert!(
+        report["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "library.kept_referenced")
+    );
+    assert!(
+        report["ledger"]["files"].to_string().contains(&used),
+        "still ours"
+    );
+}
+
+#[test]
+fn an_update_refuses_a_part_number_a_user_row_already_holds() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib"], &[]);
+    let lib = snxlib_path(&dir);
+    let text = std::fs::read_to_string(&lib).unwrap();
+    let row = first_row(&text);
+    let mut c: Vec<String> = row.split('\t').map(str::to_string).collect();
+    c[0] = "ffffffff-0000-4000-8000-000000000001".into(); // same part number as ours
+    std::fs::write(
+        &lib,
+        text.replacen(&row, &format!("{row}\n{}", c.join("\t")), 1),
+    )
+    .unwrap();
+    let before = std::fs::read(&lib).unwrap();
+    let (o, s) = run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(s["error"].as_str().unwrap().contains("part number"), "{s}");
+    assert_eq!(std::fs::read(&lib).unwrap(), before);
+}
+
+#[test]
+fn an_update_deletes_a_ledgered_file_only_while_its_bytes_still_match() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib", "Simple.PcbLib"], &[]);
+    let stems = footprint_stems(&dir);
+    let edited = dir.join(format!("footprints/{}.snxfpt", stems[0]));
+    let mut t = std::fs::read_to_string(&edited).unwrap();
+    t.push('\n');
+    std::fs::write(&edited, &t).unwrap();
+    let (_, s) = run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(footprint_stems(&dir), vec![stems[0].clone()]);
+    assert_eq!(std::fs::read_to_string(&edited).unwrap(), t);
+}
+
+#[test]
+fn an_update_keeps_the_library_name_unless_asked() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib"], &["--name", "First"]);
+    let name = |d: &std::path::Path| {
+        std::fs::read_to_string(snxlib_path(d))
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with("name = "))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(name(&dir), "name = \"First\"");
+    run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(name(&dir), "name = \"First\"", "no --name: kept");
+    run_with(&dir, &["simple.SchLib"], &["--update", "--name", "Second"]);
+    assert_eq!(name(&dir), "name = \"Second\"");
+}

@@ -73,8 +73,11 @@ order and names.
     are reported.
 - **Footprints** flip to the footprint editor's Y-down frame, so rotations
   negate:
-  - **Pads:** each keeps its own rotation. Layers use the editor's
-    new-pad names (`F.Cu` / `F.Mask` / `F.Paste`, `*.Cu` for through-hole).
+  - **Pads:** each keeps its own rotation. Layers are the named
+    tokens of the library format: `Top Layer|Top Solder|Top Paste` for a top
+    SMD pad (`Bottom …` for a bottom one), `Top Layer|Bottom Layer|Top
+    Solder|Bottom Solder` for through-hole, `Top Solder|Bottom Solder` for an
+    unplated hole.
   - **Graphics:** overlay goes to silkscreen. Assembly layers go to fab.
   - **Courtyard:** the courtyard layer becomes the courtyard outline. If it
     doesn't close, its bounding box is used, and that is reported.
@@ -237,14 +240,30 @@ Signex repository is the format; `docs/APP_INTEGRATION.md` the command).
   y, then z in its own y-up frame, adds the offset, and then flips into the
   footprint's y-down frame, and Altium's placement is y-up already, so the
   offset is (`MODEL.2D.X`, `MODEL.2D.Y`, `MODEL.3D.DZ`) in mm and the rotation
-  (`ROTX`, `ROTY`, `ROTZ` + `MODEL.2D.ROTATION`) in degrees, unchanged. That
-  Altium's turn order equals Signex's is not verified in a 3D view; a body
-  with a 2D rotation or a bottom-side projection is reported
+  (`ROTX`, `ROTY`, `ROTZ` + `MODEL.2D.ROTATION`) in degrees, unchanged
+  (`LIBRARY_FORMAT.md` 4.3 states Signex's model frame). That Altium's turn
+  order equals Signex's is not verified in a 3D view; a body with two or more
+  non-zero turns, a 2D rotation or a bottom-side projection is reported
   (`model.placement_approximated`). `--models skip` embeds none and reports
-  each (`model.skipped`, info; skipped models are not counted). A model that
+  each (`model.skipped`, info; skipped models are not counted). A body that does not say its model is
+  embedded and has no table entry names a model stored outside the file
+  (`model.external`; observed in a private corpus, where no integrated
+  library stored its 3D models). A model that
   is not STEP, not embedded, unreadable or missing from the table, and a
   second model on one footprint, are not written and reported as `error`
   items of kind `model`. A body without a model is reported as info.
+- **Update rules.** The report's `ledger` lists each file written with its
+  SHA-256. `--update` deletes a ledgered file only when it left the source
+  and its bytes still match; a file a user edited stays. A target file that is
+  not in the ledger and differs is never overwritten: a symbol envelope takes
+  its uuid name instead, any other target stops the run before anything is
+  written. A ledgered primitive that a user's row still references is kept
+  (`library.kept_referenced`) and stays in the ledger. A part number a user
+  row already holds stops the run. The library name is kept unless `--name`
+  is given. A stale name that is the same file as a written one (another
+  case, or the same inode) is never deleted.
+- **Limits.** One run inflates at most 2 GiB of embedded data, and a stream
+  may not inflate to more than 200 times its size (1 MiB always allowed).
 - **Not carried yet:** `.DbLib` sources, folder inputs, simulation models.
 - **Completeness.** Every source component is a written part or a part item
   with severity `error`; the run fails with an internal error if the report
@@ -273,6 +292,13 @@ is a TOML literal string (`part.text_sanitized`, `info`). A repeated name
 keeps the later value (`part.param_dropped`). When the class template
 requires parameters the part lacks, one `info` item lists them
 (`part.template_incomplete`).
+
+## Behaviour changes
+
+- Footprint pads carry the library format's named layer tokens (`Top Layer|Top
+  Solder|Top Paste`, ...), not the editor's (`F.Cu`, ...), in every
+  `.snxfpt` this tool writes, the single-file `.PcbLib` conversion included:
+  the editor spelling made a footprint unplaceable on a board.
 
 ## Report codes
 
@@ -347,6 +373,7 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `model.not_step` | error | The model is not a STEP file |
 | `model.placement_approximated` | approximated | A 2D rotation is added to the z turn, or a bottom-side projection is not applied |
 | `library.crossref_mismatch` | info | An integrated library's cross-reference disagrees with its schematic library |
+| `library.kept_referenced` | info | A file that left the source is kept because a row you added still uses it |
 | `library.input_unreadable` | error | An input file could not be read (library runs) |
 
-63 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.
+64 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.

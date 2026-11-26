@@ -258,8 +258,8 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
         let abs = path.canonicalize().unwrap_or_else(|_| path.clone());
         let read = SourceFile::hash(&abs).and_then(|src| {
             let bodies = match kind {
-                Source::SchLib => vec![(SourceBody::Sch(SchLib::open(&abs)?), false)],
-                Source::PcbLib => vec![(SourceBody::Pcb(PcbLib::open(&abs)?), false)],
+                Source::SchLib => vec![(name.clone(), SourceBody::Sch(SchLib::open(&abs)?), false)],
+                Source::PcbLib => vec![(name.clone(), SourceBody::Pcb(PcbLib::open(&abs)?), false)],
                 Source::IntLib => {
                     let int = IntLib::open(&abs)?;
                     for m in int.cross_ref_mismatches() {
@@ -274,26 +274,37 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
                         });
                     }
                     // Integrated libraries are published: their parts are released.
-                    int.schlibs
-                        .into_iter()
-                        .map(|e| (SourceBody::Sch(e.lib), true))
-                        .chain(
-                            int.pcblibs
-                                .into_iter()
-                                .map(|e| (SourceBody::Pcb(e.lib), true)),
-                        )
-                        .collect()
+                    // Several embedded libraries of one kind are told apart by
+                    // their stream, so repeated component names keep distinct ids.
+                    let key = |n: usize, stream: &str| -> String {
+                        if n > 1 {
+                            let s = stream.rsplit('/').next().unwrap_or(stream);
+                            let s = s.rsplit_once('.').map_or(s, |x| x.0);
+                            format!("{name}/{s}")
+                        } else {
+                            name.clone()
+                        }
+                    };
+                    let (ns, np) = (int.schlibs.len(), int.pcblibs.len());
+                    let mut out = Vec::new();
+                    for e in int.schlibs {
+                        out.push((key(ns, &e.stream), SourceBody::Sch(e.lib), true));
+                    }
+                    for e in int.pcblibs {
+                        out.push((key(np, &e.stream), SourceBody::Pcb(e.lib), true));
+                    }
+                    out
                 }
             };
             Ok((src, bodies))
         });
         match read {
             Ok((src, bodies)) => {
-                for (body, released) in bodies {
+                for (source_name, body, released) in bodies {
                     sources.push(SourceLib {
                         released,
                         path: abs.to_string_lossy().into_owned(),
-                        name: name.clone(),
+                        name: source_name,
                         body,
                     });
                 }
@@ -350,6 +361,11 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
                     .ledger
                     .clone()
                     .filter(|l| l.library_id == Some(lib.manifest.library_id));
+                // Only files this converter wrote keep their text; a user's
+                // envelope is never reused.
+                options
+                    .previous_files
+                    .retain(|k, _| usable.as_ref().is_some_and(|l| l.files.contains_key(k)));
                 existing = Some((path, lib.manifest.library_id));
             }
             Err(e) => return write_report(args, &doc, Some(e), Vec::new()),
@@ -399,6 +415,7 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
     // An update merges into the library on disk, keeping its file name and
     // whatever a user added; only rows this converter wrote earlier go.
     let mut files = built.files.clone();
+    let mut kept_refs = std::collections::BTreeMap::new();
     if let Some((old_path, _)) = &existing {
         let merged = std::fs::read_to_string(old_path)
             .map_err(|e| format!("--update: {}: {e}", old_path.display()))
@@ -408,18 +425,27 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
                     .position(|(p, _)| p.ends_with(".snxlib"))
                     .ok_or("no library file")?;
                 let before = usable.as_ref().map(|l| l.rows.clone()).unwrap_or_default();
-                let text = crate::update_merge::merge(&old, &files[at].1, &before)?;
-                Ok((at, text))
+                let m =
+                    crate::update_merge::merge(&old, &files[at].1, &before, args.name.as_deref())?;
+                Ok((at, m))
             });
         match merged {
-            Ok((at, text)) => {
+            Ok((at, m)) => {
                 files[at].0 = old_path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| files[at].0.clone());
-                files[at].1 = text;
+                files[at].1 = m.text;
+                kept_refs = m.kept_refs;
             }
             Err(e) => return write_report(args, &doc, Some(format!("--update: {e}")), Vec::new()),
+        }
+        let canon = args
+            .output
+            .canonicalize()
+            .unwrap_or_else(|_| args.output.clone());
+        if let Err(e) = avoid_user_files(&mut files, &canon, usable.as_ref()) {
+            return write_report(args, &doc, Some(format!("--update: {e}")), Vec::new());
         }
     }
 
@@ -439,16 +465,48 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
     };
     let mut guard = Guard::new(&dir);
     let mut written = Vec::new();
-    let rels: std::collections::BTreeSet<String> = files.iter().map(|(p, _)| p.clone()).collect();
-    // Stale: only what the (valid) record says this converter wrote and the
-    // source no longer has, and only as plain regular files.
-    let stale: Vec<PathBuf> = usable
+    let mut ledger_files: std::collections::BTreeMap<String, String> = files
         .iter()
-        .flat_map(|l| l.files.iter())
-        .filter(|f| !rels.contains(*f) && crate::ledger::expected_path(f))
-        .map(|f| dir.join(f))
-        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
+        .map(|(p, t)| (p.clone(), crate::ledger::sha256_hex(t.as_bytes())))
         .collect();
+    // Stale: only what the (valid) record says this converter wrote, the
+    // source no longer has, and that is still byte for byte what it wrote;
+    // only plain regular files; nothing a user's row still uses.
+    let mut stale: Vec<PathBuf> = Vec::new();
+    for (rel, hash) in usable.iter().flat_map(|l| l.files.iter()) {
+        if ledger_files.contains_key(rel) || !crate::ledger::expected_path(rel) {
+            continue;
+        }
+        let path = dir.join(rel);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || names_a_written_file(&path, rel, &files, &dir) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if crate::ledger::sha256_hex(&bytes) != *hash {
+            continue;
+        }
+        if let Some(pn) = referenced_by_kept_row(rel, &bytes, &kept_refs) {
+            doc.report.push(Item {
+                kind: ItemKind::Library,
+                source: rel.clone(),
+                id: None,
+                code: "library.kept_referenced",
+                severity: Severity::Info,
+                message: format!(
+                    "{rel} left the source but the part {pn:?} you added still uses it; kept"
+                ),
+                detail: serde_json::Value::Null,
+            });
+            ledger_files.insert(rel.clone(), hash.clone());
+            continue;
+        }
+        stale.push(path);
+    }
     let res = write_files(&mut guard, &dir, &files, &stale, progress, &mut written);
     match res {
         Ok(()) => {
@@ -457,7 +515,7 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
                 rows: built.row_ids.iter().copied().collect(),
                 symbols: built.symbol_ids.iter().copied().collect(),
                 footprints: built.footprint_ids.iter().copied().collect(),
-                files: rels,
+                files: ledger_files,
             });
             let summary = write_report(args, &doc, None, written);
             if summary.error.is_none() {
@@ -484,6 +542,95 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
             write_report(args, &doc, Some(msg), Vec::new())
         }
     }
+}
+
+/// The first `file_uuid` of an envelope text.
+fn file_uuid_of(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("file_uuid = \""))
+        .and_then(|r| r.strip_suffix('"'))
+        .map(str::to_string)
+}
+
+/// A target that already holds a file this converter did not write, with
+/// other content, is not overwritten: a symbol envelope takes its uuid name
+/// instead; any other target (or a taken uuid name) is refused, before
+/// anything is written.
+fn avoid_user_files(
+    files: &mut [(String, String)],
+    dir: &Path,
+    ledger: Option<&Ledger>,
+) -> Result<(), String> {
+    let owned = |rel: &str| ledger.is_some_and(|l| l.files.contains_key(rel));
+    let clashes = |rel: &str, text: &str| -> bool {
+        let p = dir.join(rel);
+        std::fs::symlink_metadata(&p).is_ok()
+            && !owned(rel)
+            && std::fs::read_to_string(&p).map_or(true, |old| old != text)
+    };
+    for (rel, text) in files.iter_mut() {
+        if rel.ends_with(".snxlib") || !clashes(rel, text) {
+            continue;
+        }
+        let alt = rel
+            .starts_with("symbols/")
+            .then(|| file_uuid_of(text))
+            .flatten()
+            .map(|u| format!("symbols/{u}.snxsym"));
+        match alt {
+            Some(alt) if !clashes(&alt, text) => *rel = alt,
+            _ => {
+                return Err(format!(
+                    "{rel} exists and was not written by this converter; move it or rename it first"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A stale entry that is the same file as one being written: same name in
+/// another case (case-insensitive filesystems), or the same inode.
+fn names_a_written_file(path: &Path, rel: &str, files: &[(String, String)], dir: &Path) -> bool {
+    let folded = rel.to_lowercase();
+    if files.iter().any(|(p, _)| p.to_lowercase() == folded) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(m) = std::fs::metadata(path) {
+            return files.iter().any(|(p, _)| {
+                std::fs::metadata(dir.join(p))
+                    .is_ok_and(|w| w.dev() == m.dev() && w.ino() == m.ino())
+            });
+        }
+    }
+    let _ = (path, dir);
+    false
+}
+
+/// The part number of a row a user added that still uses a primitive in this
+/// ledgered file, if any.
+fn referenced_by_kept_row(
+    rel: &str,
+    bytes: &[u8],
+    refs: &std::collections::BTreeMap<Uuid, String>,
+) -> Option<String> {
+    if refs.is_empty() {
+        return None;
+    }
+    if let Some(stem) = rel
+        .strip_prefix("footprints/")
+        .and_then(|r| r.strip_suffix(".snxfpt"))
+    {
+        return refs.get(&Uuid::parse_str(stem).ok()?).cloned();
+    }
+    if rel.starts_with("symbols/") {
+        let f = SymbolFile::from_toml_str(std::str::from_utf8(bytes).ok()?).ok()?;
+        return f.symbols.iter().find_map(|s| refs.get(&s.uuid).cloned());
+    }
+    None
 }
 
 /// Write the new files, then delete the stale ones.

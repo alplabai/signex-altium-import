@@ -85,6 +85,13 @@ committed). The compound file holds, at its root:
   per-component parameter text and is not read.
 - `CKT/<n>.ckt` simulation models in one of the files: not read.
 
+In the observed integrated libraries the embedded footprint library's model
+table (`Library/Models/Data`, `Library/ModelsNoEmbed/Data`) is empty while
+its component bodies name models by id with no embed flag: the 3D models are
+stored nowhere in the file. The root also holds a storage of simulation
+model streams (`MDL/<n>.mdl`), one with a type byte `0x00`, one zlib
+(type `0x02`); they are not read.
+
 A stream that is empty, has another type byte, does not inflate, or inflates
 to something that is not a compound file is an error, as is a file with no
 embedded library at all.
