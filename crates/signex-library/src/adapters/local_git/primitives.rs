@@ -1,6 +1,7 @@
 //! Primitive read/write + git-commit inherent methods on `LocalGitAdapter`.
 
 use super::helpers::*;
+use super::walk_error::{WalkErrorAction, walk_error_action};
 use super::*;
 use crate::git_identity::identity_for_repo;
 
@@ -22,7 +23,7 @@ impl LocalGitAdapter {
         self.root_dir.join(primitive_subdir(kind))
     }
 
-    fn primitive_path(&self, kind: PrimitiveKind, uuid: Uuid) -> PathBuf {
+    pub(super) fn primitive_path(&self, kind: PrimitiveKind, uuid: Uuid) -> PathBuf {
         self.primitive_dir(kind)
             .join(format!("{uuid}.{}", primitive_ext(kind)))
     }
@@ -50,8 +51,9 @@ impl LocalGitAdapter {
     /// just to hand the caller the value it already had (#534).
     pub(super) fn read_footprint(&self, uuid: Uuid) -> Result<Footprint, LibraryError> {
         let bytes = self.read_primitive_bytes(PrimitiveKind::Footprint, uuid)?;
+        let path = self.primitive_path(PrimitiveKind::Footprint, uuid);
         crate::primitive::FootprintFile::from_bytes(&bytes)
-            .map_err(|e| LibraryError::Backend(format!("read .snxfpt: {e}")))?
+            .map_err(|e| LibraryError::Backend(format!("read {}: {e}", path.display())))?
             .footprints
             .into_iter()
             .next()
@@ -75,7 +77,7 @@ impl LocalGitAdapter {
         &self,
         fp: &Footprint,
         message: &str,
-    ) -> Result<(), LibraryError> {
+    ) -> Result<CommitOutcome, LibraryError> {
         let (rel_path, abs_path) =
             self.prepare_primitive_write(PrimitiveKind::Footprint, fp.uuid)?;
         // The container is read, merged and rewritten: another Signex
@@ -83,8 +85,11 @@ impl LocalGitAdapter {
         // `write_lock`). The cascade that follows takes the lock itself.
         let _write_lock = self.lock_for_write()?;
         let mut file = match fs::read(&abs_path) {
-            Ok(existing) => crate::primitive::FootprintFile::from_bytes(&existing)
-                .map_err(|e| LibraryError::Backend(format!("re-read .snxfpt: {e}")))?,
+            Ok(existing) => {
+                crate::primitive::FootprintFile::from_bytes(&existing).map_err(|e| {
+                    LibraryError::Backend(format!("re-read {}: {e}", abs_path.display()))
+                })?
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 crate::primitive::FootprintFile::from_footprint(fp.clone())
             }
@@ -113,7 +118,11 @@ impl LocalGitAdapter {
 
     /// Persist `model` into `<root>/sims/<uuid>.snxsim`, merging into the
     /// existing envelope (HI-7) so a multi-model file is not clobbered.
-    pub(super) fn write_sim(&self, model: &SimModel, message: &str) -> Result<(), LibraryError> {
+    pub(super) fn write_sim(
+        &self,
+        model: &SimModel,
+        message: &str,
+    ) -> Result<CommitOutcome, LibraryError> {
         let (rel_path, abs_path) = self.prepare_primitive_write(PrimitiveKind::Sim, model.uuid)?;
         // The container is read, merged and rewritten: another Signex
         // process doing the same would drop this edit (#893, see
@@ -147,6 +156,22 @@ impl LocalGitAdapter {
         )
     }
 
+    /// Refuse a write into a library whose folder is gone (moved or deleted
+    /// outside the app) instead of re-creating it (#1828).
+    fn require_root_dir(&self) -> Result<(), LibraryError> {
+        if self.root_dir.is_dir() {
+            return Ok(());
+        }
+        // The caller appends no path here, so name the library folder.
+        let refusal = signex_types::atomic_io::MissingParentDir {
+            dir: self.root_dir.clone(),
+        };
+        Err(LibraryError::Backend(format!(
+            "{}: {refusal}",
+            self.root_dir.display()
+        )))
+    }
+
     /// Refuse before touching disk if the commit cannot be made, create the
     /// primitive directory, and return the (repo-relative, absolute) path.
     /// Symbols go through `save_symbol_in_container` instead.
@@ -156,6 +181,7 @@ impl LocalGitAdapter {
         uuid: Uuid,
     ) -> Result<(String, PathBuf), LibraryError> {
         self.ensure_commit_identity()?;
+        self.require_root_dir()?;
         fs::create_dir_all(self.primitive_dir(kind))?;
         let rel_path = format!("{}/{uuid}.{}", primitive_subdir(kind), primitive_ext(kind));
         let abs_path = self.root_dir.join(&rel_path);
@@ -170,15 +196,17 @@ impl LocalGitAdapter {
         abs_path: &Path,
         bytes: &[u8],
         message: &str,
-    ) -> Result<(), LibraryError> {
+    ) -> Result<CommitOutcome, LibraryError> {
         // HI-6: atomic write — primitive containers (`.snxsim`,
         // `.snxfpt`, `.snxsym`) are TOML+TSV envelopes; a half-written
         // file destroys all primitives in the container, so we cannot
         // afford the in-place truncate that `fs::write` does on
         // existing destinations.
-        signex_types::atomic_io::atomic_write(abs_path, bytes)?;
+        crate::adapter::ensure_inside_library(&self.root_dir, abs_path)?;
+        signex_types::atomic_io::atomic_write_existing_dir(abs_path, bytes)?;
         let fallback = format!("save {} {uuid}", primitive_kind_str(kind));
-        self.commit_path(rel_path, message, &fallback)
+        // The file is saved: a failed commit is an outcome, not an error.
+        Ok(self.commit_path(rel_path, message, &fallback))
     }
 
     /// Stage `rel_path` and create a new commit, unless the staged tree
@@ -188,12 +216,15 @@ impl LocalGitAdapter {
     /// has already been written to disk by the caller, and the user
     /// opted out of version control at create time. They can opt in
     /// later via the (forthcoming) Enable Version Control flow.
+    ///
+    /// Callers have written the file already, so a failed commit is the
+    /// returned [`CommitOutcome::NotCommitted`], not an error (#858).
     pub(super) fn commit_path(
         &self,
         rel_path: &str,
         message: &str,
         fallback_message: &str,
-    ) -> Result<(), LibraryError> {
+    ) -> CommitOutcome {
         self.commit_change(None, rel_path, message, fallback_message)
     }
 
@@ -206,37 +237,31 @@ impl LocalGitAdapter {
         rel_path: &str,
         message: &str,
         fallback_message: &str,
-    ) -> Result<(), LibraryError> {
-        if !self.root_dir.join(".git").exists() {
-            return Ok(());
-        }
-        // HI-11: serialise concurrent commits in this process. Two
-        // threads each opening their own `git2::Repository` and
-        // calling `index().add_path()` race on `.git/index.lock`; the
-        // loser would surface as a `git add: error` failure to the
-        // user despite no real conflict.
-        let _git_guard = self.git_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let repo = git2::Repository::open(&self.root_dir)
-            .map_err(|e| LibraryError::Backend(format!("git open: {e}")))?;
-        let (sig_name, sig_email) = identity_for_repo(&repo)?;
-        let sig = git2::Signature::now(&sig_name, &sig_email)
-            .map_err(|e| LibraryError::Backend(format!("git signature: {e}")))?;
+    ) -> CommitOutcome {
+        self.commit_change_with(removed_rel_path, rel_path, &[], message, fallback_message)
+    }
 
-        let commit_message = if message.is_empty() {
-            fallback_message.to_string()
-        } else {
-            message.to_string()
-        };
-        retry_on_git_lock(repo.path(), || {
-            stage_and_commit(
-                &repo,
-                removed_rel_path.map(Path::new),
-                Path::new(rel_path),
-                &sig,
-                &commit_message,
-            )
-        })
-        .map_err(|e| LibraryError::Backend(format!("git commit {rel_path}: {e}")))?;
+    /// Refuse an asset path that is not a pinned-datasheet file already
+    /// written beside this library: only `assets/datasheets/<hash>.pdf`
+    /// is ever committed with a row, whatever the caller passes.
+    pub(super) fn check_datasheet_assets(&self, rels: &[String]) -> Result<(), LibraryError> {
+        for rel in rels {
+            let hash = rel
+                .strip_prefix(crate::datasheet_asset::DATASHEET_ASSET_DIR)
+                .and_then(|r| r.strip_prefix('/'))
+                .and_then(|r| r.strip_suffix(".pdf"));
+            let named = hash.and_then(crate::datasheet_asset::datasheet_asset_rel_path);
+            if named.as_deref() != Some(rel.as_str()) {
+                return Err(LibraryError::Backend(format!(
+                    "{rel} is not a pinned datasheet path"
+                )));
+            }
+            if !self.root_dir.join(rel).is_file() {
+                return Err(LibraryError::Backend(format!(
+                    "pinned datasheet {rel} is not on disk"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -244,15 +269,6 @@ impl LocalGitAdapter {
 
     pub(super) fn snxlib_rel_path(&self) -> Result<String, LibraryError> {
         file_name_str(&self.file_path)
-    }
-
-    /// Persist the in-memory `library_file` to disk. Caller already holds
-    /// the appropriate read/write lock.
-    fn persist_library_file(&self, lf: &LibraryFile) -> Result<(), LibraryError> {
-        let text = lf.write()?;
-        // HI-6: atomic write — never half-write the manifest.
-        signex_types::atomic_io::atomic_write(&self.file_path, text.as_bytes())?;
-        self.note_own_write(&text)
     }
 
     /// Mutate the in-memory `library_file`, persist it, and commit the
@@ -288,6 +304,77 @@ impl LocalGitAdapter {
     where
         F: FnOnce(&mut LibraryFile) -> Result<bool, LibraryError>,
     {
+        self.mutate_library_file_with_assets(f, &[], message, fallback)
+    }
+
+    /// [`Self::mutate_library_file_if_changed`] whose commit also takes the
+    /// working-tree files `asset_rel_paths` (already written).
+    pub(super) fn mutate_library_file_with_assets<F>(
+        &self,
+        f: F,
+        asset_rel_paths: &[String],
+        message: &str,
+        fallback: &str,
+    ) -> Result<(), LibraryError>
+    where
+        F: FnOnce(&mut LibraryFile) -> Result<bool, LibraryError>,
+    {
+        self.mutate_library_file_deferred(f, asset_rel_paths, &|| message.to_string(), fallback)
+    }
+
+    /// [`Self::mutate_library_file_with_assets`] whose commit message is
+    /// built after the edit ran, so it can say what the edit did.
+    pub(super) fn mutate_library_file_deferred<F>(
+        &self,
+        f: F,
+        asset_rel_paths: &[String],
+        message: &dyn Fn() -> String,
+        fallback: &str,
+    ) -> Result<(), LibraryError>
+    where
+        F: FnOnce(&mut LibraryFile) -> Result<bool, LibraryError>,
+    {
+        self.save_edit(
+            |lf, _| {
+                if !f(lf)? {
+                    return Ok(None);
+                }
+                // Cached prices follow their rows: a deleted row, or a SKU
+                // edited away, takes its prices with it in this same save.
+                super::helpers::prune_stale_pricing(lf);
+                // Rebased, so what this save removed is gone from the text
+                // later saves start from.
+                let text = lf.write_and_rebase()?;
+                // Lines of rows this edit replaced or removed go now, not
+                // at the next row write.
+                self.row_lines().retain_rows(lf);
+                Ok(Some(text))
+            },
+            asset_rel_paths,
+            message,
+            fallback,
+        )
+        .map(drop)
+    }
+
+    /// The one save protocol of the `.snxlib`: under both write locks,
+    /// reload, edit a clone, write it atomically, then let memory take it
+    /// and commit, with `asset_rel_paths` and every pinned PDF not yet in
+    /// HEAD (#1471). `edit` changes the clone and returns its encoded text,
+    /// or `None` when nothing changed (no write, no commit). Its flag says
+    /// whether memory holds this adapter's own last write (see
+    /// `holds_own_write`). Once the file is written the save is a success;
+    /// a failed commit is the returned outcome (#858).
+    pub(super) fn save_edit<F>(
+        &self,
+        edit: F,
+        asset_rel_paths: &[String],
+        message: &dyn Fn() -> String,
+        fallback: &str,
+    ) -> Result<CommitOutcome, LibraryError>
+    where
+        F: FnOnce(&mut LibraryFile, bool) -> Result<Option<String>, LibraryError>,
+    {
         self.ensure_commit_identity()?;
         // Another Signex process could otherwise reload and write between
         // our reload and our write (see `write_lock`). Taken before the
@@ -300,24 +387,51 @@ impl LocalGitAdapter {
         // An external edit must be merged in, not overwritten by a stale
         // copy; an unreadable file refuses the edit (see `disk_sync`).
         self.reload_if_stale(&mut guard, super::disk_sync::Verify::Content)?;
-        if !f(&mut guard)? {
-            return Ok(());
-        }
-        self.persist_library_file(&guard)?;
+        // Resolve the manifest path before any write: nothing after the
+        // atomic write below may return an error.
         let rel = self.snxlib_rel_path()?;
-        self.commit_path(&rel, message, fallback)
+        // #831: edit a clone. An encode or write failure discards it, so
+        // memory and the `.snxlib` on disk stay exactly as they were. Rows
+        // are shared, so the clone is cheap (#416).
+        let mut candidate = guard.clone();
+        let Some(text) = edit(&mut candidate, self.holds_own_write())? else {
+            return Ok(CommitOutcome::NothingToCommit);
+        };
+        // Every row's pins are in `text`, so every pinned PDF that is on
+        // disk and not yet in HEAD goes into this commit, whichever row the
+        // edit was about (#1471). Read under the write lock.
+        let asset_rel_paths = &self.pinned_assets_to_commit(&candidate, asset_rel_paths);
+        // Built before the write: nothing after it may fail or panic.
+        let message = message();
+        // HI-6: atomic write — never half-write the manifest.
+        crate::adapter::ensure_inside_library(&self.root_dir, &self.file_path)?;
+        signex_types::atomic_io::atomic_write_existing_dir(&self.file_path, text.as_bytes())?;
+        self.warn_plain_token_once(&candidate.manifest.mode);
+        // Disk now holds the edit, so memory takes it too. Memory and disk
+        // stay equal whatever happens next: a failed commit leaves both on
+        // the edit (#858).
+        *guard = candidate;
+        // A failed stamp only costs one extra reload on the next access.
+        if let Err(stamp_err) = self.note_own_write(&text) {
+            tracing::warn!(
+                target: "signex::library",
+                path = %self.file_path.display(),
+                "saved, but the disk stamp could not be recorded: {stamp_err}"
+            );
+        }
+        Ok(self.commit_change_with(None, &rel, asset_rel_paths, &message, fallback))
     }
 
     /// Read the table named `table` as a snapshot of [`ComponentRow`]s,
     /// scoped to whatever the legacy [`TABLE_HEADER`] columns are.
-    /// Returns an empty vec for unknown tables (matches the old
-    /// `tables/<name>.tsv` "missing file = empty" semantics).
+    /// Returns an empty vec for unknown tables.
     pub(super) fn snapshot_table(&self, name: &str) -> Result<Vec<ComponentRow>, LibraryError> {
         self.refresh_for_read();
         let guard = self
             .library_file
             .read()
             .map_err(|_| LibraryError::Backend("library_file read lock poisoned".into()))?;
+        self.row_reads.retain_tables(guard.tables.keys());
         let Some(table) = guard.tables.get(name) else {
             return Ok(Vec::new());
         };
@@ -326,20 +440,25 @@ impl LocalGitAdapter {
         // away, but for v0.9 we want a loud error if a hand-edited
         // .snxlib drifts the schema.
         validate_legacy_header(name, &table.columns)?;
-        let mut out = Vec::with_capacity(table.rows.len());
-        for row in &table.rows {
-            out.push(library_row_to_component(row)?);
-        }
-        Ok(out)
+        self.row_reads.table(name, &table.rows)
     }
 
     // ── Symbol container helpers (v0.9 phase 2 multi-symbol files) ────────
 
     pub(super) fn scan_symbol_files(&self) -> Result<Vec<(PathBuf, SymbolFile)>, LibraryError> {
         let dir = self.primitive_dir(PrimitiveKind::Symbol);
-        if !dir.exists() {
-            self.record_symbol_problems(&[]);
-            return Ok(Vec::new());
+        // Only a folder that is really absent is empty; one that cannot be
+        // checked or listed is a backend failure, never "not found" (#1903).
+        let present = dir
+            .try_exists()
+            .map_err(|e| LibraryError::Backend(format!("check {}: {e}", dir.display())))?;
+        let empty = |this: &Self| {
+            this.record_symbol_problems(&[]);
+            this.symbol_index.rebuild(&[]);
+            Ok(Vec::new())
+        };
+        if !present {
+            return empty(self);
         }
         let suffix = format!(".{SYMBOL_EXT}");
         let mut out: Vec<(PathBuf, SymbolFile)> = Vec::new();
@@ -348,17 +467,44 @@ impl LocalGitAdapter {
             .min_depth(1)
             .max_depth(1)
             .into_iter()
-            .filter_map(Result::ok)
         {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    let kind = e.io_error().map(std::io::Error::kind);
+                    match walk_error_action(e.depth(), kind, e.path(), &suffix) {
+                        WalkErrorAction::Fail => {
+                            return Err(LibraryError::Backend(format!(
+                                "list {}: {e}",
+                                dir.display()
+                            )));
+                        }
+                        WalkErrorAction::Problem => {
+                            let at = e.path().map_or_else(|| dir.clone(), Path::to_path_buf);
+                            problems.push(SymbolFileProblem::new(at, &e.to_string()));
+                        }
+                        WalkErrorAction::Skip => {}
+                    }
+                    continue;
+                }
+            };
             let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
             let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
                 continue;
             };
             if !name.ends_with(&suffix) {
                 continue;
+            }
+            // Only regular files (or links to one) are read: a link to a
+            // device or FIFO must not be read. A stat that fails is a problem,
+            // not a skip, so the listing never reads as complete without it.
+            match fs::metadata(path) {
+                Ok(meta) if meta.is_file() => {}
+                Ok(_) => continue,
+                Err(e) => {
+                    problems.push(SymbolFileProblem::new(path.to_path_buf(), &e.to_string()));
+                    continue;
+                }
             }
             // #690 — a container that cannot be read or parsed affects only
             // itself: skip it, never rewrite it, and record it so it is
@@ -378,6 +524,7 @@ impl LocalGitAdapter {
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         self.record_symbol_problems(&problems);
+        self.symbol_index.rebuild(&out);
         Ok(out)
     }
 
@@ -453,30 +600,26 @@ impl LocalGitAdapter {
         &self,
         sym: Symbol,
         message: &str,
-    ) -> Result<(), LibraryError> {
+    ) -> Result<CommitOutcome, LibraryError> {
         self.ensure_commit_identity()?;
         // The container is read, merged and rewritten: another Signex
         // process doing the same would drop this edit (#893, see
         // `write_lock`). The cascade that follows takes the lock itself.
         let _write_lock = self.lock_for_write()?;
         let dir = self.primitive_dir(PrimitiveKind::Symbol);
+        self.require_root_dir()?;
         fs::create_dir_all(&dir)?;
 
-        let target_path = match self.locate_symbol_file(sym.uuid)? {
+        // The path is made library-relative before the write: nothing after
+        // the atomic write may return an error (#858).
+        let (path, file, rel_path) = match self.locate_symbol_file(sym.uuid)? {
             Some((path, mut file)) => {
                 if !file.upsert(sym.clone()) {
                     file.symbols.push(sym.clone());
                     file.updated = chrono::Utc::now();
                 }
-                // v0.18.4 — emit TOML envelope.
-                let text = file
-                    .to_toml_string()
-                    .map_err(|e| LibraryError::Backend(format!("write symbol container: {e}")))?;
-                // HI-6: atomic write — the symbol container is a TOML+TSV
-                // envelope holding every symbol; an in-place truncate by
-                // `fs::write` would destroy them all on a crash mid-save.
-                signex_types::atomic_io::atomic_write(&path, text.as_bytes())?;
-                path
+                let rel_path = self.library_rel_path(&path)?;
+                (path, file, rel_path)
             }
             None => {
                 // A skipped container whose text mentions this uuid may
@@ -485,36 +628,46 @@ impl LocalGitAdapter {
                 self.refuse_if_skipped_file_mentions(sym.uuid)?;
                 let file = SymbolFile::from_symbol(sym.clone());
                 let path = self.fresh_symbol_file_path(&dir, &file)?;
-                // v0.18.4 — emit TOML envelope.
-                let text = file
-                    .to_toml_string()
-                    .map_err(|e| LibraryError::Backend(format!("write symbol container: {e}")))?;
-                // HI-6: atomic write — the symbol container is a TOML+TSV
-                // envelope holding every symbol; an in-place truncate by
-                // `fs::write` would destroy them all on a crash mid-save.
-                signex_types::atomic_io::atomic_write(&path, text.as_bytes())?;
-                path
+                let rel_path = self.library_rel_path(&path)?;
+                (path, file, rel_path)
             }
         };
+        // v0.18.4 — emit TOML envelope.
+        let text = file
+            .to_toml_string()
+            .map_err(|e| LibraryError::Backend(format!("write symbol container: {e}")))?;
+        // HI-6: atomic write — the symbol container is a TOML+TSV
+        // envelope holding every symbol; an in-place truncate by
+        // `fs::write` would destroy them all on a crash mid-save.
+        crate::adapter::ensure_inside_library(&self.root_dir, &path)?;
+        signex_types::atomic_io::atomic_write_existing_dir(&path, text.as_bytes())?;
+        self.symbol_index.record(&file, &path);
 
-        let rel_path = target_path
+        let fallback = format!("save symbol {} into {rel_path}", sym.uuid);
+        Ok(self.commit_path(&rel_path, message, &fallback))
+    }
+
+    /// `path` as a library-relative, forward-slash path.
+    fn library_rel_path(&self, path: &Path) -> Result<String, LibraryError> {
+        Ok(path
             .strip_prefix(&self.root_dir)
             .map_err(|_| {
                 LibraryError::Backend(format!(
                     "could not relativise {} against root",
-                    target_path.display()
+                    path.display()
                 ))
             })?
             .to_string_lossy()
-            .replace('\\', "/");
-        let fallback = format!("save symbol {} into {rel_path}", sym.uuid);
-        self.commit_path(&rel_path, message, &fallback)
+            .replace('\\', "/"))
     }
 
-    fn locate_symbol_file(
+    pub(super) fn locate_symbol_file(
         &self,
         uuid: Uuid,
     ) -> Result<Option<(PathBuf, SymbolFile)>, LibraryError> {
+        if let Some(hit) = self.indexed_symbol_file(uuid) {
+            return Ok(Some(hit));
+        }
         for (path, file) in self.scan_symbol_files()? {
             if file.symbols.iter().any(|s| s.uuid == uuid) {
                 return Ok(Some((path, file)));
@@ -597,6 +750,7 @@ impl LocalGitAdapter {
                 name,
                 kind,
                 used_by_count: 0,
+                file: Some(path.to_path_buf()),
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));

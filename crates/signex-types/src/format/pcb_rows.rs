@@ -10,13 +10,25 @@
 //! the container `SnxPcb` can reach them.
 
 use super::extras::{FootprintExtras, PadExtras};
-use super::tsv::{format_f64, parse_f64, parse_i64, parse_uuid};
+use super::pad_shape_cells::{
+    check_shape, refuse_unreadable_shape, take_shape_cells, with_shape_cells,
+};
+use super::pcb_cells::{
+    take_layer_sizes_cell, take_locked_cell, take_net_locked_cell, take_rotation_cell,
+    with_layer_sizes_cell, with_locked_cell, with_net_locked_cell, with_rotation_cell,
+};
+use super::pcb_row_columns::{take_track_cells, take_via_cells, with_track_cells, with_via_cells};
+use super::tsv::{format_f64, parse_f64, parse_nm, parse_uuid};
 use super::units::{NonFiniteField, mm_to_nm, nm_to_mm};
 use super::unknown_columns::impl_unknown_columns_accessors;
 use super::*;
+use crate::part::FootprintSourceRef;
 use crate::pcb::{
-    DrillDef, Footprint, Pad, PadNet, PadShape, PadType, Point as PcbPoint, Segment, Via, ViaType,
+    DrillDef, Footprint, Pad, PadNet, PadShape, PadType, Point as PcbPoint, Segment, SymbolLink,
+    Via, ViaType,
 };
+use crate::pcb_layer::{CopperLayer, InnerCopper, MechanicalLayer, PcbLayer, TechnicalLayer};
+use crate::schematic::InstancePath;
 use uuid::Uuid;
 
 /// Bulk row for one [`Footprint`] in the `[footprints]` block.
@@ -60,8 +72,8 @@ impl SnxTable for PcbFootprintRow {
             uuid: parse_uuid(values[0], block, row, "uuid")?,
             ref_des: values[1].to_string(),
             library: values[2].to_string(),
-            pos_x: parse_i64(values[3], block, row, "pos_x")?,
-            pos_y: parse_i64(values[4], block, row, "pos_y")?,
+            pos_x: parse_nm(values[3], block, row, "pos_x")?,
+            pos_y: parse_nm(values[4], block, row, "pos_y")?,
             rotation: parse_f64(values[5], block, row, "rotation")?,
             layer: values[6].to_string(),
             value: values[7].to_string(),
@@ -139,14 +151,14 @@ impl SnxTable for PcbPadRow {
             uuid: parse_uuid(values[0], block, row, "uuid")?,
             footprint_ref: values[1].to_string(),
             pin: values[2].to_string(),
-            pos_x: parse_i64(values[3], block, row, "pos_x")?,
-            pos_y: parse_i64(values[4], block, row, "pos_y")?,
-            size_x: parse_i64(values[5], block, row, "size_x")?,
-            size_y: parse_i64(values[6], block, row, "size_y")?,
+            pos_x: parse_nm(values[3], block, row, "pos_x")?,
+            pos_y: parse_nm(values[4], block, row, "pos_y")?,
+            size_x: parse_nm(values[5], block, row, "size_x")?,
+            size_y: parse_nm(values[6], block, row, "size_y")?,
             pad_type: values[7].to_string(),
             shape: values[8].to_string(),
             layers: values[9].to_string(),
-            drill: parse_i64(values[10], block, row, "drill")?,
+            drill: parse_nm(values[10], block, row, "drill")?,
             net_number: values[11].parse().map_err(|e: std::num::ParseIntError| {
                 FormatError::TsvFieldParse {
                     block: block.to_string(),
@@ -210,11 +222,11 @@ impl SnxTable for PcbTrackRow {
                 }
             })?,
             layer: values[2].to_string(),
-            width: parse_i64(values[3], block, row, "width")?,
-            start_x: parse_i64(values[4], block, row, "start_x")?,
-            start_y: parse_i64(values[5], block, row, "start_y")?,
-            end_x: parse_i64(values[6], block, row, "end_x")?,
-            end_y: parse_i64(values[7], block, row, "end_y")?,
+            width: parse_nm(values[3], block, row, "width")?,
+            start_x: parse_nm(values[4], block, row, "start_x")?,
+            start_y: parse_nm(values[5], block, row, "start_y")?,
+            end_x: parse_nm(values[6], block, row, "end_x")?,
+            end_y: parse_nm(values[7], block, row, "end_y")?,
             unknown_columns: UnknownColumns::default(),
         })
     }
@@ -267,10 +279,10 @@ impl SnxTable for PcbViaRow {
                     message: e.to_string(),
                 }
             })?,
-            pos_x: parse_i64(values[2], block, row, "pos_x")?,
-            pos_y: parse_i64(values[3], block, row, "pos_y")?,
-            drill: parse_i64(values[4], block, row, "drill")?,
-            diameter: parse_i64(values[5], block, row, "diameter")?,
+            pos_x: parse_nm(values[2], block, row, "pos_x")?,
+            pos_y: parse_nm(values[3], block, row, "pos_y")?,
+            drill: parse_nm(values[4], block, row, "drill")?,
+            diameter: parse_nm(values[5], block, row, "diameter")?,
             layers: values[6].to_string(),
             via_type: values[7].to_string(),
             unknown_columns: UnknownColumns::default(),
@@ -282,60 +294,154 @@ impl SnxTable for PcbViaRow {
 // Enum string codecs
 // ---------------------------------------------------------------------------
 
-fn pad_type_str(t: PadType) -> &'static str {
-    match t {
-        PadType::Thru => "thru",
-        PadType::Smd => "smd",
-        PadType::Connect => "connect",
-        PadType::NpThru => "np_thru",
+crate::token_enum! {
+    fn pad_type_str / parse_pad_type for PadType, fallback Thru {
+        Thru => "thru",
+        Smd => "smd",
+        Connect => "connect",
+        NpThru => "np_thru",
     }
 }
 
-fn parse_pad_type(s: &str) -> PadType {
-    match s {
-        "smd" => PadType::Smd,
-        "connect" => PadType::Connect,
-        "np_thru" => PadType::NpThru,
-        _ => PadType::Thru,
-    }
-}
-
-fn pad_shape_str(s: PadShape) -> &'static str {
-    match s {
+fn pad_shape_str(shape: PadShape) -> &'static str {
+    match shape {
         PadShape::Circle => "circle",
         PadShape::Rect => "rect",
         PadShape::Oval => "oval",
-        PadShape::Trapezoid => "trapezoid",
         PadShape::RoundRect => "roundrect",
+        PadShape::Trapezoid => "trapezoid",
         PadShape::Custom => "custom",
     }
 }
 
-fn parse_pad_shape(s: &str) -> PadShape {
-    match s {
+/// An unknown shape token is a load error naming the field and the value:
+/// reading it as some other shape would draw and hit-test the wrong copper.
+fn parse_pad_shape(text: &str, block: &str, row: usize) -> Result<PadShape, FormatError> {
+    Ok(match text {
+        "circle" => PadShape::Circle,
         "rect" => PadShape::Rect,
         "oval" => PadShape::Oval,
-        "trapezoid" => PadShape::Trapezoid,
         "roundrect" => PadShape::RoundRect,
+        "trapezoid" => PadShape::Trapezoid,
         "custom" => PadShape::Custom,
-        _ => PadShape::Circle,
+        other => {
+            return Err(row_field_error(
+                block,
+                row,
+                "shape",
+                other,
+                "not a pad shape (circle, rect, oval, roundrect, trapezoid, custom)",
+            ));
+        }
+    })
+}
+
+pub(in crate::format) fn row_field_error(
+    block: &str,
+    row: usize,
+    field: &str,
+    value: &str,
+    why: &str,
+) -> FormatError {
+    FormatError::TsvFieldParse {
+        block: block.to_string(),
+        row,
+        field: field.to_string(),
+        message: format!("value {value:?}: {why}"),
     }
 }
 
-fn via_type_str(t: ViaType) -> &'static str {
-    match t {
-        ViaType::Through => "through",
-        ViaType::Blind => "blind",
-        ViaType::Micro => "micro",
+crate::token_enum! {
+    fn via_type_str / parse_via_type for ViaType, fallback Through {
+        Through => "through",
+        Blind => "blind",
+        Micro => "micro",
     }
 }
 
-fn parse_via_type(s: &str) -> ViaType {
-    match s {
-        "blind" => ViaType::Blind,
-        "micro" => ViaType::Micro,
-        _ => ViaType::Through,
+// The fallback is a placeholder: `parse_pcb_layer` re-checks the token, so
+// an unknown name is never read as `Margin`.
+crate::token_enum! {
+    fn technical_layer_str / parse_technical_layer_or_margin for TechnicalLayer, fallback Margin {
+        EdgeCuts => "EdgeCuts",
+        Margin => "Margin",
+        SilkscreenTop => "TopSilkscreen",
+        SilkscreenBottom => "BottomSilkscreen",
+        SolderMaskTop => "TopSolderMask",
+        SolderMaskBottom => "BottomSolderMask",
+        PasteTop => "TopPaste",
+        PasteBottom => "BottomPaste",
+        AdhesiveTop => "TopAdhesive",
+        AdhesiveBottom => "BottomAdhesive",
+        FabTop => "TopFab",
+        FabBottom => "BottomFab",
+        AssemblyTop => "TopAssembly",
+        AssemblyBottom => "BottomAssembly",
+        CourtyardTop => "TopCourtyard",
+        CourtyardBottom => "BottomCourtyard",
+        Body3dTop => "Top3DBody",
+        Body3dBottom => "Bottom3DBody",
+        KeepoutTop => "TopKeepout",
+        KeepoutBottom => "BottomKeepout",
+        FiducialTop => "TopFiducial",
+        FiducialBottom => "BottomFiducial",
+        DesignatorTop => "TopDesignator",
+        DesignatorBottom => "BottomDesignator",
+        Dimensions => "Dimensions",
+        Notes => "Notes",
+        DrillDrawing => "DrillDrawing",
+        Eco1 => "Eco1",
+        Eco2 => "Eco2",
     }
+}
+
+/// The on-disk name of `layer`: `TopCopper`, `Inner<n>Copper`,
+/// `BottomCopper`, a technical name such as `TopSilkscreen`, or `Mechanical<n>`.
+pub fn pcb_layer_token(layer: PcbLayer) -> String {
+    match layer {
+        PcbLayer::Copper(CopperLayer::Top) => "TopCopper".to_string(),
+        PcbLayer::Copper(CopperLayer::Inner(n)) => format!("Inner{}Copper", n.index()),
+        PcbLayer::Copper(CopperLayer::Bottom) => "BottomCopper".to_string(),
+        PcbLayer::Technical(t) => technical_layer_str(t).to_string(),
+        PcbLayer::Mechanical(n) => format!("Mechanical{}", n.index()),
+    }
+}
+
+/// The layer `token` names, or `None` for a name this build does not know.
+/// Exact match only, so `pcb_layer_token` of the result is `token` again;
+/// the caller keeps an unknown name as its string.
+pub fn parse_pcb_layer(token: &str) -> Option<PcbLayer> {
+    match token {
+        "TopCopper" => return Some(PcbLayer::Copper(CopperLayer::Top)),
+        "BottomCopper" => return Some(PcbLayer::Copper(CopperLayer::Bottom)),
+        _ => {}
+    }
+    if let Some(n) = token
+        .strip_prefix("Inner")
+        .and_then(|rest| rest.strip_suffix("Copper"))
+    {
+        return canonical_index(n)
+            .and_then(InnerCopper::new)
+            .map(|n| PcbLayer::Copper(CopperLayer::Inner(n)));
+    }
+    if let Some(n) = token.strip_prefix("Mechanical") {
+        return canonical_index(n)
+            .and_then(MechanicalLayer::new)
+            .map(PcbLayer::Mechanical);
+    }
+    let technical = parse_technical_layer_or_margin(token);
+    (technical_layer_str(technical) == token).then_some(PcbLayer::Technical(technical))
+}
+
+/// A decimal index written without sign or leading zero.
+fn canonical_index(digits: &str) -> Option<u8> {
+    let canonical = !digits.is_empty()
+        && !digits.starts_with('0')
+        && digits.bytes().all(|b| b.is_ascii_digit());
+    if !canonical {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn join_layers(layers: &[String]) -> String {
@@ -356,9 +462,42 @@ fn split_layers(s: &str) -> Vec<String> {
 // Footprint / Pad / Segment / Via translation
 // ---------------------------------------------------------------------------
 
+/// Why a footprint row cannot be written.
+#[derive(Debug)]
+pub(in crate::format) enum FootprintRowError {
+    NonFinite(NonFiniteField),
+    /// The `lib_ref` cell would not read back; it holds the cell.
+    UnreadableLibRef(String),
+}
+
+impl From<NonFiniteField> for FootprintRowError {
+    fn from(e: NonFiniteField) -> Self {
+        Self::NonFinite(e)
+    }
+}
+
+impl FootprintRowError {
+    pub(in crate::format) fn at(self, block: &str, row: usize) -> FormatError {
+        match self {
+            Self::NonFinite(e) => super::non_finite_error(block, row, e),
+            Self::UnreadableLibRef(value) => FormatError::UnwritableField {
+                block: block.to_string(),
+                row,
+                field: LIB_REF_COLUMN.to_string(),
+                value,
+                why: "a library footprint must be <library uuid>:<footprint uuid>@<version> with a version".to_string(),
+            },
+        }
+    }
+}
+
 pub(in crate::format) fn footprint_to_row(
     fp: &Footprint,
-) -> Result<PcbFootprintRow, NonFiniteField> {
+) -> Result<PcbFootprintRow, FootprintRowError> {
+    let unknown_columns = with_lib_ref_cell(
+        with_link_cell(fp.unknown_columns.clone(), fp.schematic_link.as_ref()),
+        fp.library_ref.as_ref(),
+    )?;
     Ok(PcbFootprintRow {
         uuid: fp.uuid,
         ref_des: fp.reference.clone(),
@@ -368,15 +507,19 @@ pub(in crate::format) fn footprint_to_row(
         rotation: fp.rotation,
         layer: fp.layer.clone(),
         value: fp.value.clone(),
-        unknown_columns: fp.unknown_columns.clone(),
+        unknown_columns,
     })
 }
 
 pub(in crate::format) fn row_to_footprint(
-    row: PcbFootprintRow,
+    mut row: PcbFootprintRow,
     extras: FootprintExtras,
-) -> Footprint {
-    Footprint {
+    block: &str,
+    index: usize,
+) -> Result<Footprint, FormatError> {
+    let schematic_link = take_link_cell(&mut row.unknown_columns);
+    let library_ref = take_lib_ref_cell(&mut row.unknown_columns, block, index)?;
+    Ok(Footprint {
         uuid: row.uuid,
         reference: row.ref_des,
         value: row.value,
@@ -395,9 +538,108 @@ pub(in crate::format) fn row_to_footprint(
         pads: Vec::new(),
         graphics: extras.graphics,
         properties: extras.properties,
+        schematic_link,
+        library_ref,
+        component: Box::new(extras.component),
         unknown: extras.unknown,
         unknown_columns: row.unknown_columns,
+    })
+}
+
+/// Header of the optional `sch_link` footprint column: the footprint's
+/// schematic part as `<unit uuid>[+<unit uuid>...]@<sheet path>`, units in
+/// ascending order, e.g. `0190...@/` for a one-unit part on a root page or
+/// `0190...a+0190...b@/<sheet uuid>` for a two-unit part on a child sheet
+/// occurrence. A foreign column like `net_locked`: absent when no footprint
+/// is linked, an empty cell for an unlinked footprint of a block that has
+/// linked ones.
+pub(in crate::format) const SCH_LINK_COLUMN: &str = "sch_link";
+
+fn link_cell(link: &SymbolLink) -> String {
+    let units: Vec<String> = link.units.iter().map(Uuid::to_string).collect();
+    format!("{}@{}", units.join("+"), link.sheet)
+}
+
+fn with_link_cell(mut columns: UnknownColumns, link: Option<&SymbolLink>) -> UnknownColumns {
+    if let Some(link) = link {
+        columns.set(SCH_LINK_COLUMN, link_cell(link));
     }
+    columns
+}
+
+/// An empty cell is "no link"; a cell this build cannot parse is not ours
+/// to read, so it stays a foreign cell and round-trips untouched.
+fn take_link_cell(columns: &mut UnknownColumns) -> Option<SymbolLink> {
+    let cell = columns.get(SCH_LINK_COLUMN)?;
+    if cell.is_empty() {
+        columns.take(SCH_LINK_COLUMN);
+        return None;
+    }
+    let (units, sheet) = cell.split_once('@')?;
+    let units = units
+        .split('+')
+        .map(|u| Uuid::parse_str(u).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let link = SymbolLink::new(InstancePath::parse(sheet)?, units);
+    // Only a cell that writes back identically is ours.
+    if link_cell(&link) != cell {
+        return None;
+    }
+    columns.take(SCH_LINK_COLUMN);
+    Some(link)
+}
+
+/// Header of the optional `lib_ref` footprint column: the library footprint
+/// the board footprint was built from, as `<library uuid>:<footprint
+/// uuid>@<version>` (ADR-0005 section 13). Like `sch_link` it is absent when
+/// no footprint carries one, and an empty cell for a footprint without one in
+/// a block that has some.
+pub(in crate::format) const LIB_REF_COLUMN: &str = "lib_ref";
+
+/// The reader refuses a cell that does not parse back to the same value (an
+/// empty version, say), so writing one would save a board that cannot
+/// reopen: the save is refused instead.
+fn with_lib_ref_cell(
+    mut columns: UnknownColumns,
+    library_ref: Option<&FootprintSourceRef>,
+) -> Result<UnknownColumns, FootprintRowError> {
+    if let Some(library_ref) = library_ref {
+        let cell = library_ref.to_string();
+        if FootprintSourceRef::parse(&cell).as_ref() != Some(library_ref) {
+            return Err(FootprintRowError::UnreadableLibRef(cell));
+        }
+        columns.set(LIB_REF_COLUMN, cell);
+    }
+    Ok(columns)
+}
+
+/// An empty cell is "no library footprint". Any other cell must read back
+/// exactly; a malformed one is a load error naming the field and value, as
+/// a wrong library identity would update the footprint from the wrong part.
+fn take_lib_ref_cell(
+    columns: &mut UnknownColumns,
+    block: &str,
+    row: usize,
+) -> Result<Option<FootprintSourceRef>, FormatError> {
+    match columns.take(LIB_REF_COLUMN) {
+        None => Ok(None),
+        Some(cell) if cell.is_empty() => Ok(None),
+        Some(cell) => FootprintSourceRef::parse(&cell).map(Some).ok_or_else(|| {
+            row_field_error(
+                block,
+                row,
+                LIB_REF_COLUMN,
+                &cell,
+                "a library footprint must be <library uuid>:<footprint uuid>@<version>",
+            )
+        }),
+    }
+}
+
+/// A round-rect corner ratio must be within 0..=0.5; other shapes ignore it.
+/// The reader and the writer share this rule.
+fn roundrect_ratio_fits(shape: PadShape, ratio: f64) -> bool {
+    shape != PadShape::RoundRect || (0.0..=0.5).contains(&ratio)
 }
 
 pub(in crate::format) fn pad_to_row(
@@ -415,6 +657,12 @@ pub(in crate::format) fn pad_to_row(
         .as_ref()
         .map(|n| (n.number, n.name.clone()))
         .unwrap_or((0, String::new()));
+    // The reader refuses this ratio, so writing it would save a board
+    // that cannot reopen.
+    if !roundrect_ratio_fits(pad.shape, pad.roundrect_ratio) {
+        return Err(NonFiniteField("roundrect_ratio"));
+    }
+    refuse_unreadable_shape(pad)?;
     Ok(PcbPadRow {
         uuid: pad.uuid,
         footprint_ref: footprint_ref.to_string(),
@@ -430,11 +678,41 @@ pub(in crate::format) fn pad_to_row(
         net_number,
         net_name,
         roundrect_ratio: pad.roundrect_ratio,
-        unknown_columns: pad.unknown_columns.clone(),
+        unknown_columns: with_shape_cells(
+            with_layer_sizes_cell(
+                with_rotation_cell(
+                    with_net_locked_cell(pad.unknown_columns.clone(), pad.net_locked),
+                    pad.rotation,
+                )?,
+                pad.layer_sizes.as_ref(),
+            )?,
+            pad,
+        )?,
     })
 }
 
-pub(in crate::format) fn row_to_pad(row: PcbPadRow, extras: PadExtras) -> Pad {
+pub(in crate::format) fn row_to_pad(
+    mut row: PcbPadRow,
+    extras: PadExtras,
+    block: &str,
+    index: usize,
+) -> Result<Pad, FormatError> {
+    let shape = parse_pad_shape(&row.shape, block, index)?;
+    let ratio = row.roundrect_ratio;
+    if !roundrect_ratio_fits(shape, ratio) {
+        return Err(row_field_error(
+            block,
+            index,
+            "roundrect_ratio",
+            &ratio.to_string(),
+            "a roundrect corner ratio must be within 0..=0.5",
+        ));
+    }
+    let rotation = take_rotation_cell(&mut row.unknown_columns, block, index)?;
+    let net_locked = take_net_locked_cell(&mut row.unknown_columns);
+    let layer_sizes = take_layer_sizes_cell(&mut row.unknown_columns, block, index)?;
+    let (trapezoid_delta, custom_outline) =
+        take_shape_cells(&mut row.unknown_columns, block, index)?;
     let drill = if row.drill > 0 {
         Some(DrillDef {
             diameter: nm_to_mm(row.drill),
@@ -451,11 +729,11 @@ pub(in crate::format) fn row_to_pad(row: PcbPadRow, extras: PadExtras) -> Pad {
     } else {
         None
     };
-    Pad {
+    let pad = Pad {
         uuid: row.uuid,
         number: row.pin,
         pad_type: parse_pad_type(&row.pad_type),
-        shape: parse_pad_shape(&row.shape),
+        shape,
         position: PcbPoint {
             x: nm_to_mm(row.pos_x),
             y: nm_to_mm(row.pos_y),
@@ -468,9 +746,16 @@ pub(in crate::format) fn row_to_pad(row: PcbPadRow, extras: PadExtras) -> Pad {
         layers: split_layers(&row.layers),
         net,
         roundrect_ratio: row.roundrect_ratio,
+        rotation,
+        trapezoid_delta,
+        custom_outline,
+        net_locked,
+        layer_sizes,
         unknown: extras.unknown,
         unknown_columns: row.unknown_columns,
-    }
+    };
+    check_shape(&pad, block, index)?;
+    Ok(pad)
 }
 
 pub(in crate::format) fn track_to_row(s: &Segment) -> Result<PcbTrackRow, NonFiniteField> {
@@ -483,12 +768,17 @@ pub(in crate::format) fn track_to_row(s: &Segment) -> Result<PcbTrackRow, NonFin
         start_y: mm_to_nm(s.start.y, "start_y")?,
         end_x: mm_to_nm(s.end.x, "end_x")?,
         end_y: mm_to_nm(s.end.y, "end_y")?,
-        unknown_columns: s.unknown_columns.clone(),
+        unknown_columns: with_track_cells(
+            with_locked_cell(s.unknown_columns.clone(), s.locked),
+            &s.attributes,
+        )?,
     })
 }
 
-pub(in crate::format) fn row_to_track(row: PcbTrackRow) -> Segment {
-    Segment {
+fn row_to_track(mut row: PcbTrackRow, block: &str, index: usize) -> Result<Segment, FormatError> {
+    let locked = take_locked_cell(&mut row.unknown_columns);
+    let attributes = take_track_cells(&mut row.unknown_columns, block, index)?;
+    Ok(Segment {
         uuid: row.uuid,
         start: PcbPoint {
             x: nm_to_mm(row.start_x),
@@ -501,8 +791,10 @@ pub(in crate::format) fn row_to_track(row: PcbTrackRow) -> Segment {
         width: nm_to_mm(row.width),
         layer: row.layer,
         net: row.net,
+        locked,
+        attributes,
         unknown_columns: row.unknown_columns,
-    }
+    })
 }
 
 pub(in crate::format) fn via_to_row(v: &Via) -> Result<PcbViaRow, NonFiniteField> {
@@ -515,12 +807,21 @@ pub(in crate::format) fn via_to_row(v: &Via) -> Result<PcbViaRow, NonFiniteField
         diameter: mm_to_nm(v.diameter, "diameter")?,
         layers: join_layers(&v.layers),
         via_type: via_type_str(v.via_type).to_string(),
-        unknown_columns: v.unknown_columns.clone(),
+        unknown_columns: with_via_cells(
+            with_layer_sizes_cell(
+                with_locked_cell(v.unknown_columns.clone(), v.locked),
+                v.layer_sizes.as_ref(),
+            )?,
+            &v.attributes,
+        )?,
     })
 }
 
-pub(in crate::format) fn row_to_via(row: PcbViaRow) -> Via {
-    Via {
+fn row_to_via(mut row: PcbViaRow, block: &str, index: usize) -> Result<Via, FormatError> {
+    let locked = take_locked_cell(&mut row.unknown_columns);
+    let layer_sizes = take_layer_sizes_cell(&mut row.unknown_columns, block, index)?;
+    let attributes = take_via_cells(&mut row.unknown_columns, block, index)?;
+    Ok(Via {
         uuid: row.uuid,
         position: PcbPoint {
             x: nm_to_mm(row.pos_x),
@@ -531,6 +832,27 @@ pub(in crate::format) fn row_to_via(row: PcbViaRow) -> Via {
         layers: split_layers(&row.layers),
         net: row.net,
         via_type: parse_via_type(&row.via_type),
+        locked,
+        layer_sizes,
+        attributes,
         unknown_columns: row.unknown_columns,
-    }
+    })
+}
+
+/// The `[tracks]` rows as tracks, refusing a row with an unreadable cell.
+pub(in crate::format) fn rows_to_tracks(
+    rows: Vec<PcbTrackRow>,
+) -> Result<Vec<Segment>, FormatError> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, row)| row_to_track(row, "tracks", i))
+        .collect()
+}
+
+/// The `[vias]` rows as vias, refusing a row with an unreadable cell.
+pub(in crate::format) fn rows_to_vias(rows: Vec<PcbViaRow>) -> Result<Vec<Via>, FormatError> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, row)| row_to_via(row, "vias", i))
+        .collect()
 }

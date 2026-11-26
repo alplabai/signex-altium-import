@@ -24,6 +24,7 @@ fn pin(part_number: u8, orientation: PinOrientation, electrical: PinDirection) -
 
 fn line_graphic(part_number: u8, from: [f64; 2], to: [f64; 2]) -> SymbolGraphic {
     SymbolGraphic {
+        body_style: 1,
         kind: SymbolGraphicKind::Line { from, to },
         stroke_width: 0.2,
         fill: None,
@@ -44,7 +45,7 @@ fn two_unit_symbol_graphics_and_part_zero_pins_carry_the_right_unit() {
     let mut sym = Symbol::empty("DUAL-OPAMP");
     sym.part_count = 2;
     sym.pins = vec![
-        pin(0, PinOrientation::Right, PinDirection::Power), // Part Zero: shared VCC
+        pin(0, PinOrientation::Right, PinDirection::PowerInput), // Part Zero: shared VCC
         pin(1, PinOrientation::Right, PinDirection::Input),
         pin(2, PinOrientation::Right, PinDirection::Input),
     ];
@@ -134,7 +135,7 @@ fn pin_orientation_maps_to_rotation_degrees_for_all_four_variants() {
     }
 }
 
-/// Ground-truth convention test: ties `pin_rotation_deg`'s output to the
+/// Ground-truth convention test: ties `PinOrientation::rotation_deg`'s output to the
 /// convention the actual downstream renderer uses, so the two mappings
 /// can't silently drift apart (the other rotation test above only
 /// checks self-consistency with the formula in this crate).
@@ -192,42 +193,37 @@ fn pin_rotation_matches_signex_output_pin_direction_convention() {
 /// Acceptance criterion: pin the complete `PinDirection` mapping (every
 /// one of the library's 10 source variants).
 #[test]
-fn pin_direction_mapping_is_total_for_every_source_variant() {
-    let table = [
-        (PinDirection::Input, SchematicPinDirection::Input),
-        (PinDirection::Output, SchematicPinDirection::Output),
-        (
-            PinDirection::Bidirectional,
-            SchematicPinDirection::Bidirectional,
-        ),
-        (PinDirection::Power, SchematicPinDirection::PowerInput),
-        (PinDirection::Passive, SchematicPinDirection::Passive),
-        (
-            PinDirection::OpenCollector,
-            SchematicPinDirection::OpenDrainLow,
-        ),
-        (
-            PinDirection::OpenEmitter,
-            SchematicPinDirection::OpenDrainHigh,
-        ),
-        (
-            PinDirection::NotConnected,
-            SchematicPinDirection::DoNotConnect,
-        ),
-        (PinDirection::Tristate, SchematicPinDirection::ThreeStatable),
-        (
-            PinDirection::Unspecified,
-            SchematicPinDirection::Unclassified,
-        ),
-    ];
-    for (electrical, expected) in table {
+fn pin_direction_converts_losslessly_for_every_variant() {
+    for electrical in PinDirection::ALL {
         let mut sym = Symbol::empty("DIR-CHECK");
         sym.pins = vec![pin(1, PinOrientation::Right, electrical)];
         let lib = sym.to_lib_symbol("id");
-        assert_eq!(
-            lib.pins[0].pin.direction, expected,
-            "{electrical:?} -> {expected:?}"
-        );
+        assert_eq!(lib.pins[0].pin.direction, electrical, "{electrical:?}");
+    }
+}
+
+/// Old files: every token the former 10-variant enum wrote converts to the
+/// schematic type the former mapping gave it (`Power` stays `PowerInput`).
+#[test]
+fn legacy_pin_tokens_convert_to_their_old_schematic_type() {
+    let table = [
+        ("Input", SchematicPinDirection::Input),
+        ("Output", SchematicPinDirection::Output),
+        ("Bidirectional", SchematicPinDirection::Bidirectional),
+        ("Power", SchematicPinDirection::PowerInput),
+        ("Passive", SchematicPinDirection::Passive),
+        ("OpenCollector", SchematicPinDirection::OpenDrainLow),
+        ("OpenEmitter", SchematicPinDirection::OpenDrainHigh),
+        ("NotConnected", SchematicPinDirection::DoNotConnect),
+        ("Tristate", SchematicPinDirection::ThreeStatable),
+        ("Unspecified", SchematicPinDirection::Unclassified),
+    ];
+    for (token, expected) in table {
+        let electrical = PinDirection::from_token(token).expect(token);
+        let mut sym = Symbol::empty("LEGACY-CHECK");
+        sym.pins = vec![pin(1, PinOrientation::Right, electrical)];
+        let lib = sym.to_lib_symbol("id");
+        assert_eq!(lib.pins[0].pin.direction, expected, "{token}");
     }
 }
 
@@ -238,6 +234,7 @@ fn fill_none_and_some_map_to_fill_type() {
     let mut sym = Symbol::empty("FILL-CHECK");
     sym.graphics = vec![
         SymbolGraphic {
+            body_style: 1,
             kind: SymbolGraphicKind::Rectangle {
                 from: [0.0, 0.0],
                 to: [1.0, 1.0],
@@ -247,6 +244,7 @@ fn fill_none_and_some_map_to_fill_type() {
             part_number: 0,
         },
         SymbolGraphic {
+            body_style: 1,
             kind: SymbolGraphicKind::Rectangle {
                 from: [0.0, 0.0],
                 to: [1.0, 1.0],
@@ -316,6 +314,7 @@ fn pin_shape_style_uses_outside_edge_symbol_as_the_authoritative_slot() {
 fn arc_converts_to_three_points_along_the_ccw_sweep() {
     let mut sym = Symbol::empty("ARC-CHECK");
     sym.graphics = vec![SymbolGraphic {
+        body_style: 1,
         kind: SymbolGraphicKind::Arc {
             center: [0.0, 0.0],
             radius: 1.0,
@@ -350,6 +349,7 @@ fn arc_converts_to_three_points_along_the_ccw_sweep() {
 fn polygon_closes_explicitly_when_converted_to_polyline() {
     let mut sym = Symbol::empty("POLY-CHECK");
     sym.graphics = vec![SymbolGraphic {
+        body_style: 1,
         kind: SymbolGraphicKind::Polygon {
             vertices: vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
         },

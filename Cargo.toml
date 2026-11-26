@@ -4,6 +4,7 @@ members = [
     "crates/altium-format",
     "crates/signex-altium-convert",
     "crates/cli",
+    "crates/signex-expr",
     "crates/signex-types",
     "crates/signex-sketch",
     "crates/signex-library",
@@ -22,6 +23,7 @@ repository = "https://github.com/alplabai/signex-altium-import"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 toml = "0.8"
+toml_edit = "0.22"
 uuid = { version = "1.23.1", features = ["v4", "v7", "serde"] }
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
@@ -35,6 +37,7 @@ cfb = "0.10"
 flate2 = "1"
 encoding_rs = "0.8"
 
+signex-expr = { path = "crates/signex-expr" }
 signex-types = { path = "crates/signex-types" }
 signex-sketch = { path = "crates/signex-sketch" }
 signex-library = { path = "crates/signex-library" }

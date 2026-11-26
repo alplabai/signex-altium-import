@@ -16,9 +16,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::page_extras::PageExtras;
 use super::unknown::UnknownFields;
-use crate::pcb::{Footprint, Pad, PcbBoard, Point as PcbPoint};
-use crate::schematic::{Junction, SchematicSheet, Symbol};
+use crate::pcb::{ComponentAttributes, Footprint, Pad, PcbBoard, Point as PcbPoint};
+use crate::schematic::{Junction, RowStamp, SchematicSheet, Symbol};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(in crate::format) struct SchExtrasRaw {
@@ -28,6 +29,9 @@ pub(in crate::format) struct SchExtrasRaw {
     pub(in crate::format) junctions: BTreeMap<String, JunctionExtras>,
     #[serde(default)]
     pub(in crate::format) sheet: Option<SheetExtras>,
+    /// Foreign keys and tables under `[extras]` (#1829).
+    #[serde(flatten)]
+    pub(in crate::format) unknown: UnknownFields,
 }
 
 /// Per-junction auxiliary fields that don't fit into [`SchJunctionRow`] —
@@ -37,17 +41,26 @@ pub(in crate::format) struct SchExtrasRaw {
 /// trips unchanged and every dot it names loads as user-placed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(in crate::format) struct JunctionExtras {
-    #[serde(default)]
+    /// Skipped when `false` so a table holding only foreign keys re-saves
+    /// as it was read.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(in crate::format) minted: bool,
+    /// Keys this build does not recognise (`[extras.junctions.<uuid>]`,
+    /// #1874).
+    #[serde(flatten)]
+    pub(in crate::format) unknown: UnknownFields,
 }
 
 impl JunctionExtras {
     pub(in crate::format) fn is_default(&self) -> bool {
-        !self.minted
+        !self.minted && self.unknown.is_empty()
     }
 
     pub(in crate::format) fn from_junction(j: &Junction) -> Self {
-        JunctionExtras { minted: j.minted }
+        JunctionExtras {
+            minted: j.minted,
+            unknown: j.unknown.clone(),
+        }
     }
 }
 
@@ -98,6 +111,58 @@ pub(in crate::format) struct SymbolExtras {
     pub(in crate::format) ref_text: Option<crate::schematic::TextProp>,
     #[serde(default)]
     pub(in crate::format) val_text: Option<crate::schematic::TextProp>,
+    /// Font families of the reference and value text. They live here, not
+    /// inside `ref_text` / `val_text`, because a build that predates the
+    /// field drops unknown keys nested in those typed tables on re-save but
+    /// keeps unknown keys of this table (`unknown` below) attached to the
+    /// symbol. That holds for builds since #658; v0.15.0 has no unknown-key
+    /// capture and drops these keys on re-save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::format) ref_font_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::format) val_font_family: Option<String>,
+    /// Library body-style tag (`2` = alternate / De Morgan). Written only
+    /// for a symbol showing the alternate body, so every file that has none
+    /// stays byte-identical. A value other than 1 or 2, or one that is
+    /// not an integer, is not a body this build knows; it loads as the normal body with a warning and is kept
+    /// verbatim in `Symbol.unknown` until the user picks a body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::format) body_style: Option<toml::Value>,
+    /// Library row this symbol was placed from and the row version it is
+    /// pinned to (#1338). Declared in key order (`library_id`,
+    /// `library_version`, `row_id`) because an older build re-saves them
+    /// sorted as unknown keys; this keeps its output byte-identical when the
+    /// symbol has no other unknown keys. Written only when set, so a symbol
+    /// with no link adds nothing to the file. A build keeps the keys as
+    /// unknown keys of this table only if it has the unknown-key capture
+    /// (trunk since #658); v0.15.0 drops them on re-save. A `library_id` or
+    /// `row_id` that is not a UUID loads as no link and is reported with a
+    /// `tracing::warn!` (it reaches Messages); the sheet still opens.
+    #[serde(
+        default,
+        deserialize_with = "lenient_link_id::<_, 0>",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(in crate::format) library_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(in crate::format) library_version: String,
+    #[serde(
+        default,
+        deserialize_with = "lenient_link_id::<_, 1>",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(in crate::format) row_id: Option<Uuid>,
+    /// The stamp table as read, converted in `sch_rows::symbol_from_row`: a
+    /// table that is not a stamp loads as none, is reported, and stays among
+    /// the unknown keys so a save keeps it. Writing never sets this; the
+    /// stamp goes out as an unknown table (`stamp_for_write`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::format) library_stamp: Option<toml::Value>,
+    /// Key of the embedded library body this symbol draws with (#2209),
+    /// `"<lib_id>#<hash>"`. Absent in a file saved before versioned bodies;
+    /// the decoder upgrades that on load.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(in crate::format) body_ref: String,
     /// Keys this build does not recognise (`[extras.symbols.<uuid>]`).
     #[serde(flatten)]
     pub(in crate::format) unknown: UnknownFields,
@@ -125,6 +190,14 @@ impl Default for SymbolExtras {
             instances: Vec::new(),
             ref_text: None,
             val_text: None,
+            ref_font_family: None,
+            val_font_family: None,
+            body_style: None,
+            library_id: None,
+            row_id: None,
+            library_version: String::new(),
+            library_stamp: None,
+            body_ref: String::new(),
             unknown: UnknownFields::default(),
         }
     }
@@ -154,10 +227,19 @@ impl SymbolExtras {
             && self.instances.is_empty()
             && self.ref_text.is_none()
             && self.val_text.is_none()
+            && self.ref_font_family.is_none()
+            && self.val_font_family.is_none()
+            && self.body_style.is_none()
+            && self.library_id.is_none()
+            && self.row_id.is_none()
+            && self.library_version.is_empty()
+            && self.library_stamp.is_none()
+            && self.body_ref.is_empty()
             && self.unknown.is_empty()
     }
 
     pub(in crate::format) fn from_symbol(s: &Symbol) -> Self {
+        let stamp_table = stamp_for_write(s.library_stamp.as_ref());
         SymbolExtras {
             footprint: s.footprint.clone(),
             datasheet: s.datasheet.clone(),
@@ -184,9 +266,29 @@ impl SymbolExtras {
                 .map(|(key, value)| (key.clone(), *value))
                 .collect(),
             instances: s.instances.clone(),
-            ref_text: s.ref_text.clone(),
-            val_text: s.val_text.clone(),
-            unknown: s.unknown.clone(),
+            ref_text: s.ref_text.clone().map(without_font_family),
+            val_text: s.val_text.clone().map(without_font_family),
+            ref_font_family: s.ref_text.as_ref().and_then(|t| t.font_family.clone()),
+            val_font_family: s.val_text.as_ref().and_then(|t| t.font_family.clone()),
+            body_style: (!s.body_style.is_normal())
+                .then(|| toml::Value::Integer(i64::from(s.body_style.tag()))),
+            library_id: s.library_id,
+            row_id: s.row_id,
+            library_version: s.library_version.clone(),
+            library_stamp: None,
+            body_ref: s.body_ref.clone(),
+            unknown: {
+                // A chosen body owns the key; a preserved unreadable value
+                // must not be written beside it.
+                let mut unknown = s.unknown.clone();
+                if !s.body_style.is_normal() {
+                    unknown.remove("body_style");
+                }
+                if let Some(table) = stamp_table {
+                    unknown.insert_value("library_stamp", table);
+                }
+                unknown
+            },
         }
     }
 }
@@ -211,7 +313,11 @@ pub(in crate::format) struct SheetExtras {
     #[serde(default)]
     pub(in crate::format) drawings: Vec<crate::schematic::SchDrawing>,
     #[serde(default)]
-    pub(in crate::format) no_erc_directives: Vec<crate::schematic::NoConnect>,
+    pub(in crate::format) no_erc_directives: Vec<crate::schematic::NoErcDirective>,
+    /// Blankets, Compile Masks and Differential Pair directives (#2420);
+    /// omitted when empty so a sheet without any re-saves byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::format) directives: Vec<crate::schematic::SchDirective>,
     #[serde(default)]
     pub(in crate::format) title_block: BTreeMap<String, String>,
     #[serde(default)]
@@ -222,6 +328,70 @@ pub(in crate::format) struct SheetExtras {
     /// and writes it back.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(in crate::format) net_colors: BTreeMap<String, String>,
+    /// Sheet-wide default font family; omitted when unset so a sheet that
+    /// never chose one serialises exactly as it did before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::format) font_family: Option<String>,
+    /// Text-note font families by note uuid. Kept beside the notes, not in
+    /// them: a build that predates the field drops unknown keys nested in
+    /// the typed `text_notes` array on re-save but keeps unknown keys of this
+    /// table (builds since #658; v0.15.0 drops them). Entries for notes that no longer exist are ignored on load and
+    /// so are gone after the next save.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(in crate::format) note_font_families: BTreeMap<String, String>,
+    /// Stored text widths (#2029); omitted when empty so a sheet without any
+    /// re-saves byte-identical. A table, so a build that predates it keeps it
+    /// as an unknown key of `[extras.sheet]`.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "super::text_extents_extras::lenient_table"
+    )]
+    pub(in crate::format) text_extents: super::text_extents_extras::ExtentTable,
+    /// Drawing placements by drawing uuid; only `"above"` is written, because
+    /// no entry means behind. Kept beside the drawings, not in them: a build
+    /// that predates the field drops unknown keys nested in the typed
+    /// `drawings` array on re-save but keeps unknown keys of this table
+    /// (builds since #658; v0.15.0 drops them).
+    /// Entries for drawings that no longer exist are ignored on load and so
+    /// are gone after the next save.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(in crate::format) drawing_placements: BTreeMap<String, String>,
+    /// Uuids of the locked text notes and drawings (#1573). Kept beside the
+    /// objects, not in them, for the reason [`Self::note_font_families`] is:
+    /// a build that predates the lock drops unknown keys nested in the typed
+    /// arrays but keeps unknown keys of this table. Omitted when empty so a
+    /// sheet with nothing locked re-saves byte-identical. Format:
+    /// `docs/architecture/snxsch-object-lock.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::format) locked_objects: Vec<String>,
+    /// Frame settings (`[extras.sheet.frame]`); omitted at the default so a
+    /// sheet that never changed them re-saves byte-identical.
+    #[serde(default, skip_serializing_if = "FrameExtras::is_default")]
+    pub(in crate::format) frame: FrameExtras,
+    /// Page settings (`[extras.sheet.page]`, #2034); omitted at the default.
+    #[serde(default, skip_serializing_if = "PageExtras::is_default")]
+    pub(in crate::format) page: PageExtras,
+    /// Sheet variables (`[extras.sheet.variables]`, #1987): name to source
+    /// text. Omitted when empty, so a sheet without any re-saves
+    /// byte-identical; a table, so a build that predates it keeps it as an
+    /// unknown key of `[extras.sheet]` and writes it back.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(in crate::format) variables: BTreeMap<String, String>,
+    /// Schematic Refinement content (`snxsch/1.3`): harness connectors,
+    /// harness wires, harness-typed sheet entries (sheet-pin uuid to harness
+    /// type) and unions. Each is omitted when empty, so a sheet without them
+    /// re-saves byte-identical; top-level keys of this table, so a build that
+    /// predates them keeps them as unknown keys. Format:
+    /// `docs/architecture/snxsch-refinement-objects.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::format) harness_connectors: Vec<crate::schematic::HarnessConnector>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::format) harness_wires: Vec<crate::schematic::HarnessWire>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(in crate::format) harness_entry_types: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::format) unions: Vec<crate::schematic::SchUnion>,
     /// Keys this build does not recognise (`[extras.sheet]`).
     #[serde(flatten)]
     pub(in crate::format) unknown: UnknownFields,
@@ -236,9 +406,22 @@ impl SheetExtras {
             && self.bus_entries.is_empty()
             && self.drawings.is_empty()
             && self.no_erc_directives.is_empty()
+            && self.directives.is_empty()
             && self.title_block.is_empty()
             && self.lib_symbols.is_empty()
             && self.net_colors.is_empty()
+            && self.font_family.is_none()
+            && self.note_font_families.is_empty()
+            && self.text_extents.is_empty()
+            && self.drawing_placements.is_empty()
+            && self.locked_objects.is_empty()
+            && self.frame.is_default()
+            && self.page.is_default()
+            && self.variables.is_empty()
+            && self.harness_connectors.is_empty()
+            && self.harness_wires.is_empty()
+            && self.harness_entry_types.is_empty()
+            && self.unions.is_empty()
             && self.unknown.is_empty()
     }
 
@@ -246,11 +429,29 @@ impl SheetExtras {
         SheetExtras {
             child_sheets: s.child_sheets.clone(),
             no_connects: s.no_connects.clone(),
-            text_notes: s.text_notes.clone(),
+            text_notes: s
+                .text_notes
+                .iter()
+                .cloned()
+                .map(|mut note| {
+                    note.font_family = None;
+                    note.locked = false;
+                    note
+                })
+                .collect(),
             buses: s.buses.clone(),
             bus_entries: s.bus_entries.clone(),
-            drawings: s.drawings.clone(),
+            drawings: s
+                .drawings
+                .iter()
+                .cloned()
+                .map(|mut drawing| {
+                    drawing.set_locked(false);
+                    drawing
+                })
+                .collect(),
             no_erc_directives: s.no_erc_directives.clone(),
+            directives: s.directives.clone(),
             title_block: s
                 .title_block
                 .iter()
@@ -266,7 +467,114 @@ impl SheetExtras {
                 .iter()
                 .map(|(id, color)| (id.to_string(), color.to_hex()))
                 .collect(),
-            unknown: s.unknown.extras.clone(),
+            font_family: s.font_family.clone(),
+            note_font_families: s
+                .text_notes
+                .iter()
+                .filter_map(|note| Some((note.uuid.to_string(), note.font_family.clone()?)))
+                .collect(),
+            text_extents: super::text_extents_extras::encode(&s.text_extents.retained(s)),
+            drawing_placements: s
+                .drawing_placements
+                .iter()
+                .filter(|(_, placement)| **placement == crate::schematic::DrawingPlacement::Above)
+                .filter(|(id, _)| s.drawings.iter().any(|d| d.uuid() == **id))
+                .map(|(id, _)| (id.to_string(), "above".to_string()))
+                .collect(),
+            locked_objects: s
+                .text_notes
+                .iter()
+                .filter(|note| note.locked)
+                .map(|note| note.uuid)
+                .chain(
+                    s.drawings
+                        .iter()
+                        .filter(|d| d.is_locked())
+                        .map(|d| d.uuid()),
+                )
+                .map(|id| id.to_string())
+                .collect(),
+            frame: FrameExtras {
+                settings: s.frame,
+                unknown: s.unknown.frame.clone(),
+            },
+            page: PageExtras::of(s.page, &s.unknown.page),
+            variables: s.variables.clone(),
+            harness_connectors: s.harness.connectors.clone(),
+            harness_wires: s.harness.wires.clone(),
+            harness_entry_types: super::refinement_extras::entry_types_for_write(s),
+            unions: s.unions.clone(),
+            unknown: {
+                // A kept non-table `page` gives way to a real page table.
+                let mut extras = s.unknown.extras.clone();
+                if !s.page.is_default() || !s.unknown.page.is_empty() {
+                    extras.remove("page");
+                }
+                extras
+            },
+        }
+    }
+}
+
+/// A reference/value text property without its family, which is stored in
+/// the symbol's own table (see [`SymbolExtras::ref_font_family`]).
+fn without_font_family(mut prop: crate::schematic::TextProp) -> crate::schematic::TextProp {
+    prop.font_family = None;
+    prop
+}
+
+/// Deserialize a library-link id, mapping a value that is not a UUID to
+/// `None` and reporting it. `KEY` picks the name (0 `library_id`, 1
+/// `row_id`) because `deserialize_with` receives no field name.
+fn lenient_link_id<'de, D, const KEY: u8>(de: D) -> Result<Option<Uuid>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<toml::Value>::deserialize(de)? else {
+        return Ok(None);
+    };
+    let parsed = value.as_str().and_then(|s| Uuid::parse_str(s).ok());
+    if parsed.is_none() {
+        let key = if KEY == 0 { "library_id" } else { "row_id" };
+        tracing::warn!(
+            target: "signex::format",
+            "[extras.symbols] {key} = {value} is not a UUID; the symbol loads without its library link"
+        );
+    }
+    Ok(parsed)
+}
+
+/// The stamp as it is written: a table among the unknown keys, so it sorts
+/// where a build without the field re-saves it and a re-save changes no
+/// byte (docs/architecture/snxsch-library-link.md, "Value stamp").
+fn stamp_for_write(stamp: Option<&RowStamp>) -> Option<toml::Value> {
+    match toml::Value::try_from(stamp?) {
+        Ok(table) => Some(table),
+        Err(error) => {
+            tracing::warn!(target: "signex::format", "library_stamp not written: {error}");
+            None
+        }
+    }
+}
+
+/// Convert the stamp table read from a file. A table that is not a stamp (a
+/// wrong type, a `row_id` that is not a UUID) is reported and put back among
+/// `unknown`, so the sheet opens and a save keeps it for a build that reads it.
+pub(in crate::format) fn stamp_from_read(
+    read: Option<toml::Value>,
+    unknown: &mut UnknownFields,
+) -> Option<RowStamp> {
+    let value = read?;
+    match value.clone().try_into::<RowStamp>() {
+        Ok(stamp) => Some(stamp),
+        Err(error) => {
+            tracing::warn!(
+                target: "signex::format",
+                "[extras.symbols] library_stamp = {value} is not a value stamp ({error}); \
+                 the symbol loads without one"
+            );
+            unknown.insert_value("library_stamp", value);
+            None
         }
     }
 }
@@ -287,6 +595,9 @@ pub(in crate::format) struct PcbExtrasRaw {
     pub(in crate::format) pads: BTreeMap<String, PadExtras>,
     #[serde(default)]
     pub(in crate::format) board: Option<BoardExtras>,
+    /// Foreign keys and tables under `[extras]` (#1873).
+    #[serde(flatten)]
+    pub(in crate::format) unknown: UnknownFields,
 }
 
 pub(in crate::format) struct PcbExtras {
@@ -333,6 +644,9 @@ pub(in crate::format) struct FootprintExtras {
     pub(in crate::format) graphics: Vec<crate::pcb::FpGraphic>,
     #[serde(default)]
     pub(in crate::format) properties: Vec<crate::property::PcbProperty>,
+    /// The component settings (#2365); no table when all are defaults.
+    #[serde(default, skip_serializing_if = "ComponentAttributes::is_default")]
+    pub(in crate::format) component: ComponentAttributes,
     /// Keys this build does not recognise (`[extras.footprints.<uuid>]`).
     #[serde(flatten)]
     pub(in crate::format) unknown: UnknownFields,
@@ -344,6 +658,7 @@ impl FootprintExtras {
             && !self.locked
             && self.graphics.is_empty()
             && self.properties.is_empty()
+            && self.component.is_default()
             && self.unknown.is_empty()
     }
 
@@ -353,6 +668,7 @@ impl FootprintExtras {
             locked: fp.locked,
             graphics: fp.graphics.clone(),
             properties: fp.properties.clone(),
+            component: (*fp.component).clone(),
             unknown: fp.unknown.clone(),
         }
     }
@@ -413,5 +729,38 @@ impl SheetExtras {
                 ))
             })
             .collect()
+    }
+}
+
+impl SheetExtras {
+    /// The placements of drawings that exist and sit above the circuit. A key
+    /// that is not a uuid, a value other than `"above"` and an entry for a
+    /// missing drawing are dropped: each means "behind".
+    pub(in crate::format) fn parsed_drawing_placements(
+        &self,
+    ) -> BTreeMap<Uuid, crate::schematic::DrawingPlacement> {
+        self.drawing_placements
+            .iter()
+            .filter(|(_, value)| value.as_str() == "above")
+            .filter_map(|(id, _)| Uuid::parse_str(id).ok())
+            .filter(|id| self.drawings.iter().any(|d| d.uuid() == *id))
+            .map(|id| (id, crate::schematic::DrawingPlacement::Above))
+            .collect()
+    }
+}
+
+/// `[extras.sheet.frame]`: the sheet's frame settings, plus any key a newer
+/// build wrote there, kept so a save does not drop it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(in crate::format) struct FrameExtras {
+    #[serde(flatten)]
+    pub(in crate::format) settings: crate::schematic::SheetFrameSettings,
+    #[serde(flatten)]
+    pub(in crate::format) unknown: UnknownFields,
+}
+
+impl FrameExtras {
+    pub(in crate::format) fn is_default(&self) -> bool {
+        self.settings.is_default() && self.unknown.is_empty()
     }
 }

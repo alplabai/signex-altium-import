@@ -1,0 +1,195 @@
+//! What loading a sheet changed to make it usable (#1830).
+//!
+//! The parser records these on `SheetUnknown::load_repairs`; the document
+//! that opens the sheet takes them once with
+//! `SchematicSheet::take_load_repairs`, reports them in Messages and marks
+//! the sheet modified (the file on disk still holds what was repaired).
+//! Nothing here logs: previews, scans and history reads parse sheets too.
+
+use uuid::Uuid;
+
+/// The names a repair gives each kind of sheet object. A sheet symbol's
+/// re-minted id needs the designators placed under it annotated again.
+pub(in crate::format) mod kind {
+    pub const SYMBOL: &str = "symbol";
+    pub const WIRE: &str = "wire";
+    pub const JUNCTION: &str = "junction";
+    pub const LABEL: &str = "label";
+    pub const SHEET_SYMBOL: &str = "sheet symbol";
+    pub const SHEET_PIN: &str = "sheet pin";
+    pub const NO_CONNECT: &str = "no-connect";
+    pub const TEXT_NOTE: &str = "text note";
+    pub const BUS: &str = "bus";
+    pub const BUS_ENTRY: &str = "bus entry";
+    pub const DRAWING: &str = "drawing";
+    pub const NO_ERC_DIRECTIVE: &str = "no-ERC directive";
+    pub const DIRECTIVE: &str = "directive";
+    pub const HARNESS_CONNECTOR: &str = "harness connector";
+    pub const HARNESS_ENTRY: &str = "harness entry";
+    pub const HARNESS_WIRE: &str = "harness wire";
+    pub const UNION: &str = "union";
+    pub const FOOTPRINT: &str = "footprint";
+    pub const PAD: &str = "pad";
+    pub const TRACK: &str = "track";
+    pub const VIA: &str = "via";
+    pub const ZONE: &str = "zone";
+    pub const BOARD_TEXT: &str = "board text";
+    pub const ARC: &str = "arc";
+    pub const FREE_PAD: &str = "free pad";
+    pub const DIMENSION: &str = "dimension";
+    pub const BOARD_GRAPHIC: &str = "board drawing";
+    /// The document's own id (sheet or board), which no object may take.
+    pub const SHEET: &str = "sheet";
+}
+
+/// The object a repair names: its kind, its label or reference when it has
+/// one, and its 1-based position among objects of that kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairedObject {
+    pub kind: &'static str,
+    pub name: String,
+    pub position: usize,
+}
+
+/// One change made while parsing a sheet.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SheetLoadRepair {
+    /// An exact copy of an earlier object of the same kind, carrying its
+    /// uuid, was dropped.
+    CopyDropped { object: RepairedObject, uuid: Uuid },
+    /// A different object carrying an id already taken got a new one.
+    UuidReminted {
+        object: RepairedObject,
+        old: Uuid,
+        new: Uuid,
+        /// What the first holder of `old` is: another kind means the entries
+        /// keyed by `old` belonged to this object, not to the holder.
+        holder: &'static str,
+        /// The sheet symbol a sheet pin, or the footprint a pad, belongs to.
+        owner: Option<String>,
+    },
+    /// A text size no schematic uses was clamped to `new` (mm).
+    TextSizeClamped {
+        object: RepairedObject,
+        old: f64,
+        new: f64,
+    },
+    /// A wire's `color` cell is not a colour this build reads. The cell is
+    /// kept as it was and written back; the wire draws uncoloured.
+    WireColorUnreadable {
+        object: RepairedObject,
+        value: String,
+    },
+    /// Two pins of one symbol shared an id; the later pin got a new one.
+    PinUuidReminted {
+        symbol: String,
+        pin: String,
+        old: Uuid,
+        new: Uuid,
+    },
+    /// A symbol named an embedded library symbol version the sheet does not
+    /// hold (#2209). `repointed` is the only version of that library symbol
+    /// on the sheet, which the symbol now draws with; `None` leaves the
+    /// symbol dangling, with `versions` other versions on the sheet.
+    BodyRefDangling {
+        object: RepairedObject,
+        missing: String,
+        repointed: Option<String>,
+        versions: usize,
+    },
+    /// A union named `member`, which is no object a union can hold on the
+    /// sheet (gone, or a sheet pin, harness object or union); it was dropped
+    /// from the union.
+    UnionMemberDropped { union: String, member: Uuid },
+    /// A harness entry type was set for sheet pin `pin`, which is not on the
+    /// sheet; it was dropped.
+    HarnessEntryTypeDropped { pin: Uuid, harness_type: String },
+}
+
+impl RepairedObject {
+    fn label(&self) -> String {
+        if self.name.is_empty() {
+            format!("{} #{}", self.kind, self.position)
+        } else {
+            format!("{} {} #{}", self.kind, self.name, self.position)
+        }
+    }
+}
+
+impl SheetLoadRepair {
+    /// The one-sentence wording for Messages. Short on purpose: the panel
+    /// cuts long entries.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::CopyDropped { object, uuid } => format!(
+                "{} repeated uuid {uuid} of an identical {}; dropped",
+                object.label(),
+                object.kind
+            ),
+            Self::UuidReminted {
+                object,
+                old,
+                new,
+                owner,
+                holder,
+            } => {
+                let mut text = format!("{} repeated uuid {old}; new uuid {new}", object.label());
+                if let Some(owner) = owner {
+                    let noun = if object.kind == kind::PAD {
+                        kind::FOOTPRINT
+                    } else {
+                        kind::SHEET_SYMBOL
+                    };
+                    text.push_str(&format!(" on {noun} {owner}"));
+                }
+                if *holder == kind::SHEET {
+                    text.push_str(" (the document's own id)");
+                }
+                if object.kind == kind::SHEET_SYMBOL {
+                    text.push_str("; re-annotate its placed designators");
+                }
+                text
+            }
+            Self::TextSizeClamped { object, old, new } => format!(
+                "{} had text size {old} mm; clamped to {new} mm",
+                object.label()
+            ),
+            Self::WireColorUnreadable { object, value } => format!(
+                "{} has colour {value:?}, which is not #RRGGBB or #RRGGBBAA; drawn uncoloured, kept in the file",
+                object.label()
+            ),
+            Self::PinUuidReminted {
+                symbol,
+                pin,
+                old,
+                new,
+            } => format!("pin {pin} of symbol {symbol} repeated uuid {old}; new uuid {new}"),
+            Self::BodyRefDangling {
+                object,
+                missing,
+                repointed: Some(to),
+                ..
+            } => format!(
+                "{} drew with library symbol version {missing}, which the sheet does not                  hold; now draws with {to}, the only version of it here",
+                object.label()
+            ),
+            Self::BodyRefDangling {
+                object,
+                missing,
+                versions,
+                ..
+            } => format!(
+                "{} draws with library symbol version {missing}, which the sheet does not                  hold ({versions} other versions here); it draws without pins until                  updated from the library",
+                object.label()
+            ),
+            Self::UnionMemberDropped { union, member } => format!(
+                "{} {union} listed {member}, which is no object a union holds on this sheet; dropped from it",
+                kind::UNION
+            ),
+            Self::HarnessEntryTypeDropped { pin, harness_type } => format!(
+                "harness type {harness_type} was set for {} {pin}, which is not on this sheet; dropped",
+                kind::SHEET_PIN
+            ),
+        }
+    }
+}

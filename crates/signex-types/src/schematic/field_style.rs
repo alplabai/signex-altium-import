@@ -10,7 +10,29 @@ use super::{HAlign, Symbol, TextProp, VAlign};
 /// justify_h, justify_v)`. Total rotations of 180/270 fold to a readable
 /// 0/90 and flip the justification; symbol mirroring also flips it.
 pub fn field_effective_style(prop: &TextProp, sym: &Symbol) -> (f64, HAlign, VAlign) {
-    let total = (sym.rotation + prop.rotation).rem_euclid(360.0);
+    readable_text_style(
+        sym.rotation + prop.rotation,
+        prop.justify_h,
+        prop.justify_v,
+        sym.mirror_x,
+        sym.mirror_y,
+    )
+}
+
+/// Make text that sits on a placed symbol readable: `total_rotation_deg` is
+/// the symbol rotation plus the text's own. 180/270 fold back to 0/90 and
+/// swap the justification; `mirror_y` swaps horizontal and `mirror_x` swaps
+/// vertical justification, so the text stays on the same side of its anchor
+/// as the body it labels. Shared by reference/value fields and library body
+/// text so the canvas, hit box and SVG export cannot disagree.
+pub fn readable_text_style(
+    total_rotation_deg: f64,
+    justify_h: HAlign,
+    justify_v: VAlign,
+    mirror_x: bool,
+    mirror_y: bool,
+) -> (f64, HAlign, VAlign) {
+    let total = total_rotation_deg.rem_euclid(360.0);
     let (draw_rot, fold_h, fold_v) = match total.round() as i32 {
         0 => (0.0, false, false),
         90 => (90.0, false, false),
@@ -19,27 +41,27 @@ pub fn field_effective_style(prop: &TextProp, sym: &Symbol) -> (f64, HAlign, VAl
         _ => (total, false, false),
     };
 
-    let flip_h = fold_h ^ sym.mirror_y;
-    let flip_v = fold_v ^ sym.mirror_x;
+    let flip_h = fold_h ^ mirror_y;
+    let flip_v = fold_v ^ mirror_x;
 
     let h = if flip_h {
-        match prop.justify_h {
+        match justify_h {
             HAlign::Left => HAlign::Right,
             HAlign::Center => HAlign::Center,
             HAlign::Right => HAlign::Left,
         }
     } else {
-        prop.justify_h
+        justify_h
     };
 
     let v = if flip_v {
-        match prop.justify_v {
+        match justify_v {
             VAlign::Top => VAlign::Bottom,
             VAlign::Center => VAlign::Center,
             VAlign::Bottom => VAlign::Top,
         }
     } else {
-        prop.justify_v
+        justify_v
     };
 
     (draw_rot, h, v)
@@ -56,6 +78,7 @@ mod tests {
             unknown: Default::default(),
             uuid: uuid::Uuid::nil(),
             lib_id: String::new(),
+            body_ref: String::new(),
             reference: String::new(),
             value: String::new(),
             footprint: String::new(),
@@ -65,6 +88,7 @@ mod tests {
             mirror_x,
             mirror_y,
             unit: 1,
+            body_style: Default::default(),
             is_power: false,
             ref_text: None,
             val_text: None,
@@ -82,6 +106,7 @@ mod tests {
             library_id: None,
             row_id: None,
             library_version: String::new(),
+            library_stamp: None,
         }
     }
 
@@ -93,6 +118,7 @@ mod tests {
             justify_h: HAlign::Left,
             justify_v: VAlign::Top,
             hidden: false,
+            font_family: None,
         }
     }
 

@@ -1123,6 +1123,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "signex-expr"
+version = "0.15.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "signex-library"
 version = "0.15.0"
 dependencies = [
@@ -1134,9 +1142,9 @@ dependencies = [
  "sha2",
  "signex-sketch",
  "signex-types",
- "tempfile",
  "thiserror",
  "toml",
+ "toml_edit",
  "tracing",
  "url",
  "uuid",
@@ -1147,7 +1155,7 @@ name = "signex-sketch"
 version = "0.15.0"
 dependencies = [
  "serde",
- "serde_json",
+ "signex-expr",
  "signex-types",
  "thiserror",
  "toml",
@@ -1161,9 +1169,12 @@ version = "0.15.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
+ "signex-expr",
  "tempfile",
  "thiserror",
  "toml",
+ "tracing",
  "uuid",
 ]
 

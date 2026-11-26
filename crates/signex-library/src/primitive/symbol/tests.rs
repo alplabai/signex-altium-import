@@ -10,6 +10,7 @@ fn symbol_json_roundtrip() {
         name: "OPAMP-DUAL-8".into(),
         anchor: [0.0, 0.0],
         pins: vec![SymbolPin {
+            body_style: 1,
             number: "1".into(),
             name: "OUT_A".into(),
             electrical: PinDirection::Output,
@@ -31,6 +32,7 @@ fn symbol_json_roundtrip() {
             part_number: 1,
         }],
         graphics: vec![SymbolGraphic {
+            body_style: 1,
             kind: SymbolGraphicKind::Rectangle {
                 from: [-2.5, -2.5],
                 to: [2.5, 2.5],
@@ -147,9 +149,10 @@ fn symbol_file_from_bytes_rejects_empty_payload() {
 #[test]
 fn symbol_file_round_trip_with_full_pin_payload() {
     let pin = SymbolPin {
+        body_style: 1,
         number: "VCC".into(),
         name: "Power".into(),
-        electrical: PinDirection::Power,
+        electrical: PinDirection::PowerInput,
         position: [-3.81, 5.08],
         orientation: PinOrientation::Up,
         length: 2.54,
@@ -269,21 +272,80 @@ fn pins_from_tsv_rejects_cell_count_mismatch() {
 
 #[test]
 fn pin_direction_token_round_trip_all_variants() {
-    for d in [
-        PinDirection::Input,
-        PinDirection::Output,
-        PinDirection::Bidirectional,
-        PinDirection::Power,
-        PinDirection::Passive,
-        PinDirection::OpenCollector,
-        PinDirection::OpenEmitter,
-        PinDirection::NotConnected,
-        PinDirection::Tristate,
-        PinDirection::Unspecified,
-    ] {
+    for d in PinDirection::ALL {
         let token = pin_direction_token(d);
         let back = pin_direction_from_token(token).unwrap();
         assert_eq!(d, back);
+    }
+}
+
+#[test]
+fn unknown_pin_direction_token_is_an_error() {
+    assert!(matches!(
+        pin_direction_from_token("Power Input"),
+        Err(SymbolFileError::UnknownEnumToken {
+            kind: "PinDirection",
+            ..
+        })
+    ));
+}
+
+/// Every token the pre-unification library wrote reads and writes back
+/// byte-identical, so a file using only those types re-saves unchanged.
+#[test]
+fn legacy_pin_tokens_write_back_byte_identical() {
+    for token in [
+        "Input",
+        "Output",
+        "Bidirectional",
+        "Power",
+        "Passive",
+        "OpenCollector",
+        "OpenEmitter",
+        "NotConnected",
+        "Tristate",
+        "Unspecified",
+    ] {
+        assert_eq!(
+            pin_direction_token(pin_direction_from_token(token).unwrap()),
+            token
+        );
+    }
+}
+
+/// A pin of every type survives a `.snxsym` write and read.
+#[test]
+fn every_pin_type_survives_a_snxsym_round_trip() {
+    let mut sym = Symbol::empty("ALL-TYPES");
+    sym.pins = PinDirection::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let mut p = SymbolPin::new((i + 1).to_string(), "P");
+            p.electrical = *d;
+            p
+        })
+        .collect();
+    let text = SymbolFile::from_symbol(sym.clone())
+        .to_toml_string()
+        .unwrap();
+    let back = SymbolFile::from_toml_str(&text).unwrap();
+    let got: Vec<_> = back.symbols[0].pins.iter().map(|p| p.electrical).collect();
+    assert_eq!(got, PinDirection::ALL.to_vec());
+}
+
+/// A shipped `.snxsym` (it holds `Unspecified` and `Power` pins) re-encodes
+/// byte-identical.
+#[test]
+fn stock_snxsym_re_encodes_byte_identical() {
+    for text in [
+        include_str!("../../../../../assets/stock-library/symbols/IC_Generic.snxsym"),
+        include_str!("../../../../../assets/stock-library/symbols/GND.snxsym"),
+        include_str!("../../../../../assets/stock-library/symbols/74HC00.snxsym"),
+    ] {
+        let text = text.replace("\r\n", "\n");
+        let file = SymbolFile::from_toml_str(&text).unwrap();
+        assert_eq!(file.to_toml_string().unwrap(), text);
     }
 }
 
@@ -337,31 +399,73 @@ updated = "2026-05-04T00:00:00Z"
 symbols = []
 "#;
     match SymbolFile::from_toml_str(bad) {
-        Err(SymbolFileError::UnsupportedFormat { got }) => {
-            assert_eq!(got, "snxsym/99");
+        Err(SymbolFileError::UnsupportedFormat(reason)) => {
+            assert_eq!(reason.found(), Some("snxsym/99"));
         }
+        other => panic!("expected UnsupportedFormat, got {other:?}"),
+    }
+}
+
+/// #2207: every listed token reads, a newer one is refused naming it, and
+/// a file with no token is refused.
+#[test]
+fn symbol_file_tokens_follow_the_shared_version_policy() {
+    let body = "file_uuid = \"00000000-0000-0000-0000-000000000000\"\n\
+                display_name = \"\"\n\
+                created = \"2026-05-04T00:00:00Z\"\n\
+                updated = \"2026-05-04T00:00:00Z\"\n\
+                symbols = []\n";
+    for token in ["snxsym/v1", "snxsym/v2", "snxsym/v3", "snxsym/v4"] {
+        let file = SymbolFile::from_toml_str(&format!("format = \"{token}\"\n{body}"))
+            .unwrap_or_else(|e| panic!("{token}: {e}"));
+        assert_eq!(file.format, token);
+    }
+    match SymbolFile::from_toml_str(&format!("format = \"snxsym/v5\"\n{body}")) {
+        Err(error @ SymbolFileError::UnsupportedFormat(_)) => {
+            let message = error.to_string();
+            assert!(message.contains("snxsym/v5"), "{message}");
+            assert!(message.contains("newer Signex"), "{message}");
+        }
+        other => panic!("expected UnsupportedFormat, got {other:?}"),
+    }
+    match SymbolFile::from_toml_str(body) {
+        Err(SymbolFileError::UnsupportedFormat(reason)) => assert_eq!(reason.found(), None),
         other => panic!("expected UnsupportedFormat, got {other:?}"),
     }
 }
 
 #[test]
 fn pin_electrical_type_round_trip_all_variants() {
-    for t in [
-        PinDirection::Input,
-        PinDirection::Output,
-        PinDirection::Bidirectional,
-        PinDirection::Power,
-        PinDirection::Passive,
-        PinDirection::OpenCollector,
-        PinDirection::OpenEmitter,
-        PinDirection::NotConnected,
-        PinDirection::Tristate,
-        PinDirection::Unspecified,
-    ] {
-        let json = serde_json::to_string(&t).unwrap();
-        let back: PinDirection = serde_json::from_str(&json).unwrap();
-        assert_eq!(t, back);
+    for t in PinDirection::ALL {
+        let mut pin = SymbolPin::new("1", "A");
+        pin.electrical = t;
+        let json = serde_json::to_string(&pin).unwrap();
+        assert!(
+            json.contains(&format!("\"electrical\":\"{}\"", t.as_token())),
+            "{json}"
+        );
+        let back: SymbolPin = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.electrical, t);
     }
+}
+
+/// A JSON symbol written before the unification (variant names) still reads.
+#[test]
+fn old_json_pin_electrical_names_still_read() {
+    let mut pin = SymbolPin::new("1", "A");
+    pin.electrical = PinDirection::Input;
+    let json = serde_json::to_string(&pin).unwrap();
+    for (old, expected) in [
+        ("Tristate", PinDirection::ThreeStatable),
+        ("Power", PinDirection::PowerInput),
+        ("OpenCollector", PinDirection::OpenDrainLow),
+    ] {
+        let old_json = json.replace("\"Input\"", &format!("\"{old}\""));
+        let back: SymbolPin = serde_json::from_str(&old_json).unwrap();
+        assert_eq!(back.electrical, expected, "{old}");
+    }
+    let bad = json.replace("\"Input\"", "\"input_x\"");
+    assert!(serde_json::from_str::<SymbolPin>(&bad).is_err());
 }
 
 #[test]
@@ -465,6 +569,7 @@ fn legacy_file_reconciles_part_count() {
 fn graphic_part_number_round_trips() {
     let mut s = Symbol::empty("X");
     s.graphics.push(SymbolGraphic {
+        body_style: 1,
         kind: SymbolGraphicKind::Rectangle {
             from: [-2.5, -2.5],
             to: [2.5, 2.5],
@@ -488,6 +593,7 @@ fn graphic_part_number_round_trips() {
 fn graphic_fill_round_trips() {
     let mut s = Symbol::empty("X");
     s.graphics.push(SymbolGraphic {
+        body_style: 1,
         kind: SymbolGraphicKind::Rectangle {
             from: [-2.5, -2.5],
             to: [2.5, 2.5],
@@ -509,6 +615,7 @@ fn graphic_fill_round_trips() {
 fn graphic_missing_part_number_defaults_to_zero() {
     let mut s = Symbol::empty("X");
     s.graphics.push(SymbolGraphic {
+        body_style: 1,
         kind: SymbolGraphicKind::Rectangle {
             from: [-2.5, -2.5],
             to: [2.5, 2.5],
@@ -535,6 +642,7 @@ fn graphic_missing_part_number_defaults_to_zero() {
 fn polygon_graphic_round_trips() {
     let mut s = Symbol::empty("X");
     s.graphics.push(SymbolGraphic {
+        body_style: 1,
         kind: SymbolGraphicKind::Polygon {
             vertices: vec![[-2.5, -1.0], [2.5, -1.0], [2.5, 1.0], [-2.5, 1.0]],
         },
@@ -567,6 +675,7 @@ fn polygon_graphic_round_trips() {
 fn symbol_file_with_no_polygon_graphic_stays_v1() {
     let mut s = Symbol::empty("X");
     s.graphics.push(SymbolGraphic {
+        body_style: 1,
         kind: SymbolGraphicKind::Rectangle {
             from: [0.0, 0.0],
             to: [1.0, 1.0],
@@ -586,6 +695,7 @@ fn symbol_file_with_no_polygon_graphic_stays_v1() {
 fn arc_symbol(start_deg: f64, end_deg: f64) -> Symbol {
     let mut s = Symbol::empty("X");
     s.graphics.push(SymbolGraphic {
+        body_style: 1,
         kind: SymbolGraphicKind::Arc {
             center: [0.0, 0.0],
             radius: 5.0,
@@ -672,6 +782,7 @@ fn normalize_arc_endpoints_deg_leaves_ccw_pairs_unswapped() {
 fn arc_full_turn_migrates_to_circle_on_load() {
     let mut s = Symbol::empty("X");
     s.graphics.push(SymbolGraphic {
+        body_style: 1,
         kind: SymbolGraphicKind::Arc {
             center: [1.0, 2.0],
             radius: 5.0,
@@ -796,6 +907,7 @@ fn to_toml_string_refuses_a_non_finite_graphic() {
     for bad in NON_FINITE {
         let mut sym = Symbol::empty("G");
         sym.graphics.push(SymbolGraphic {
+            body_style: 1,
             kind: SymbolGraphicKind::Line {
                 from: [bad, 0.0],
                 to: [1.0, 0.0],
@@ -816,4 +928,54 @@ fn a_finite_symbol_still_saves() {
     let mut sym = Symbol::empty("OK");
     sym.pins.push(SymbolPin::new("1", "A"));
     assert!(SymbolFile::from_symbol(sym).to_toml_string().is_ok());
+}
+
+/// A `.snxsym` written before this change: `pin.function` is `|`-joined with
+/// backslashes literal. Trunk loaded `RESET\|GPIO` as `RESET\` + `GPIO`
+/// and must keep doing so, and a re-save must write the same bytes.
+#[test]
+fn legacy_pin_function_cell_loads_with_literal_backslashes() {
+    let mut pin = SymbolPin::new("1", "A");
+    pin.function = vec!["LEGACYCELL".into()];
+    let mut sym = Symbol::empty("L");
+    sym.pins.push(pin);
+    let written = SymbolFile::from_symbol(sym).to_toml_string().expect("save");
+    assert!(written.contains("LEGACYCELL"));
+    let legacy = written.replace("LEGACYCELL", "RESET\\|GPIO|a\\\\b");
+    assert!(legacy.contains("RESET\\|GPIO|a\\\\b"));
+
+    let loaded = SymbolFile::from_toml_str(&legacy).expect("legacy file loads");
+    assert_eq!(
+        loaded.symbols[0].pins[0].function,
+        vec![
+            "RESET\\".to_string(),
+            "GPIO".to_string(),
+            "a\\\\b".to_string()
+        ]
+    );
+    assert_eq!(loaded.to_toml_string().expect("re-save"), legacy);
+}
+
+/// A function item holding `|` cannot be told from two items on reload, so
+/// the save is refused and no text is produced to write.
+#[test]
+fn saving_a_pin_function_containing_a_pipe_is_refused() {
+    let mut pin = SymbolPin::new("1", "A");
+    pin.function = vec!["SPI|MOSI".into()];
+    match pins_to_tsv(std::slice::from_ref(&pin)) {
+        Err(e @ SymbolFileError::PipeInPinFunction { .. }) => {
+            let text = e.to_string();
+            assert!(
+                text.contains("SPI|MOSI") && text.contains("'|'"),
+                "the error names the item and the reason: {text}"
+            );
+        }
+        other => panic!("expected PipeInPinFunction, got {other:?}"),
+    }
+    let mut sym = Symbol::empty("P");
+    sym.pins.push(pin);
+    assert!(matches!(
+        SymbolFile::from_symbol(sym).to_toml_string(),
+        Err(SymbolFileError::PipeInPinFunction { .. })
+    ));
 }

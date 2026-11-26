@@ -17,13 +17,30 @@ use uuid::Uuid;
 
 use crate::param::ParamMap;
 
+mod format_token;
+#[cfg(test)]
+mod format_token_tests;
+#[cfg(test)]
+mod format_version_tests;
+mod generated;
 mod load_repair;
+mod mount_style;
 mod pad;
+mod pad_columns;
+mod pad_shape_check;
+mod pitch;
 mod serde_tsv;
+mod silk_marker;
 #[cfg(test)]
 mod tests;
 
+use format_token::{FOOTPRINT_FILE_VERSION, SNXFPT_FORMAT_V1_1};
+pub use generated::{
+    DEFAULT_COURTYARD_LINE_WIDTH_MM, DEFAULT_PAD_CLEARANCE_MM, DEFAULT_SILK_LINE_WIDTH_MM,
+    GeneratedFeatures,
+};
 pub use load_repair::LoadRepair;
+pub use mount_style::MountStyle;
 pub use pad::*;
 pub use serde_tsv::FootprintFileError;
 pub(crate) use serde_tsv::{pads_from_tsv, pads_to_tsv};
@@ -44,6 +61,18 @@ pub enum FpGraphicKind {
         center: [f64; 2],
         radius: f64,
     },
+    /// Circular arc about `center`.
+    ///
+    /// **Sweep convention:** the arc runs from `start_deg` to `end_deg` in
+    /// the direction of *increasing* angle (angles measured from +X with
+    /// `atan2(dy, dx)`; CCW in a y-up frame, which reads clockwise on the
+    /// y-down footprint canvas), wrapping through 360 when `start_deg > end_deg`.
+    /// So `300 -> 60` is the 120 degree arc through 0, not the 240 degree
+    /// one; `10 -> 80` is the 70 degree arc. Angles may be given outside
+    /// `[0, 360)` (the placement tool stores `atan2` output in
+    /// `(-180, 180]`). A sweep of 360 or more (`|end - start| >= 360`) is a
+    /// full circle and equal angles are a zero-length arc; see
+    /// [`FpGraphicKind::arc_sweep_deg`].
     Arc {
         center: [f64; 2],
         radius: f64,
@@ -67,6 +96,23 @@ pub enum FpGraphicKind {
     },
 }
 
+impl FpGraphicKind {
+    /// CCW sweep in degrees of an [`FpGraphicKind::Arc`], in `[0, 360]`.
+    ///
+    /// `0.0` for a degenerate zero-length arc, `360.0` for a full circle
+    /// (`|end - start| >= 360`), otherwise `(end - start).rem_euclid(360)`.
+    pub fn arc_sweep_deg(start_deg: f64, end_deg: f64) -> f64 {
+        let raw = (end_deg - start_deg).abs();
+        if raw < 1e-6 {
+            0.0
+        } else if raw >= 359.999 {
+            360.0
+        } else {
+            (end_deg - start_deg).rem_euclid(360.0)
+        }
+    }
+}
+
 /// One footprint silkscreen / fab graphic.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FpGraphic {
@@ -81,6 +127,28 @@ pub struct FpGraphic {
     /// `Polygon` / `Rectangle` / `Circle` / `Arc` (closed shapes).
     #[serde(default)]
     pub filled: bool,
+    /// The sketch entity a bake made this entry from; `None` = drawn by
+    /// hand. A re-bake replaces only marked entries. See
+    /// `docs/FOOTPRINT_SKETCH.md`, "Bake ownership".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sketch_entity: Option<signex_sketch::id::SketchEntityId>,
+}
+
+impl FpGraphic {
+    /// A hand-drawn graphic: no sketch entity owns it.
+    pub fn drawn(kind: FpGraphicKind, stroke_width: f64, filled: bool) -> Self {
+        Self {
+            kind,
+            stroke_width,
+            filled,
+            sketch_entity: None,
+        }
+    }
+
+    /// Whether a sketch bake made this entry (it carries a marker).
+    pub fn is_baked(&self) -> bool {
+        self.sketch_entity.is_some()
+    }
 }
 
 /// 3D body shape — drives the procedural render (no STEP required).
@@ -139,7 +207,7 @@ impl Default for Body3D {
 }
 
 /// Net reference — string for now, will become a UUID once nets are
-/// first-class library citizens (v0.16+). v0.14 introduces this as a
+/// first-class library citizens. v0.14 introduced this as a
 /// thin wrapper so future migration can be one-shot.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -175,8 +243,8 @@ pub enum ThermalReliefStyle {
     None,
 }
 
-/// Copper pour / region. Fill generation lives in v0.15 — v0.14 stores
-/// the boundary + metadata only.
+/// Copper pour / region. Stores the boundary + metadata only; fill
+/// generation lands with the PCB Routing plan (Copper Pour).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FpPour {
     pub boundary: Polygon,
@@ -195,7 +263,8 @@ pub struct FpPour {
     pub priority: u8,
 }
 
-/// What a keepout zone forbids. DRC enforcement lands in v0.15.
+/// What a keepout zone forbids. DRC enforcement lands with the Advanced PCB plan
+/// (Routing Polish & Geometry).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -208,7 +277,7 @@ pub enum KeepoutForbid {
     Copper,
 }
 
-/// DRC keepout zone. v0.14 stores the polygon + layer + forbid kind.
+/// DRC keepout zone. Stores the polygon + layer + forbid kind.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FpKeepout {
     pub boundary: Polygon,
@@ -363,17 +432,19 @@ pub struct Footprint {
     /// serialised. The editor that opens the footprint reports and clears it.
     #[serde(skip)]
     pub load_repairs: Vec<LoadRepair>,
-    /// Copper pour / region polygons. v0.14+; fill generation is v0.15.
+    /// Copper pour / region polygons. v0.14+; fill generation lands with
+    /// the PCB Routing plan (Copper Pour).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pours: Vec<FpPour>,
-    /// DRC keepout zones. v0.14 records; v0.15 enforces.
+    /// DRC keepout zones. Recorded only; enforcement lands with the
+    /// Advanced PCB plan.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keepouts: Vec<FpKeepout>,
     /// Board cutouts. v0.14 records; outline subtraction at PCB-export.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cutouts: Vec<FpCutout>,
-    /// V-score panelisation hints. v0.14 records; panelisation tool
-    /// consumes them in v0.16+.
+    /// V-score panelisation hints. Recorded only; the panelisation tool
+    /// (Advanced Output plan, Panelization) consumes them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub v_scores: Vec<FpVScore>,
     /// Standalone solder-mask openings (separate from pad mask margins).
@@ -400,6 +471,9 @@ pub struct Footprint {
     pub component_type: ComponentType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height_mm: Option<f64>,
+    /// Generated silkscreen, pin 1 and assembly features (`snxfpt/1.3`).
+    #[serde(default, skip_serializing_if = "GeneratedFeatures::is_default")]
+    pub generated: GeneratedFeatures,
 }
 
 /// v0.21 — Altium-parity component type. Drives whether the part
@@ -479,7 +553,8 @@ pub const FOOTPRINT_SCHEMA_VERSION: u32 = 3;
 /// inline TOML since they're variant-shaped or sparse.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FootprintFile {
-    /// Schema sentinel — current emitters write `"snxfpt/1"`.
+    /// The format token the file was read with; a save writes
+    /// [`FootprintFile::format_token`].
     #[serde(default = "default_footprint_format")]
     pub format: String,
     /// File-level UUID — distinct from any contained footprint's uuid.
@@ -489,6 +564,10 @@ pub struct FootprintFile {
     /// panel header. Defaults to the file stem when empty.
     #[serde(default)]
     pub display_name: String,
+    /// The `file_uuid` of the stock file this one was copied from (#813);
+    /// see `SymbolFile::copied_from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_from: Option<Uuid>,
     /// All footprints in this file. Order is the Footprint Library
     /// panel order.
     pub footprints: Vec<Footprint>,
@@ -496,11 +575,10 @@ pub struct FootprintFile {
     pub updated: DateTime<Utc>,
 }
 
-const FOOTPRINT_FILE_FORMAT_TOKEN: &str = "snxfpt/1";
-
-/// Stable column layout for the per-footprint `pads_tsv` block.
-/// Adding or reordering columns is a wire-format break — bump
-/// [`FOOTPRINT_FILE_FORMAT_TOKEN`].
+/// Base column layout for the per-footprint `pads_tsv` block; these
+/// lead every header. Reordering them is a wire-format break — bump
+/// the `.snxfpt` token (`format_token`). The remaining `Pad` fields are
+/// optional trailing columns, see `pad_columns`.
 const PAD_TSV_COLUMNS: &[&str] = &[
     "number",
     "kind",
@@ -523,7 +601,7 @@ const PAD_TSV_COLUMNS: &[&str] = &[
 const PADS_TSV_PLACEHOLDER_PREFIX: &str = "__SIGNEX_PADS_TSV_a1b2c3d4_";
 
 fn default_footprint_format() -> String {
-    FOOTPRINT_FILE_FORMAT_TOKEN.to_string()
+    SNXFPT_FORMAT_V1_1.to_string()
 }
 
 /// On-disk wire shape. Mirrors [`FootprintFile`] but each
@@ -531,10 +609,13 @@ fn default_footprint_format() -> String {
 /// carrying the TSV-encoded payload.
 #[derive(Serialize, Deserialize)]
 struct FootprintFileWire {
-    format: String,
+    #[serde(default)]
+    format: Option<String>,
     file_uuid: Uuid,
     #[serde(default)]
     display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    copied_from: Option<Uuid>,
     created: DateTime<Utc>,
     updated: DateTime<Utc>,
     #[serde(default)]
@@ -597,6 +678,8 @@ struct FootprintWire {
     component_type: ComponentType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     height_mm: Option<f64>,
+    #[serde(default, skip_serializing_if = "GeneratedFeatures::is_default")]
+    generated: GeneratedFeatures,
     // FootprintWire (per-footprint) wire fields below; the
     // FootprintFile (file-level) wire ends here.
 }
@@ -619,6 +702,7 @@ impl FootprintFile {
             format: default_footprint_format(),
             file_uuid,
             display_name: footprint.name.clone(),
+            copied_from: None,
             footprints: vec![footprint],
             created: timestamp,
             updated: timestamp,
@@ -634,14 +718,12 @@ impl FootprintFile {
         Self::from_toml_str(text)
     }
 
-    /// Parse the TOML+TSV wire format. The format-token check pins us
-    /// to [`FOOTPRINT_FILE_FORMAT_TOKEN`]; mismatched files surface
+    /// Parse the TOML+TSV wire format. The format token is checked by
+    /// [`FOOTPRINT_FILE_VERSION`]; a refused one surfaces
     /// [`FootprintFileError::UnsupportedFormat`].
     pub fn from_toml_str(text: &str) -> Result<Self, FootprintFileError> {
         let wire: FootprintFileWire = signex_types::numeric::parse_toml_finite(text)?;
-        if wire.format != FOOTPRINT_FILE_FORMAT_TOKEN {
-            return Err(FootprintFileError::UnsupportedFormat { got: wire.format });
-        }
+        let format = FOOTPRINT_FILE_VERSION.read(wire.format.as_deref())?;
         let mut footprints = Vec::with_capacity(wire.footprints.len());
         for fw in wire.footprints {
             let pads = pads_from_tsv(&fw.pads_tsv)?;
@@ -676,14 +758,16 @@ impl FootprintFile {
                 default_designator: fw.default_designator,
                 component_type: fw.component_type,
                 height_mm: fw.height_mm,
+                generated: fw.generated,
             };
             footprint.repair_stored_sketch();
             footprints.push(footprint);
         }
         Ok(FootprintFile {
-            format: wire.format,
+            format,
             file_uuid: wire.file_uuid,
             display_name: wire.display_name,
+            copied_from: wire.copied_from,
             created: wire.created,
             updated: wire.updated,
             footprints,
@@ -728,12 +812,14 @@ impl FootprintFile {
                 default_designator: fp.default_designator.clone(),
                 component_type: fp.component_type,
                 height_mm: fp.height_mm,
+                generated: fp.generated.clone(),
             });
         }
         let wire = FootprintFileWire {
-            format: self.format.clone(),
+            format: Some(self.format_token().to_string()),
             file_uuid: self.file_uuid,
             display_name: self.display_name.clone(),
+            copied_from: self.copied_from,
             created: self.created,
             updated: self.updated,
             footprints: wire_footprints,
@@ -757,10 +843,6 @@ impl FootprintFile {
     /// Locate a footprint by UUID within this file.
     pub fn get_footprint(&self, uuid: Uuid) -> Option<&Footprint> {
         self.footprints.iter().find(|f| f.uuid == uuid)
-    }
-
-    pub fn get_footprint_mut(&mut self, uuid: Uuid) -> Option<&mut Footprint> {
-        self.footprints.iter_mut().find(|f| f.uuid == uuid)
     }
 }
 
@@ -804,6 +886,7 @@ impl Footprint {
             default_designator: String::new(),
             component_type: ComponentType::Standard,
             height_mm: None,
+            generated: GeneratedFeatures::default(),
         }
     }
 }

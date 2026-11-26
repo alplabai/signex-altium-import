@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Re-vendor signex-types, signex-sketch and signex-library from a checkout
+# Re-vendor signex-expr, signex-types, signex-sketch and signex-library from a checkout
 # of alplabai/signex:
 #
 #   scripts/sync-signex-crates.sh ../signex
@@ -17,13 +17,13 @@ SRC="${1:?usage: $0 <path-to-signex-checkout>}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 test -f "$SRC/crates/signex-types/Cargo.toml" || { echo "not a signex checkout: $SRC" >&2; exit 1; }
 COMMIT="$(git -C "$SRC" rev-parse HEAD)"
-for crate in signex-types signex-sketch signex-library; do
+for crate in signex-expr signex-types signex-sketch signex-library; do
   rm -rf "$ROOT/crates/$crate"
   cp -r "$SRC/crates/$crate" "$ROOT/crates/$crate"
   echo "$COMMIT" > "$ROOT/crates/$crate/UPSTREAM_COMMIT"
 done
-for crate in signex-sketch signex-library; do
+for crate in signex-expr signex-sketch signex-library; do
   rm -rf "$ROOT/crates/$crate/tests" "$ROOT/crates/$crate/benches" "$ROOT/crates/$crate/examples"
   python3 "$ROOT/scripts/trim_manifest.py" "$ROOT/crates/$crate/Cargo.toml"
 done
-echo "vendored signex-types, signex-sketch, signex-library @ $COMMIT"
+echo "vendored signex-expr, signex-types, signex-sketch, signex-library @ $COMMIT"

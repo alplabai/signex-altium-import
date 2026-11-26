@@ -1,6 +1,6 @@
 [package]
 name = "signex-sketch"
-description = "2D parametric sketcher for footprints — entities, constraints, solver, bake"
+description = "2D parametric sketcher for footprints — entities, constraints, solver"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,11 +8,11 @@ license.workspace = true
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 signex-types = { workspace = true }
+signex-expr = { workspace = true }
 # GH #599 — the solver reports the diagnostics it cannot compute
 # (constraints whose residual will not evaluate) instead of dropping
 # them. signex-app installs a `log` sink and enables tracing's `log`

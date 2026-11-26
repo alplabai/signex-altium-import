@@ -11,6 +11,10 @@ use uuid::Uuid;
 
 use super::Symbol;
 
+/// The symbol fields a part's manufacturer part number is read from, in
+/// order (case-insensitive). Shared by the BOM and ERC.
+pub const MPN_FIELDS: [&str; 3] = ["MPN", "Manufacturer Part Number", "Part Number"];
+
 /// The identity fields of a placed symbol that decide part membership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartKey<'a> {
@@ -31,7 +35,26 @@ pub fn normalized_lib_id(lib_id: &str) -> &str {
     lib_id.trim()
 }
 
+impl super::LibSymbol {
+    /// How many units a placed part of this symbol has: the highest unit
+    /// number any pin or graphic belongs to (unit 0 is shared by every unit),
+    /// at least 1.
+    pub fn unit_count(&self) -> u32 {
+        let pins = self.pins.iter().map(|p| p.unit);
+        let graphics = self.graphics.iter().map(|g| g.unit);
+        pins.chain(graphics).max().unwrap_or(0).max(1)
+    }
+}
+
 impl Symbol {
+    /// Whether the reference designator is drawn at all. A power port is a
+    /// net name, not a part, so it never draws one; canvas, hit boxes and
+    /// SVG/PDF export all read this one answer (#1771).
+    #[must_use]
+    pub fn draws_reference(&self) -> bool {
+        !self.is_power
+    }
+
     /// The fields [`group_into_parts`] groups by.
     pub fn part_key(&self) -> PartKey<'_> {
         PartKey {
@@ -235,12 +258,38 @@ pub fn duplicate_designators<'a>(symbols: impl IntoIterator<Item = &'a Symbol>) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_power_port_draws_no_reference_and_a_part_does() {
+        let port = Symbol {
+            is_power: true,
+            ..Symbol::default()
+        };
+        assert!(!port.draws_reference());
+        assert!(Symbol::default().draws_reference());
+    }
+
     fn key<'a>(reference: &'a str, lib_id: &'a str, unit: u32) -> PartKey<'a> {
         PartKey {
             reference,
             lib_id,
             unit,
         }
+    }
+
+    #[test]
+    fn unit_count_is_the_highest_unit_and_at_least_one() {
+        let lib = |units: &str| -> super::super::LibSymbol {
+            let graphics: Vec<String> = units
+                .split(',')
+                .filter(|u| !u.is_empty())
+                .map(|u| format!(r#"{{"unit":{u},"graphic":{{"type":"polyline","points":[]}}}}"#))
+                .collect();
+            let json = format!(r#"{{"id":"X","graphics":[{}]}}"#, graphics.join(","));
+            serde_json::from_str(&json).expect("lib symbol json")
+        };
+        assert_eq!(lib("").unit_count(), 1);
+        assert_eq!(lib("0").unit_count(), 1);
+        assert_eq!(lib("0,1,3,2").unit_count(), 3);
     }
 
     #[test]
@@ -279,7 +328,7 @@ mod tests {
 
     fn placed(reference: &str, lib_id: &str, unit: u32) -> Symbol {
         Symbol {
-            uuid: Uuid::new_v4(),
+            uuid: Uuid::now_v7(),
             reference: reference.to_string(),
             lib_id: lib_id.to_string(),
             unit,

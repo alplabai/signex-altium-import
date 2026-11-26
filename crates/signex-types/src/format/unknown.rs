@@ -40,6 +40,27 @@ impl UnknownFields {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Keep `value` under `key` so a save writes it back verbatim.
+    pub(crate) fn insert_value(&mut self, key: &str, value: toml::Value) {
+        self.0.insert(key.to_string(), value);
+    }
+
+    /// The captured keys and their raw values.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&String, &toml::Value)> {
+        self.0.iter()
+    }
+
+    /// Whether `key` was captured.
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.0.contains_key(key)
+    }
+
+    /// Drop a captured key, for when this build starts owning it so a save
+    /// can not write it twice.
+    pub fn remove(&mut self, key: &str) {
+        self.0.remove(key);
+    }
 }
 
 /// Foreign keys carried by a [`SchematicSheet`](crate::schematic::SchematicSheet),
@@ -57,17 +78,47 @@ pub struct SheetUnknown {
     /// Keys inside `[extras.sheet]`.
     #[serde(default, skip_serializing_if = "UnknownFields::is_empty")]
     pub extras: UnknownFields,
+    /// Keys inside `[extras.sheet.frame]` (#1134).
+    #[serde(default, skip_serializing_if = "UnknownFields::is_empty")]
+    pub frame: UnknownFields,
+    /// Keys inside `[extras.sheet.page]` (#2034).
+    #[serde(default, skip_serializing_if = "UnknownFields::is_empty")]
+    pub page: UnknownFields,
+    /// Keys inside `[sheets]` beside the TSV blocks, e.g. a
+    /// `[sheets.widgets]` table (#1829).
+    #[serde(default, skip_serializing_if = "UnknownFields::is_empty")]
+    pub sheets: UnknownFields,
+    /// Keys inside `[extras]` beside `symbols`, `junctions` and `sheet`,
+    /// e.g. an `[extras.mystery]` table (#1829).
+    #[serde(default, skip_serializing_if = "UnknownFields::is_empty")]
+    pub extras_root: UnknownFields,
     /// Format token of the newer-minor file this was read from. A
     /// document carrying it loads for viewing but cannot be saved: the
     /// writer would drop content this build has no field for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newer_minor_source: Option<String>,
+    /// What loading changed to make the file usable (a repeated uuid
+    /// re-minted or dropped, #1830). Never written. The document that opens
+    /// the sheet takes it once ([`SchematicSheet::take_load_repairs`]).
+    #[serde(skip)]
+    pub load_repairs: Vec<super::SheetLoadRepair>,
+    /// SHA-256 of the exact file bytes this copy was parsed from, set by the
+    /// app's sheet reader. Never written. A run that keeps the copy as an
+    /// unsaved document takes it as the save's disk baseline (#2760).
+    #[serde(skip)]
+    pub source_hash: Option<Box<[u8; 32]>>,
 }
 
 impl SheetUnknown {
     /// `true` when no section holds a foreign key.
     pub fn is_empty(&self) -> bool {
-        self.manifest.is_empty() && self.extras.is_empty() && self.newer_minor_source.is_none()
+        self.manifest.is_empty()
+            && self.extras.is_empty()
+            && self.frame.is_empty()
+            && self.page.is_empty()
+            && self.sheets.is_empty()
+            && self.extras_root.is_empty()
+            && self.newer_minor_source.is_none()
     }
 }
 
@@ -84,17 +135,34 @@ pub struct BoardUnknown {
     /// Keys inside `[stackup]`.
     #[serde(default, skip_serializing_if = "UnknownFields::is_empty")]
     pub stackup: UnknownFields,
+    /// Entries of `[stackup.display_names]` this build does not own: a token
+    /// that names no layer, or a value that is not a string.
+    #[serde(default, skip_serializing_if = "UnknownFields::is_empty")]
+    pub stackup_display_names: UnknownFields,
     /// Keys inside `[nets]`.
     #[serde(default, skip_serializing_if = "UnknownFields::is_empty")]
     pub nets: UnknownFields,
     /// Keys inside `[extras.board]`.
     #[serde(default, skip_serializing_if = "UnknownFields::is_empty")]
     pub extras: UnknownFields,
+    /// Keys inside `[extras]` beside `footprints`, `pads` and `board`,
+    /// e.g. an `[extras.mystery]` table (#1873).
+    #[serde(default, skip_serializing_if = "UnknownFields::is_empty")]
+    pub extras_root: UnknownFields,
+    /// Keys inside `[board_sketch]` beside `sketch`, `keepouts`, `cutouts`,
+    /// `v_scores` and `holes` (#2234).
+    #[serde(default, skip_serializing_if = "UnknownFields::is_empty")]
+    pub board_sketch: UnknownFields,
     /// Format token of the newer-minor file this was read from. A
     /// document carrying it loads for viewing but cannot be saved: the
     /// writer would drop content this build has no field for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newer_minor_source: Option<String>,
+    /// What loading changed to make the board usable (a repeated uuid
+    /// re-minted or dropped, #1886). Never written. The document that opens
+    /// the board takes it once ([`PcbBoard::take_load_repairs`]).
+    #[serde(skip)]
+    pub load_repairs: Vec<super::SheetLoadRepair>,
 }
 
 impl BoardUnknown {
@@ -102,8 +170,11 @@ impl BoardUnknown {
     pub fn is_empty(&self) -> bool {
         self.manifest.is_empty()
             && self.stackup.is_empty()
+            && self.stackup_display_names.is_empty()
             && self.nets.is_empty()
             && self.extras.is_empty()
+            && self.extras_root.is_empty()
+            && self.board_sketch.is_empty()
             && self.newer_minor_source.is_none()
     }
 }
