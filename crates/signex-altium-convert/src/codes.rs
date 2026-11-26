@@ -10,6 +10,8 @@ pub const CODES: &[(&str, Severity)] = &[
     ("symbol.pin_ieee_unmapped", D),
     ("symbol.bezier_polygon", A),
     ("symbol.rounded_rect_square", A),
+    ("symbol.display_mode_dropped", D),
+    ("symbol.pin_decoration_merged", A),
     // Schematic sheets.
     ("sch.rounded_rect_square", A),
     ("sch.bezier_polygon", A),
@@ -51,6 +53,7 @@ pub const CODES: &[(&str, Severity)] = &[
     // Parts of a library run.
     ("part.pn_collision", A),
     ("part.footprint_missing", E),
+    ("part.pin_map_unread", E),
     ("part.footprint_no_current", I),
     ("part.model_skipped", I),
     ("part.param_ambiguous", I),
@@ -58,7 +61,7 @@ pub const CODES: &[(&str, Severity)] = &[
     ("part.text_sanitized", I),
     ("part.template_incomplete", I),
     ("part.row_invalid", E),
-    ("footprint.name_collision", I),
+    ("footprint.name_collision", A),
     // Library runs (`signex-altium-import library`).
     ("library.input_unreadable", E),
 ];

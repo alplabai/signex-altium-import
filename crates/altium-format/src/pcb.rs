@@ -447,6 +447,8 @@ pub struct PcbLib {
     /// The library header (`Library/Data`): layer names and stack.
     pub params: Params,
     pub layer_kinds: HashMap<u8, LayerKind>,
+    /// The container's root-entry modified time, if it records one.
+    pub modified: Option<std::time::SystemTime>,
 }
 
 impl PcbLib {
@@ -456,7 +458,10 @@ impl PcbLib {
     }
 
     pub fn from_container(c: &mut Container) -> Result<Self> {
-        let mut lib = PcbLib::default();
+        let mut lib = PcbLib {
+            modified: c.modified(),
+            ..PcbLib::default()
+        };
         if let Some(data) = c.stream_opt("Library/Data")? {
             // Only the leading text record; binary sections follow it.
             let mut r = Reader::new(&data, "Library/Data");

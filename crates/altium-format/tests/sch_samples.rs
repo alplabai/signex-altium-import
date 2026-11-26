@@ -65,3 +65,56 @@ fn schlib_handles_long_names_and_pin_text() {
         assert!(!lib.components.is_empty(), "{name}");
     }
 }
+
+fn frame(text: &str) -> Vec<u8> {
+    let mut payload = text.as_bytes().to_vec();
+    payload.push(0);
+    let mut out = (payload.len() as u32).to_le_bytes().to_vec();
+    out.extend(payload);
+    out
+}
+
+fn symbol_with_map(extra: &[&str]) -> Vec<altium_format::sch::Implementation> {
+    let mut s = Vec::new();
+    for rec in [
+        "|RECORD=1|LibReference=X|PartCount=2|",
+        "|RECORD=44|",
+        "|RECORD=45|ModelName=FP|ModelType=PCBLIB|IsCurrent=T|",
+    ]
+    .iter()
+    .chain(extra)
+    {
+        s.extend(frame(rec));
+    }
+    altium_format::sch::parse_symbol_stream(&s)
+        .unwrap()
+        .implementations
+}
+
+#[test]
+fn an_unread_pin_map_is_flagged_never_left_silently_empty() {
+    // A bare record 46 (as in the samples) says nothing.
+    assert!(!symbol_with_map(&["|RECORD=46|"])[0].pin_map_unread);
+    // A record 46 with keys, or any record 47, is a map this reader skips.
+    assert!(symbol_with_map(&["|RECORD=46|DesignatorCount=2|"])[0].pin_map_unread);
+    assert!(symbol_with_map(&["|RECORD=46|", "|RECORD=47|"])[0].pin_map_unread);
+    assert!(!symbol_with_map(&[])[0].pin_map_unread);
+}
+
+#[test]
+fn no_sample_implementation_has_an_unread_pin_map() {
+    let doc = SchDoc::open(sample("simple.SchDoc")).unwrap();
+    for c in &doc.components {
+        assert!(c.implementations.iter().all(|i| !i.pin_map_unread));
+    }
+}
+
+#[test]
+fn a_library_records_its_modified_time_when_the_file_has_one() {
+    // Not every writer fills the root entry's time; when present it is after
+    // the epoch, and never a 1601 zero.
+    let lib = SchLib::open(sample("simple.SchLib")).unwrap();
+    if let Some(t) = lib.modified {
+        assert!(t > std::time::UNIX_EPOCH);
+    }
+}

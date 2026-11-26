@@ -80,6 +80,13 @@ order and names.
     doesn't close, its bounding box is used, and that is reported.
   - **Layer roles:** the file's `LayerKindMapping` decides each mechanical
     layer's role first, and the layer's name second.
+- **Display modes** become body styles: mode 0 is the normal body
+  (`body_style` 1), mode 1 the alternate (De Morgan) body (2), an item for no
+  particular mode (-1) belongs to both (0). Items of a further mode are
+  dropped and reported (`symbol.display_mode_dropped`).
+- **Pin decorations:** schematic placement reads only the outside-edge column,
+  so both the dot (outer) and the clock (inner) go there. A pin with both
+  keeps the dot and is reported (`symbol.pin_decoration_merged`).
 - **Not imported:** copper drawn inside a footprint, custom pad shapes
   (regions), fills, 3D bodies.
 
@@ -150,8 +157,10 @@ Signex repository is the format; `docs/APP_INTEGRATION.md` the command).
   it; `--library-id` overrides it. Symbol, footprint and part ids come from
   the library id, the source library's name and the item's name; a repeated
   name inside one library adds `#2`, `#3`.
-- **Same inputs, same bytes.** Every written time is the Unix epoch, and
-  every primitive and part starts at version `1.0.0`. The converter writes
+- **Same inputs, same bytes.** Every written time is the newest
+  modified time recorded in the source containers' root entries (whole
+  seconds, from the input bytes, never the clock), or the Unix epoch when no
+  source records one. Every primitive and part starts at version `1.0.0`. The converter writes
   through the vendored serializers and re-reads its own `.snxlib` to check it
   is canonical.
 - **One part per SchLib component**, in (source path, source order). Part
@@ -159,41 +168,55 @@ Signex repository is the format; `docs/APP_INTEGRATION.md` the command).
   are `name~2`, `name~3` (report `part.pn_collision`). State `draft`. The
   parameter `designator_prefix` holds the designator's leading letters
   (`R?` gives `R`), when it has any.
-- **Class** from the designator prefix, limited to the classes the vendored
-  templates know:
+- **Class** from the designator prefix, with the stock library's class keys
+  and labels:
 
-  | Prefix | Class |
+  | Prefix | Class (label) |
   |---|---|
-  | `R` | `resistor` |
-  | `C` | `capacitor` |
-  | `L` | `inductor` |
-  | anything else (`D`, `LED`, `Q`, `U`, `IC`, `J`, `P`, `CN`, `SW`, `S`, `Y`, `X`, `H`, `MH`, `FID`, none) | `generic` |
+  | `R` | `resistor` (Resistor) |
+  | `C` | `capacitor` (Capacitor) |
+  | `L` | `inductor` (Inductor) |
+  | `D` | `diode` (Diode) |
+  | `LED` | `led` (LED) |
+  | `Q` | `transistor` (Transistor) |
+  | `U`, `IC` | `ic` (Integrated Circuit) |
+  | `J`, `P`, `CN` | `connector` (Connector) |
+  | `SW`, `S` | `switch` (Switch) |
+  | `Y`, `X` | `crystal` (Crystal / Oscillator) |
+  | `H`, `MH` | `mechanical` (Mechanical) |
+  | `FID` | `fiducial` (Fiducial) |
+  | anything else, or none | `generic` (Generic) |
 
-  One table per class used, named by the class key; the manifest lists those
-  classes. More classes follow when templates exist for them.
+  One table per class used, named by the class key; the manifest declares
+  every class used. Only `resistor`, `capacitor` and `inductor` have a
+  parameter template today; the others use the generic template's slots.
 - **Footprints** keep the footprint converter's frame: Signex's footprint
   frame has +y down, so every Altium y and angle is negated and each arc's
   start and end swap. Every footprint of every PcbLib is written; parts bind
   to them by name, case-insensitive, the first definition winning
-  (`footprint.name_collision` for a repeat).
+  (`footprint.name_collision`, approximated, names both definitions).
 - **Footprint binding.** A component's PCB model marked current is the
   default footprint; its other PCB models are alternates in list order. When
   none is marked current the first is the default (`part.footprint_no_current`).
-  A model whose pin map renames pins gives `pin_map_overrides` (default) or
+  A model whose pin map the reader cannot decode (a map record with content) skips the part with `part.pin_map_unread` (`error`) rather than binding it 1:1. A model whose pin map renames pins gives `pin_map_overrides` (default) or
   the alternate's own overrides; identical pairs are not overrides. A named
   footprint that is in none of the given PcbLibs skips the **part** with
   `part.footprint_missing` (`error`). A component that names no footprint
   gets a row without one. Models of other kinds (a simulation, for example)
   are reported as `info` (`part.model_skipped`) and not imported. Pin maps are
-  not read from files yet (`docs/FORMAT_NOTES.md`).
+  not decoded yet (`docs/FORMAT_NOTES.md`), so no part gets overrides from
+  a file; alternates carry their footprint's version.
 - **`--update`** needs the directory to hold exactly one `.snxlib`, with the
   same library id as this source gives (else the run fails and writes
   nothing). It rewrites the library in place and deletes envelopes,
-  footprints and library files the source no longer has. A part keeps its
-  lifecycle state, `released` flag and created time; its version and updated
-  time stay while its content hash is unchanged and otherwise the patch
-  version rises and updated is set to now. Symbol and footprint versions stay
-  `1.0.0`.
+  footprints and library files the source no longer has. Each symbol and
+  footprint is compared with its file on disk: unchanged ones keep their
+  version and times, changed ones get the next patch version and `updated` =
+  now. A part keeps its lifecycle state, `released` flag and created time;
+  its `symbol_version`/`footprint_version` follow the primitives, and its
+  own patch version rises (with `updated` = now) when its content hash or
+  either primitive version changed. A part row, symbol or footprint on disk
+  that cannot be read fails the run before anything is written.
 - **Not carried yet:** embedded 3D models, `.IntLib` and `.DbLib` sources,
   folder inputs, simulation models.
 - **Completeness.** Every source component is a written part or a part item
@@ -238,6 +261,9 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `symbol.pin_ieee_unmapped` | dropped | A pin's IEEE symbol code with no Signex shape (detail `ieee_code`) |
 | `symbol.bezier_polygon` | approximated | Library symbol bezier imported as its control polygon |
 | `symbol.rounded_rect_square` | approximated | Library symbol rounded rectangle imported with square corners |
+| `symbol.display_mode_dropped` | dropped | A pin or graphic of a display mode beyond the two Signex bodies |
+| `symbol.pin_decoration_merged` | approximated | A pin with an inner and an outer edge symbol keeps only the outer |
+| `part.pin_map_unread` | error | A footprint model has a pin map this reader cannot decode; part skipped |
 | `sch.rounded_rect_square` | approximated | Sheet rounded rectangle imported with square corners |
 | `sch.bezier_polygon` | approximated | Sheet bezier imported as its control polygon |
 | `sch.image_dropped` | dropped | Embedded image not imported |
@@ -281,7 +307,7 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `part.text_sanitized` | info | Control characters or a triple apostrophe in a value replaced |
 | `part.template_incomplete` | info | The class template wants parameters the part lacks |
 | `part.row_invalid` | error | The part row failed the writer's checks; part not written |
-| `footprint.name_collision` | info | A footprint name is already defined; parts bind to the first |
+| `footprint.name_collision` | approximated | A footprint name is already defined; parts bind to the first |
 | `library.input_unreadable` | error | An input file could not be read (library runs) |
 
-48 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.
+51 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.

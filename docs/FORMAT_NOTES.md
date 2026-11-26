@@ -65,6 +65,12 @@ the name.
 index][u32 len][zlib]`. Inflated, it gives three `i32` values (x, y,
 length) in 1/100000 units.
 
+### Container time
+
+A library's compound-file root entry may record a modified time; a zero time
+reads as 1601 and counts as none (`SchLib::modified`, `PcbLib::modified`).
+The library converter stamps its output with the newest of them.
+
 ### Implementations (footprint links)
 
 A component's footprint and other model links are records 44 to 48 below the
@@ -80,8 +86,10 @@ component record:
 - `RECORD=46` and `RECORD=48` follow each model, owned by it, and carry no
   keys in the samples (`simple.SchDoc`). Pin maps would live below record 46;
   **no sample holds one, so they are not decoded**: `Implementation::pin_map`
-  stays empty and a remapped pin cannot come from a file yet. Converting one
-  needs a sample with a non-trivial pin map.
+  stays empty. A record 46 with keys, or any record 47, sets
+  `Implementation::pin_map_unread`, and the converter skips that part
+  (`part.pin_map_unread`) instead of binding it 1:1. Decoding needs a sample
+  with a non-trivial pin map.
 - The `SchLib` samples hold a list (44) with no models at all, so the library
   samples bind no footprints; the binding tests build components in memory.
 

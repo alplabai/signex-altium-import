@@ -260,7 +260,13 @@ fn update_removes_what_the_source_no_longer_has() {
     let dir = out.0.join("lib");
     library_run(&dir, &[]);
     let stale = dir.join("footprints/00000000-0000-0000-0000-000000000000.snxfpt");
-    std::fs::write(&stale, "x").unwrap();
+    let real = std::fs::read_dir(dir.join("footprints"))
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    std::fs::copy(real, &stale).unwrap();
     library_run(&dir, &["--update"]);
     assert!(!stale.exists());
 }
@@ -436,4 +442,47 @@ fn a_path_named_like_a_command_is_an_input() {
     let s = lines(&o.stdout).pop().unwrap();
     // The single-file summary, not a describe object.
     assert!(s.get("project").is_some() && s.get("contract").is_none());
+}
+
+#[test]
+fn update_fails_on_a_part_row_it_cannot_read_back() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    library_run(&dir, &[]);
+    let lib = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "snxlib"))
+        .unwrap();
+    let text = std::fs::read_to_string(&lib).unwrap();
+    assert!(text.contains("\tDraft\t"));
+    std::fs::write(&lib, text.replacen("\tDraft\t", "\tBogus\t", 1)).unwrap();
+    let before = tree(&dir);
+    let (o, s) = library_run(&dir, &["--update"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(s["error"].as_str().unwrap().contains("unreadable state"));
+    let (mut a, mut b) = (before, tree(&dir));
+    for t in [&mut a, &mut b] {
+        t.remove("import-report.json");
+        t.remove("import-report.md");
+    }
+    assert_eq!(a, b);
+}
+
+#[test]
+fn two_inputs_with_one_file_name_are_refused() {
+    let out = Tmp::new();
+    let one = sample("simple.SchLib");
+    let o = run(&[
+        os("library"),
+        one.as_os_str(),
+        one.as_os_str(),
+        os("--output"),
+        out.0.join("o").as_os_str(),
+        os("--json"),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let s = lines(&o.stdout).pop().unwrap();
+    assert!(s["error"].as_str().unwrap().contains("same kind"));
 }

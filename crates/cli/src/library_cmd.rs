@@ -101,6 +101,27 @@ impl LibraryArgs {
                 return Err(format!("--search-path {} is not a folder", d.display()));
             }
         }
+        // Two inputs of one kind with the same stem would name their items
+        // alike, so their ids would collide.
+        let mut seen = std::collections::HashSet::new();
+        for p in &self.inputs {
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let stem = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_lowercase();
+            if !seen.insert((ext, stem)) {
+                return Err(format!(
+                    "{}: another input of the same kind has this file name; rename one",
+                    p.display()
+                ));
+            }
+        }
         if self.name.as_deref().is_some_and(str::is_empty) {
             return Err("--name is empty".into());
         }
@@ -300,6 +321,16 @@ mod tests {
         a.library_id = None;
         a.map = Some("/definitely/not/here.toml".into());
         assert!(a.validate().unwrap_err().contains("--map"));
+    }
+
+    #[test]
+    fn duplicate_stems_of_one_kind_are_refused_case_insensitively() {
+        let a = parse(&["a/X.SchLib", "b/x.schlib", "--output", "o"]).unwrap();
+        assert!(a.validate().unwrap_err().contains("same kind"));
+        let same = parse(&["X.SchLib", "X.SchLib", "--output", "o"]).unwrap();
+        assert!(same.validate().is_err());
+        let ok = parse(&["X.SchLib", "X.PcbLib", "--output", "o"]).unwrap();
+        assert!(ok.validate().is_ok());
     }
 
     #[test]

@@ -55,26 +55,50 @@ impl Guard {
     pub fn commit(mut self) {
         self.committed = true;
     }
-}
 
-impl Drop for Guard {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
+    /// Undo every write and delete, newest first, then remove the folders
+    /// this run created under `root` (never `root` itself) once empty.
+    /// Returns what could not be undone. A guard dropped without this or
+    /// [`Guard::commit`] rolls back and drops the errors.
+    pub fn rollback(mut self, root: &Path) -> Vec<String> {
+        self.committed = true;
+        self.undo_all(Some(root))
+    }
+
+    fn undo_all(&mut self, root: Option<&Path>) -> Vec<String> {
+        let mut errors = Vec::new();
         for (path, old) in self.undo.drain(..).rev() {
-            let _ = match old {
-                Some(b) => signex_types::atomic_io::atomic_write(&path, &b).map_err(drop),
-                None => std::fs::remove_file(&path).map_err(drop),
+            let done = match old {
+                Some(b) => {
+                    signex_types::atomic_io::atomic_write(&path, &b).map_err(|e| e.to_string())
+                }
+                None => match std::fs::remove_file(&path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+                    _ => Ok(()),
+                },
             };
-            // Folders this run created are removed once empty.
+            if let Err(e) = done {
+                errors.push(format!("could not restore {}: {e}", path.display()));
+            }
             let mut dir = path.parent();
             while let Some(d) = dir {
+                if root.is_some_and(|r| d == r || !d.starts_with(r)) {
+                    break;
+                }
                 if std::fs::remove_dir(d).is_err() {
                     break;
                 }
                 dir = d.parent();
             }
+        }
+        errors
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.undo_all(None);
         }
     }
 }
@@ -100,6 +124,7 @@ mod tests {
             g.write(&d.join("old.txt"), b"new").unwrap();
             g.write(&d.join("sub/new.txt"), b"x").unwrap();
             g.remove(&d.join("gone.txt")).unwrap();
+            assert!(g.rollback(&d).is_empty());
         }
         assert_eq!(std::fs::read_to_string(d.join("old.txt")).unwrap(), "old");
         assert_eq!(
@@ -107,6 +132,26 @@ mod tests {
             "keep me"
         );
         assert!(!d.join("sub").exists());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn rollback_stops_at_the_root_and_reports_what_it_cannot_undo() {
+        let d = tmp("root");
+        let mut g = Guard::new();
+        g.write(&d.join("only.txt"), b"x").unwrap();
+        assert!(g.rollback(&d).is_empty());
+        assert!(d.is_dir(), "the output root stays");
+
+        let mut g = Guard::new();
+        std::fs::write(d.join("keep.txt"), "old").unwrap();
+        g.write(&d.join("keep.txt"), b"new").unwrap();
+        // Make the restore fail: a directory where the file was.
+        std::fs::remove_file(d.join("keep.txt")).unwrap();
+        std::fs::create_dir(d.join("keep.txt")).unwrap();
+        let errors = g.rollback(&d);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("keep.txt"));
         std::fs::remove_dir_all(d).unwrap();
     }
 

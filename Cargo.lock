@@ -1107,6 +1107,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "sha2",
  "signex-library",
  "signex-sketch",
  "signex-types",

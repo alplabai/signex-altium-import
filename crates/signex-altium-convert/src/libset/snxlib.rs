@@ -16,8 +16,9 @@ use uuid::Uuid;
 
 use super::BuildError;
 
-/// The time every fresh conversion stamps. A conversion is a pure function
-/// of its inputs (contract section 5), so it carries no wall clock.
+/// The time a conversion stamps when no source records a modified time. A
+/// conversion is a pure function of its inputs (contract section 5), so it
+/// never reads the wall clock.
 pub fn epoch() -> DateTime<Utc> {
     DateTime::<Utc>::UNIX_EPOCH
 }
@@ -30,17 +31,17 @@ fn json<T: serde::Serialize>(v: &T) -> Result<String, BuildError> {
     serde_json::to_string(v).map_err(|e| BuildError::Row(e.to_string()))
 }
 
-fn state_cell(s: LifecycleState) -> &'static str {
-    match s {
-        LifecycleState::InReview => "InReview",
-        LifecycleState::Released => "Released",
-        LifecycleState::Deprecated => "Deprecated",
-        LifecycleState::Obsolete => "Obsolete",
-        _ => "Draft",
+/// The cell for a lifecycle state: the variant's name, as the row codec
+/// writes it.
+fn state_cell(s: LifecycleState) -> Result<String, BuildError> {
+    match serde_json::to_value(s) {
+        Ok(serde_json::Value::String(name)) => Ok(name),
+        _ => Err(BuildError::Row("lifecycle state has no name".into())),
     }
 }
 
-/// The 22 cells of `row`, by column name.
+/// The 22 cells of `row`, by column name. The names are checked against the
+/// vendored header, so a column the writer adds or moves fails loudly.
 pub fn row_cells(row: &ComponentRow) -> Result<LibraryRow, BuildError> {
     let datasheet = if row.datasheet_label.is_empty() && row.more_datasheets.is_empty() {
         json(&row.datasheet)?
@@ -54,33 +55,39 @@ pub fn row_cells(row: &ComponentRow) -> Result<LibraryRow, BuildError> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let cells = [
-        row.row_id.to_string(),
-        row.internal_pn.as_str().to_string(),
-        row.class.as_str().to_string(),
-        datasheet,
-        state_cell(row.state).to_string(),
-        json(&row.symbol_ref)?,
-        footprint,
-        String::new(),
-        json(&row.primary_mpn)?,
-        json(&row.alternates)?,
-        json(&row.supply)?,
-        json(&row.parameters)?,
-        json(&row.pin_map_overrides)?,
-        time_cell(row.created),
-        time_cell(row.updated),
-        hash,
-        row.version.clone(),
-        row.released.to_string(),
-        row.symbol_version.clone(),
-        row.footprint_version.clone(),
-        row.sim_version.clone(),
-        row.description.clone(),
+    let cells: [(&str, String); 22] = [
+        ("row_id", row.row_id.to_string()),
+        ("internal_pn", row.internal_pn.as_str().to_string()),
+        ("class", row.class.as_str().to_string()),
+        ("datasheet", datasheet),
+        ("state", state_cell(row.state)?),
+        ("symbol_ref", json(&row.symbol_ref)?),
+        ("footprint_ref", footprint),
+        ("sim_ref", String::new()),
+        ("primary_mpn", json(&row.primary_mpn)?),
+        ("alternates", json(&row.alternates)?),
+        ("supply", json(&row.supply)?),
+        ("parameters", json(&row.parameters)?),
+        ("pin_map_overrides", json(&row.pin_map_overrides)?),
+        ("created", time_cell(row.created)),
+        ("updated", time_cell(row.updated)),
+        ("content_hash", hash),
+        ("version", row.version.clone()),
+        ("released", row.released.to_string()),
+        ("symbol_version", row.symbol_version.clone()),
+        ("footprint_version", row.footprint_version.clone()),
+        ("sim_version", row.sim_version.clone()),
+        ("description", row.description.clone()),
     ];
+    let names: Vec<&str> = cells.iter().map(|(n, _)| *n).collect();
+    if names != TABLE_HEADER {
+        return Err(BuildError::Row(
+            "the vendored table header changed; update row_cells".into(),
+        ));
+    }
     let mut out = LibraryRow::default();
-    for (col, cell) in TABLE_HEADER.iter().zip(cells) {
-        out.cells.insert((*col).to_string(), cell);
+    for (col, cell) in cells {
+        out.cells.insert(col.to_string(), cell);
     }
     Ok(out)
 }

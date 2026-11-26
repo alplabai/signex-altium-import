@@ -7,10 +7,11 @@ use altium_format::pcb::PcbLib;
 use altium_format::sch::SchLib;
 use chrono::{DateTime, Utc};
 use signex_altium_convert::libset::{
-    LibraryOptions, PreviousRow, SourceBody, SourceLib, build_library,
+    LibraryOptions, PreviousPrimitive, PreviousRow, SourceBody, SourceLib, build_library,
 };
 use signex_altium_convert::report::{Item, ItemKind, Severity};
-use signex_library::{LibraryFile, LifecycleState};
+use signex_library::primitive::symbol::SymbolFile;
+use signex_library::{FootprintFile, LibraryFile, LifecycleState};
 use uuid::Uuid;
 
 use crate::contract::{Counts, Exit, LibrarySummary};
@@ -103,39 +104,79 @@ fn hash_of(hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// What the library on disk says about each part.
-pub fn previous_rows(lib: &LibraryFile) -> HashMap<Uuid, PreviousRow> {
+/// What the library on disk says about each part. A row this converter
+/// cannot read back fails the run: an update must not guess a part's state.
+pub fn previous_rows(lib: &LibraryFile) -> Result<HashMap<Uuid, PreviousRow>, String> {
     let mut out = HashMap::new();
     for t in lib.tables.values() {
         for row in &t.rows {
             let cell = |c: &str| t.cell(row, c).unwrap_or_default();
-            let time =
-                |c: &str| DateTime::parse_from_rfc3339(cell(c)).map(|d| d.with_timezone(&Utc));
-            let Some(content_hash) = hash_of(cell("content_hash")) else {
-                continue;
+            let bad = |what: &str| {
+                format!(
+                    "--update: part {:?} has an unreadable {what}; fix or remove it first",
+                    cell("internal_pn")
+                )
             };
-            let (Ok(id), Some(state), Ok(created), Ok(updated)) = (
-                Uuid::parse_str(cell("row_id")),
-                state_of(cell("state")),
-                time("created"),
-                time("updated"),
-            ) else {
-                continue;
+            let time = |c: &str| {
+                DateTime::parse_from_rfc3339(cell(c))
+                    .map(|d| d.with_timezone(&Utc))
+                    .map_err(|_| bad(c))
             };
+            let id = Uuid::parse_str(cell("row_id")).map_err(|_| bad("row_id"))?;
             out.insert(
                 id,
                 PreviousRow {
-                    state,
+                    state: state_of(cell("state")).ok_or_else(|| bad("state"))?,
                     released: cell("released") == "true",
-                    created,
-                    updated,
+                    created: time("created")?,
+                    updated: time("updated")?,
                     version: cell("version").to_string(),
-                    content_hash,
+                    content_hash: hash_of(cell("content_hash"))
+                        .ok_or_else(|| bad("content_hash"))?,
+                    symbol_version: cell("symbol_version").to_string(),
+                    footprint_version: cell("footprint_version").to_string(),
                 },
             );
         }
     }
-    out
+    Ok(out)
+}
+
+type Primitives = HashMap<Uuid, PreviousPrimitive>;
+
+/// The symbols and footprints on disk, by id. An envelope that does not
+/// read fails the run.
+fn previous_primitives(dir: &Path) -> Result<(Primitives, Primitives), String> {
+    let mut syms = HashMap::new();
+    let mut fps = HashMap::new();
+    let files = |sub: &str, ext: &str| -> Vec<PathBuf> {
+        std::fs::read_dir(dir.join(sub))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == ext))
+            .collect()
+    };
+    for p in files("symbols", "snxsym") {
+        let text =
+            std::fs::read_to_string(&p).map_err(|e| format!("--update: {}: {e}", p.display()))?;
+        let f = SymbolFile::from_toml_str(&text)
+            .map_err(|e| format!("--update: {} does not read: {e}", p.display()))?;
+        for s in &f.symbols {
+            syms.insert(s.uuid, PreviousPrimitive::of_symbol(s));
+        }
+    }
+    for p in files("footprints", "snxfpt") {
+        let text =
+            std::fs::read_to_string(&p).map_err(|e| format!("--update: {}: {e}", p.display()))?;
+        let f = FootprintFile::from_toml_str(&text)
+            .map_err(|e| format!("--update: {} does not read: {e}", p.display()))?;
+        for s in &f.footprints {
+            fps.insert(s.uuid, PreviousPrimitive::of_footprint(s));
+        }
+    }
+    Ok((syms, fps))
 }
 
 /// What a run produced: the summary, and the report when one was written.
@@ -211,7 +252,16 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
     if args.update {
         match existing_library(&args.output) {
             Ok((path, lib)) => {
-                options.previous = previous_rows(&lib);
+                let prev = previous_rows(&lib)
+                    .and_then(|rows| previous_primitives(&args.output).map(|(s, f)| (rows, s, f)));
+                match prev {
+                    Ok((rows, syms, fps)) => {
+                        options.previous = rows;
+                        options.previous_symbols = syms;
+                        options.previous_footprints = fps;
+                    }
+                    Err(e) => return write_report(args, &doc, Some(e), Vec::new()),
+                }
                 existing = Some((path, lib.manifest.library_id));
             }
             Err(e) => return write_report(args, &doc, Some(e), Vec::new()),
@@ -287,12 +337,26 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
             let summary = write_report(args, &doc, None, written);
             if summary.error.is_none() {
                 guard.commit();
+                summary
+            } else {
+                let mut msg = summary.error.unwrap_or_default();
+                for left in guard.rollback(&dir) {
+                    msg.push_str("; ");
+                    msg.push_str(&left);
+                }
+                LibrarySummary {
+                    error: Some(msg),
+                    ..summary
+                }
             }
-            summary
         }
         Err(e) => {
-            drop(guard);
-            write_report(args, &doc, Some(format!("{e:#}")), Vec::new())
+            let mut msg = format!("{e:#}");
+            for left in guard.rollback(&dir) {
+                msg.push_str("; ");
+                msg.push_str(&left);
+            }
+            write_report(args, &doc, Some(msg), Vec::new())
         }
     }
 }

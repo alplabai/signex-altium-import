@@ -34,6 +34,13 @@ impl Container {
         Ok(Self { path, cfb })
     }
 
+    /// The root entry's modified time, when the file records one after the
+    /// Unix epoch (a zero time reads as 1601 and counts as none).
+    pub fn modified(&self) -> Option<std::time::SystemTime> {
+        let t = self.cfb.root_entry().modified();
+        (t > std::time::UNIX_EPOCH).then_some(t)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

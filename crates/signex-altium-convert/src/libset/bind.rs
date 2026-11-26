@@ -16,22 +16,25 @@ use crate::report::Report;
 /// Footprints by name, case-insensitive, first one wins.
 #[derive(Default)]
 pub struct FootprintIndex {
-    by_name: HashMap<String, Uuid>,
+    by_name: HashMap<String, (Uuid, String)>,
 }
 
 impl FootprintIndex {
-    /// Add a footprint; `false` when the name is already taken.
-    pub fn insert(&mut self, name: &str, id: Uuid) -> bool {
+    /// Add a footprint defined at `source` (`<library>:<name>`); when the
+    /// name is taken, the source of the first definition.
+    pub fn insert(&mut self, name: &str, id: Uuid, source: &str) -> Result<(), String> {
         let key = name.trim().to_lowercase();
-        if self.by_name.contains_key(&key) {
-            return false;
+        if let Some((_, first)) = self.by_name.get(&key) {
+            return Err(first.clone());
         }
-        self.by_name.insert(key, id);
-        true
+        self.by_name.insert(key, (id, source.to_string()));
+        Ok(())
     }
 
     fn get(&self, name: &str) -> Option<Uuid> {
-        self.by_name.get(&name.trim().to_lowercase()).copied()
+        self.by_name
+            .get(&name.trim().to_lowercase())
+            .map(|(id, _)| *id)
     }
 }
 
@@ -45,12 +48,18 @@ pub struct Binding {
 }
 
 impl Binding {
-    pub fn alternate_bindings(&self, library: Uuid) -> Vec<FootprintBinding> {
+    /// The alternates as row bindings, each pinned to its footprint's
+    /// version (`versions`, by footprint id).
+    pub fn alternate_bindings(
+        &self,
+        library: Uuid,
+        versions: &HashMap<Uuid, String>,
+    ) -> Vec<FootprintBinding> {
         self.alternates
             .iter()
             .map(|(id, map)| FootprintBinding {
                 footprint: PrimitiveRef::new(library, *id),
-                version: String::new(),
+                version: versions.get(id).cloned().unwrap_or_default(),
                 pin_map_overrides: map.clone(),
             })
             .collect()
@@ -84,6 +93,17 @@ pub fn bind(comp: &Component, index: &FootprintIndex, report: &mut Report) -> Op
     }
     if pcb.is_empty() {
         return Some(Binding::default());
+    }
+    if let Some(i) = pcb.iter().find(|i| i.pin_map_unread) {
+        report.warn_detail(
+            "part.pin_map_unread",
+            format!(
+                "footprint {} has a pin map this reader cannot decode; part skipped rather than bound 1:1",
+                i.model_name
+            ),
+            json!({ "footprint": i.model_name }),
+        );
+        return None;
     }
     let current = pcb.iter().position(|i| i.is_current);
     if current.is_none() && pcb.len() > 1 {
@@ -144,6 +164,7 @@ mod tests {
                 .iter()
                 .map(|(a, b)| ((*a).into(), (*b).into()))
                 .collect(),
+            pin_map_unread: false,
         }
     }
 
@@ -151,7 +172,7 @@ mod tests {
         let ids = [Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)];
         let mut ix = FootprintIndex::default();
         for (n, id) in ["A", "B", "C"].iter().zip(ids) {
-            assert!(ix.insert(n, id));
+            assert!(ix.insert(n, id, n).is_ok());
         }
         (ix, ids)
     }
@@ -226,6 +247,17 @@ mod tests {
             b.alternates,
             vec![(ids[1], vec![PinPadOverride::new("1", "2")])]
         );
+    }
+
+    #[test]
+    fn an_unread_pin_map_skips_the_part_instead_of_binding_1_to_1() {
+        let (ix, _) = index();
+        let mut r = Report::default();
+        let mut i = imp("A", true, &[]);
+        i.pin_map_unread = true;
+        assert_eq!(bind(&comp(vec![i]), &ix, &mut r), None);
+        assert_eq!(r.items()[0].code, "part.pin_map_unread");
+        assert_eq!(r.items()[0].severity, crate::report::Severity::Error);
     }
 
     #[test]

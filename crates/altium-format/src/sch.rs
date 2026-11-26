@@ -60,6 +60,8 @@ pub mod kind {
     pub const PARAMETER: i64 = 41;
     pub const IMPLEMENTATION_LIST: i64 = 44;
     pub const IMPLEMENTATION: i64 = 45;
+    pub const MAP_DEFINER_LIST: i64 = 46;
+    pub const MAP_DEFINER: i64 = 47;
 }
 
 /// Pin electrical type, as stored.
@@ -278,6 +280,24 @@ pub struct Implementation {
     /// not the same name. Never filled by the reader yet: no sample holds a
     /// pin map (`docs/FORMAT_NOTES.md`).
     pub pin_map: Vec<(String, String)>,
+    /// The model has a pin map this reader does not decode (a record 46 with
+    /// keys, or any record 47). The map must not be read as 1:1.
+    pub pin_map_unread: bool,
+}
+
+/// A map record 46 that says something: it has keys beyond its framing.
+fn map_list_has_content(p: &Params) -> bool {
+    p.iter().any(|(k, _)| {
+        ![
+            "RECORD",
+            "OwnerIndex",
+            "IndexInSheet",
+            "OwnerPartId",
+            "OwnerPartDisplayMode",
+        ]
+        .iter()
+        .any(|f| k.eq_ignore_ascii_case(f))
+    })
 }
 
 /// Body graphics, shared by symbols and sheets.
@@ -519,6 +539,8 @@ impl SchDoc {
         let mut sheet_slot: HashMap<usize, usize> = HashMap::new();
         // Implementation lists sit between a component and its models.
         let mut impl_list_owner: HashMap<usize, usize> = HashMap::new();
+        // Record index of a model or its map list -> (component, model).
+        let mut impl_at: HashMap<usize, (usize, usize)> = HashMap::new();
 
         for (index, frame) in records.iter().enumerate() {
             let p = match frame {
@@ -577,7 +599,23 @@ impl SchDoc {
                             model_type: p.string("ModelType"),
                             is_current: p.bool("IsCurrent"),
                             pin_map: Vec::new(),
+                            pin_map_unread: false,
                         });
+                        let at = doc.components[slot].implementations.len() - 1;
+                        impl_at.insert(index, (slot, at));
+                    }
+                }
+                kind::MAP_DEFINER_LIST => {
+                    if let Some((slot, at)) = owner.and_then(|o| impl_at.get(&o).copied()) {
+                        impl_at.insert(index, (slot, at));
+                        if map_list_has_content(p) {
+                            doc.components[slot].implementations[at].pin_map_unread = true;
+                        }
+                    }
+                }
+                kind::MAP_DEFINER => {
+                    if let Some((slot, at)) = owner.and_then(|o| impl_at.get(&o).copied()) {
+                        doc.components[slot].implementations[at].pin_map_unread = true;
                     }
                 }
                 kind::WIRE => doc.wires.push(points(p)),
@@ -628,8 +666,9 @@ impl SchDoc {
                     }
                 }
                 kind::SHEET => doc.setup = sheet_setup(p),
-                // Template link and model-map internals: metadata, not design.
-                39 | 46 | 47 | 48 => {}
+                // Template link and a model's trailing record: metadata, not
+                // design. Map records 46 and 47 are read above.
+                39 | 48 => {}
                 _ => match shape(rec, p) {
                     Some(shape) => match (owner_comp, owner) {
                         (Some(slot), _) => doc.components[slot].shapes.push((part, mode, shape)),
@@ -648,6 +687,8 @@ impl SchDoc {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SchLib {
     pub components: Vec<Component>,
+    /// The container's root-entry modified time, if it records one.
+    pub modified: Option<std::time::SystemTime>,
 }
 
 impl SchLib {
@@ -666,7 +707,10 @@ impl SchLib {
         let count = h.i64("CompCount").unwrap_or(0).max(0) as usize;
         let section_keys = section_keys(c)?;
         let storages = c.root_storages();
-        let mut lib = SchLib::default();
+        let mut lib = SchLib {
+            modified: c.modified(),
+            ..SchLib::default()
+        };
         for i in 0..count {
             let libref = h.string(&format!("LibRef{i}"));
             let storage = section_keys
@@ -750,7 +794,20 @@ pub fn parse_symbol_stream(data: &[u8]) -> Result<Component> {
                             model_type: p.string("ModelType"),
                             is_current: p.bool("IsCurrent"),
                             pin_map: Vec::new(),
+                            pin_map_unread: false,
                         })
+                    }
+                    kind::MAP_DEFINER_LIST if in_impl_list => {
+                        if map_list_has_content(&p)
+                            && let Some(i) = c.implementations.last_mut()
+                        {
+                            i.pin_map_unread = true;
+                        }
+                    }
+                    kind::MAP_DEFINER if in_impl_list => {
+                        if let Some(i) = c.implementations.last_mut() {
+                            i.pin_map_unread = true;
+                        }
                     }
                     _ => {
                         if let Some(s) = shape(rec, &p) {

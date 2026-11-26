@@ -222,7 +222,10 @@ fn schlib_of(comps: Vec<Component>) -> SourceLib {
     SourceLib {
         path: "/in/parts.SchLib".into(),
         name: "parts".into(),
-        body: SourceBody::Sch(SchLib { components: comps }),
+        body: SourceBody::Sch(SchLib {
+            components: comps,
+            ..Default::default()
+        }),
     }
 }
 
@@ -248,7 +251,14 @@ fn prefixes_pick_template_classes_and_repeated_names_get_suffixes() {
     self_check(&b);
     let lib = snxlib(&b);
     let keys: Vec<&String> = lib.tables.keys().collect();
-    assert_eq!(keys, ["capacitor", "generic", "inductor", "resistor"]);
+    assert_eq!(keys, ["capacitor", "diode", "inductor", "resistor"]);
+    let labels: Vec<&str> = lib
+        .manifest
+        .classes
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+    assert_eq!(labels, ["Capacitor", "Diode", "Inductor", "Resistor"]);
     let pns: Vec<String> = lib.tables["resistor"]
         .rows
         .iter()
@@ -312,6 +322,7 @@ fn imp(name: &str, current: bool, map: &[(&str, &str)]) -> Implementation {
             .iter()
             .map(|(a, b)| ((*a).into(), (*b).into()))
             .collect(),
+        pin_map_unread: false,
     }
 }
 
@@ -588,5 +599,188 @@ fn parameters_land_in_the_part_row() {
         r.items()
             .iter()
             .all(|i| i.code != "part.template_incomplete")
+    );
+}
+
+// --- versions, stamps, updates ---------------------------------------------
+
+fn previous_of(
+    b: &Built,
+) -> (
+    std::collections::HashMap<uuid::Uuid, signex_altium_convert::libset::PreviousRow>,
+    std::collections::HashMap<uuid::Uuid, signex_altium_convert::libset::PreviousPrimitive>,
+    std::collections::HashMap<uuid::Uuid, signex_altium_convert::libset::PreviousPrimitive>,
+) {
+    use signex_altium_convert::libset::{PreviousPrimitive, PreviousRow};
+    let lib = snxlib(b);
+    let mut rows = std::collections::HashMap::new();
+    for t in lib.tables.values() {
+        for r in &t.rows {
+            let c = |n: &str| t.cell(r, n).unwrap().to_string();
+            let time = |n: &str| {
+                chrono::DateTime::parse_from_rfc3339(&c(n))
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            };
+            let mut hash = [0u8; 32];
+            for (i, h) in hash.iter_mut().enumerate() {
+                *h = u8::from_str_radix(&c("content_hash")[2 * i..2 * i + 2], 16).unwrap();
+            }
+            rows.insert(
+                uuid::Uuid::parse_str(&c("row_id")).unwrap(),
+                PreviousRow {
+                    state: signex_library::LifecycleState::Draft,
+                    released: false,
+                    created: time("created"),
+                    updated: time("updated"),
+                    version: c("version"),
+                    content_hash: hash,
+                    symbol_version: c("symbol_version"),
+                    footprint_version: c("footprint_version"),
+                },
+            );
+        }
+    }
+    let mut syms = std::collections::HashMap::new();
+    let mut fps = std::collections::HashMap::new();
+    for (path, text) in &b.files {
+        if path.starts_with("symbols/") {
+            for s in &SymbolFile::from_toml_str(text).unwrap().symbols {
+                syms.insert(s.uuid, PreviousPrimitive::of_symbol(s));
+            }
+        } else if path.starts_with("footprints/") {
+            for f in &FootprintFile::from_toml_str(text).unwrap().footprints {
+                fps.insert(f.uuid, PreviousPrimitive::of_footprint(f));
+            }
+        }
+    }
+    (rows, syms, fps)
+}
+
+fn versions(b: &Built) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let lib = snxlib(b);
+    let mut rows = Vec::new();
+    for t in lib.tables.values() {
+        for r in &t.rows {
+            rows.push(format!(
+                "{}|{}|{}",
+                t.cell(r, "version").unwrap(),
+                t.cell(r, "symbol_version").unwrap(),
+                t.cell(r, "footprint_version").unwrap()
+            ));
+        }
+    }
+    let mut syms = Vec::new();
+    let mut fps = Vec::new();
+    for (p, t) in &b.files {
+        if p.starts_with("symbols/") {
+            syms.extend(
+                SymbolFile::from_toml_str(t)
+                    .unwrap()
+                    .symbols
+                    .iter()
+                    .map(|s| s.version.clone()),
+            );
+        } else if p.starts_with("footprints/") {
+            fps.extend(
+                FootprintFile::from_toml_str(t)
+                    .unwrap()
+                    .footprints
+                    .iter()
+                    .map(|f| f.version.clone()),
+            );
+        }
+    }
+    (rows, syms, fps)
+}
+
+#[test]
+fn an_update_bumps_only_what_changed_and_carries_versions_into_the_row() {
+    let list = vec![imp("FP_A", true, &[]), imp("FP_B", false, &[])];
+    let sources = |pin: &str| {
+        let mut part = part_with(list.clone());
+        if let SourceBody::Sch(l) = &mut part.body {
+            l.components[0].pins[0].name = pin.into();
+        }
+        [pcblib_with(&["FP_A", "FP_B"]), part]
+    };
+    let (first, _) = convert(&sources("IN"));
+    let (rows, syms, fps) = previous_of(&first);
+
+    // Unchanged source: nothing moves, byte for byte.
+    let mut o = LibraryOptions::fresh("Test");
+    (o.previous, o.previous_symbols, o.previous_footprints) =
+        (rows.clone(), syms.clone(), fps.clone());
+    o.now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let mut r = Report::default();
+    let same = build_library(&sources("IN"), &o, &mut r, &mut |_, _, _| {}).unwrap();
+    assert_eq!(same.files, first.files);
+
+    // The symbol changes: its version, the row's symbol_version and the row
+    // version rise; footprints stay.
+    let mut r = Report::default();
+    let changed = build_library(&sources("OUT"), &o, &mut r, &mut |_, _, _| {}).unwrap();
+    let (rows_v, syms_v, fps_v) = versions(&changed);
+    assert_eq!(syms_v, ["1.0.1"]);
+    assert_eq!(rows_v, ["1.0.1|1.0.1|1.0.0"]);
+    assert!(fps_v.iter().all(|v| v == "1.0.0"));
+    // The alternate footprint is bound at its footprint's version.
+    let lib = snxlib(&changed);
+    let t = lib.tables.values().next().unwrap();
+    let (_, alts) = decode_footprint_cell(t.cell(&t.rows[0], "footprint_ref").unwrap()).unwrap();
+    assert_eq!(alts[0].version, "1.0.0");
+}
+
+#[test]
+fn stamps_come_from_the_sources_never_the_clock() {
+    let mut lib = sch("simple.SchLib");
+    let t = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123);
+    if let SourceBody::Sch(l) = &mut lib.body {
+        l.modified = Some(t);
+    }
+    let (b, _) = convert(&[lib]);
+    let text = b
+        .files
+        .iter()
+        .find(|(p, _)| p.ends_with(".snxlib"))
+        .unwrap()
+        .1
+        .clone();
+    assert!(text.contains("2023-11-14T22:13:20+00:00"), "{text}");
+    // No recorded time falls back to the epoch.
+    let mut none = sch("simple.SchLib");
+    if let SourceBody::Sch(l) = &mut none.body {
+        l.modified = None;
+    }
+    let (b, _) = convert(&[none]);
+    let text = b
+        .files
+        .iter()
+        .find(|(p, _)| p.ends_with(".snxlib"))
+        .unwrap()
+        .1
+        .clone();
+    assert!(text.contains("1970-01-01T00:00:00+00:00"));
+}
+
+#[test]
+fn a_footprint_name_defined_twice_is_approximated_and_names_both_sources() {
+    let mut a = pcblib_with(&["Same"]);
+    a.path = "/in/a.PcbLib".into();
+    a.name = "a".into();
+    let mut b = pcblib_with(&["Same"]);
+    b.path = "/in/b.PcbLib".into();
+    b.name = "b".into();
+    let (_, r) = convert(&[a, b]);
+    let i = r
+        .items()
+        .iter()
+        .find(|i| i.code == "footprint.name_collision")
+        .unwrap();
+    assert_eq!(i.severity, Severity::Approximated);
+    assert!(
+        i.message.contains("b:Same") && i.message.contains("a:Same"),
+        "{}",
+        i.message
     );
 }
