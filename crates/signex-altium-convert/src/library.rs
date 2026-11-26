@@ -97,11 +97,11 @@ fn pin(p: &APin, report: &mut Report) -> SymbolPin {
         Electrical::Input => PinDirection::Input,
         Electrical::InputOutput => PinDirection::Bidirectional,
         Electrical::Output => PinDirection::Output,
-        Electrical::OpenCollector => PinDirection::OpenCollector,
+        Electrical::OpenCollector => PinDirection::OpenDrainLow,
         Electrical::Passive => PinDirection::Passive,
-        Electrical::HiZ => PinDirection::Tristate,
-        Electrical::OpenEmitter => PinDirection::OpenEmitter,
-        Electrical::Power => PinDirection::Power,
+        Electrical::HiZ => PinDirection::ThreeStatable,
+        Electrical::OpenEmitter => PinDirection::OpenDrainHigh,
+        Electrical::Power => PinDirection::PowerInput,
     };
     // Signex: position at the electrical end, orientation toward the body.
     pin.position = xy(p.hot_end());
@@ -157,6 +157,7 @@ fn line(a: Pt, b: Pt) -> SymbolGraphicKind {
 
 fn graphics(shape: &Shape, part_number: u8, report: &mut Report) -> Vec<SymbolGraphic> {
     let g = |kind, width: f64, filled: bool| SymbolGraphic {
+        body_style: 1,
         kind,
         stroke_width: mm(width),
         fill: filled.then_some(BODY_FILL),
@@ -373,6 +374,7 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
             continue;
         }
         let g = FpGraphic {
+            sketch_entity: None,
             kind: FpGraphicKind::Line {
                 from: fxy(t.a),
                 to: fxy(t.b),
@@ -403,6 +405,7 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
             }
         };
         let g = FpGraphic {
+            sketch_entity: None,
             kind,
             stroke_width: mm(a.width),
             filled: false,
@@ -414,6 +417,7 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
             continue;
         }
         let g = FpGraphic {
+            sketch_entity: None,
             kind: FpGraphicKind::Text {
                 position: fxy(t.position),
                 content: t.text.clone(),

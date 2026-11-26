@@ -44,6 +44,11 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
     let names = LayerNames::for_doc(doc)?;
     let copper = names.copper_tokens();
     let mut board = PcbBoard {
+        free: Default::default(),
+        options: Default::default(),
+        rooms: Vec::new(),
+        sketch: None,
+        stackup: None,
         uuid: Uuid::new_v4(),
         version: 1,
         generator: crate::GENERATOR.into(),
@@ -57,6 +62,7 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             .iter()
             .enumerate()
             .map(|(i, (token, plane))| LayerDef {
+                display_name: String::new(),
                 id: i as u8,
                 name: token.clone(),
                 layer_type: if *plane { "plane" } else { "signal" }.into(),
@@ -167,6 +173,9 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             });
         } else {
             board.graphics.push(BoardGraphic {
+                uuid: Uuid::new_v4(),
+                text: String::new(),
+                font_size: 0.0,
                 graphic_type: "line".into(),
                 layer,
                 width: mm(t.width),
@@ -244,6 +253,9 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             // around, so start and end swap.
             let (first, last) = if full { (s, e) } else { (e, s) };
             board.graphics.push(BoardGraphic {
+                uuid: Uuid::new_v4(),
+                text: String::new(),
+                font_size: 0.0,
                 graphic_type: kind.into(),
                 layer,
                 width: mm(a.width),
@@ -259,6 +271,9 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
     for v in &p.vias {
         let through = v.start_layer == Layer::TOP && v.end_layer == Layer::BOTTOM;
         board.vias.push(Via {
+            attributes: Default::default(),
+            layer_sizes: None,
+            locked: false,
             uuid: Uuid::new_v4(),
             position: frame.world(v.position),
             diameter: mm(v.diameter),
@@ -326,6 +341,9 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
                 .push(zone(doc, f.common.net, names.of(f.common.layer), pts));
         } else {
             board.graphics.push(BoardGraphic {
+                uuid: Uuid::new_v4(),
+                text: String::new(),
+                font_size: 0.0,
                 graphic_type: "poly".into(),
                 layer: names.of(f.common.layer),
                 width: 0.0,
@@ -548,6 +566,8 @@ fn pad_net(doc: &PcbDoc, n: Option<u16>) -> Option<PadNet> {
 
 fn segment(frame: &Frame, a: Pt, b: Pt, width: f64, layer: String, net: Option<u16>) -> Segment {
     Segment {
+        attributes: Default::default(),
+        locked: false,
         uuid: Uuid::new_v4(),
         start: frame.world(a),
         end: frame.world(b),
@@ -836,6 +856,10 @@ fn zone(doc: &PcbDoc, net: Option<u16>, layer: String, outline: Vec<Point>) -> Z
         .map(|n| (n.number, n.name))
         .unwrap_or_default();
     Zone {
+        min_island_area: 0.0,
+        remove_dead_islands: false,
+        shelved: false,
+        unfilled: false,
         uuid: Uuid::new_v4(),
         net,
         net_name,
@@ -932,6 +956,9 @@ fn footprint(index: u16, c: &apcb::Component, doc: &PcbDoc, frame: &Frame) -> Fo
     .map(|(k, v)| property(k, v))
     .collect();
     Footprint {
+        component: Default::default(),
+        library_ref: None,
+        schematic_link: None,
         uuid: Uuid::new_v4(),
         reference: designator,
         value: comment,
@@ -957,6 +984,9 @@ fn footprint(index: u16, c: &apcb::Component, doc: &PcbDoc, frame: &Frame) -> Fo
 
 fn free_pad_holder(pad: &apcb::Pad, frame: &Frame) -> Footprint {
     Footprint {
+        component: Default::default(),
+        library_ref: None,
+        schematic_link: None,
         uuid: Uuid::new_v4(),
         reference: String::new(),
         value: String::new(),
@@ -1043,6 +1073,11 @@ fn convert_pad(
         },
     });
     Pad {
+        custom_outline: Vec::new(),
+        layer_sizes: None,
+        net_locked: false,
+        rotation: 0.0,
+        trapezoid_delta: Point::new(0.0, 0.0),
         uuid: Uuid::new_v4(),
         number: pad.name.clone(),
         pad_type,

@@ -384,6 +384,21 @@ fn convert_project(
         libraries: Vec::new(),
         enable_git: false,
         unknown: Default::default(),
+        document_id: None,
+        description: None,
+        variant_settings: Default::default(),
+        net_classes: Vec::new(),
+        rules: None,
+        annotation: None,
+        parameters: Default::default(),
+        schematic_defaults: Default::default(),
+        project_defaults: Default::default(),
+        agent_journal: Default::default(),
+        schematic_design: Default::default(),
+        fab_outputs: None,
+        requirements: Vec::new(),
+        bom_alternates: Default::default(),
+        router_tool_diameter: None,
     };
     let path = out.dir.join(&project_name);
     signex_types::project::write_project(&path, &data)

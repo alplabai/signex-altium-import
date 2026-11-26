@@ -70,8 +70,9 @@ crates/
   signex-altium-convert/  mapping onto signex-types, with a loss report
   cli/                    the signex-altium-import binary
   signex-types/           vendored from alplabai/signex
-  signex-sketch/          (scripts/sync-signex-crates.sh; the last two
-  signex-library/          trimmed to their file formats)
+  signex-expr/            (scripts/sync-signex-crates.sh; the last three
+  signex-sketch/           trimmed to their file formats)
+  signex-library/
 tests/samples/            Altium sample files (see tests/samples/NOTICE.md)
 docs/                     format notes, conversion rules, app contract
 ```
@@ -89,8 +90,8 @@ for c in &doc.components {
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --exclude signex-library --exclude signex-sketch --all-targets -- -D warnings
-cargo test --workspace --exclude signex-library --exclude signex-sketch
+cargo clippy --workspace --exclude signex-library --exclude signex-sketch --exclude signex-expr --all-targets -- -D warnings
+cargo test --workspace --exclude signex-library --exclude signex-sketch --exclude signex-expr
 cargo run -p altium-format --example dump -- file.SchDoc [stream] [sch|pcbbin|pcbtext|hex]
 ```
 

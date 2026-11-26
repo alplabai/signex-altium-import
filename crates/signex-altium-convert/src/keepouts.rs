@@ -106,6 +106,10 @@ fn zones_on(layers: &[String], outline: &[Point]) -> Vec<Zone> {
 
 fn keepout_zone(layer: String, outline: Vec<Point>) -> Zone {
     Zone {
+        min_island_area: 0.0,
+        remove_dead_islands: false,
+        shelved: false,
+        unfilled: false,
         uuid: Uuid::new_v4(),
         net: 0,
         net_name: String::new(),

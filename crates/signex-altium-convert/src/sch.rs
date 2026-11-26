@@ -12,7 +12,7 @@ use altium_format::sch::{
 };
 use signex_types::schematic::{
     Bus, BusEntry, ChildSheet, FillType, Graphic, HAlign, Junction, Label, LabelType, LibGraphic,
-    LibPin, LibSymbol, NoConnect, Pin, PinDirection, PinShapeStyle, Point, SchDrawing,
+    LibPin, LibSymbol, NoErcDirective, Pin, PinDirection, PinShapeStyle, Point, SchDrawing,
     SchematicSheet, SheetPin, Symbol, TextNote, TextProp, VAlign, Wire,
 };
 use uuid::Uuid;
@@ -62,7 +62,7 @@ pub fn convert(doc: &SchDoc, opts: &SchOptions, report: &mut Report) -> Schemati
     for pp in doc.power_ports.iter().filter(|p| !p.cross_sheet) {
         sheet.symbols.push(power_port(pp, &frame, &mut libs));
     }
-    sheet.lib_symbols = libs.symbols;
+    sheet.lib_symbols = libs.symbols.into_iter().collect();
 
     for run in &doc.wires {
         for seg in run.windows(2) {
@@ -77,6 +77,8 @@ pub fn convert(doc: &SchDoc, opts: &SchOptions, report: &mut Report) -> Schemati
     for run in &doc.buses {
         for seg in run.windows(2) {
             sheet.buses.push(Bus {
+                color: None,
+                stroke_width: 0.0,
                 uuid: Uuid::new_v4(),
                 start: frame.world(seg[0]),
                 end: frame.world(seg[1]),
@@ -93,6 +95,7 @@ pub fn convert(doc: &SchDoc, opts: &SchOptions, report: &mut Report) -> Schemati
     }
     for j in &doc.junctions {
         sheet.junctions.push(Junction {
+            unknown: Default::default(),
             uuid: Uuid::new_v4(),
             position: frame.world(*j),
             diameter: 0.0,
@@ -107,6 +110,8 @@ pub fn convert(doc: &SchDoc, opts: &SchOptions, report: &mut Report) -> Schemati
     }
     for pp in doc.power_ports.iter().filter(|p| p.cross_sheet) {
         sheet.labels.push(Label {
+            font_family: None,
+            locked: false,
             uuid: Uuid::new_v4(),
             text: pp.text.clone(),
             position: frame.world(pp.location),
@@ -126,10 +131,9 @@ pub fn convert(doc: &SchDoc, opts: &SchOptions, report: &mut Report) -> Schemati
             .push(port_label(port, opts.port_scope, &endpoints, &frame));
     }
     for p in &doc.no_ercs {
-        sheet.no_erc_directives.push(NoConnect {
-            uuid: Uuid::new_v4(),
-            position: frame.world(*p),
-        });
+        sheet
+            .no_erc_directives
+            .push(NoErcDirective::new(Uuid::new_v4(), frame.world(*p)));
     }
     for s in &doc.sheet_symbols {
         sheet.child_sheets.push(child_sheet(s, &frame, opts));
@@ -553,6 +557,7 @@ fn designator_prefix(designator: &str) -> String {
 fn text_prop(t: &Text, frame: &Frame, setup: &altium_format::sch::SheetSetup) -> TextProp {
     let (h, v) = justify(t.justification);
     TextProp {
+        font_family: None,
         position: frame.world(t.location),
         rotation: f64::from(t.orientation) * 90.0,
         font_size: setup.font_size(t.font_id) * MM_PER_PT,
@@ -871,6 +876,7 @@ fn power_port(pp: &PowerPort, frame: &Frame, libs: &mut LibTable) -> Symbol {
         is_power: true,
         in_bom: false,
         val_text: Some(TextProp {
+            font_family: None,
             position: Point::new(position.x, position.y - 2.54),
             rotation: 0.0,
             font_size: signex_types::schematic::SCHEMATIC_TEXT_MM,
@@ -926,6 +932,8 @@ fn port_label(port: &Port, scope: PortScope, endpoints: &[Pt], frame: &Frame) ->
         (true, true) => (far, 90.0),
     };
     Label {
+        font_family: None,
+        locked: false,
         uuid: Uuid::new_v4(),
         text: port.name.clone(),
         position: frame.world(position),
@@ -951,6 +959,8 @@ fn label(
 ) -> Label {
     let (h, v) = justify(t.justification);
     Label {
+        font_family: None,
+        locked: false,
         uuid: Uuid::new_v4(),
         text: t.text.clone(),
         position: frame.world(t.location),
@@ -1048,6 +1058,7 @@ fn sheet_shape(
     let id = Uuid::new_v4;
     let drawing = match shape {
         Shape::Line { a, b, width } => SchDrawing::Line {
+            locked: false,
             uuid: id(),
             start: w(*a),
             end: w(*b),
@@ -1062,6 +1073,7 @@ fn sheet_shape(
                 );
             }
             SchDrawing::Polyline {
+                locked: false,
                 uuid: id(),
                 points: poly(points),
                 width: mm(*width),
@@ -1074,6 +1086,7 @@ fn sheet_shape(
             width,
             filled,
         } => SchDrawing::Polyline {
+            locked: false,
             uuid: id(),
             points: poly(&closed(points.clone())),
             width: mm(*width),
@@ -1093,6 +1106,7 @@ fn sheet_shape(
             filled,
             ..
         } => SchDrawing::Rect {
+            locked: false,
             uuid: id(),
             start: w(*a),
             end: w(*b),
@@ -1109,6 +1123,7 @@ fn sheet_shape(
         } => {
             if is_full_circle(*start, *end) {
                 SchDrawing::Circle {
+                    locked: false,
                     uuid: id(),
                     center: w(*center),
                     radius: mm(*radius),
@@ -1119,6 +1134,7 @@ fn sheet_shape(
             } else {
                 let (s, m, e) = arc_points(*center, *radius, *start, *end);
                 SchDrawing::Arc {
+                    locked: false,
                     uuid: id(),
                     start: w(s),
                     mid: w(m),
@@ -1138,6 +1154,7 @@ fn sheet_shape(
         } => {
             if (rx - ry).abs() < 1e-6 {
                 SchDrawing::Circle {
+                    locked: false,
                     uuid: id(),
                     center: w(*center),
                     radius: mm(*rx),
@@ -1147,6 +1164,7 @@ fn sheet_shape(
                 }
             } else {
                 SchDrawing::Polyline {
+                    locked: false,
                     uuid: id(),
                     points: poly(&ellipse_points(*center, *rx, *ry)),
                     width: mm(*width),
@@ -1158,6 +1176,8 @@ fn sheet_shape(
         Shape::Label(t) => {
             let (h, v) = justify(t.justification);
             sheet.text_notes.push(TextNote {
+                font_family: None,
+                locked: false,
                 uuid: id(),
                 text: params.resolve(&t.text, &[]),
                 position: w(t.location),
@@ -1171,6 +1191,8 @@ fn sheet_shape(
         Shape::TextFrame { a, b, text, .. } => {
             let top_left = Pt::new(a.x.min(b.x), a.y.max(b.y));
             sheet.text_notes.push(TextNote {
+                font_family: None,
+                locked: false,
                 uuid: id(),
                 text: text.clone(),
                 position: w(top_left),
