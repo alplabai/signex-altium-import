@@ -99,6 +99,13 @@ fn dry_run_streams_valid_events_and_writes_only_the_report() {
     }
 }
 
+/// `f` has a directory named `dir` among its components.
+fn in_dir(f: &str, dir: &str) -> bool {
+    let p = std::path::Path::new(f);
+    p.parent()
+        .is_some_and(|parent| parent.components().any(|c| c.as_os_str() == dir))
+}
+
 fn library_run(dir: &std::path::Path, extra: &[&str]) -> (std::process::Output, Value) {
     let (sch, pcb) = (sample("simple.SchLib"), sample("Simple.PcbLib"));
     let mut args = vec![
@@ -165,12 +172,12 @@ fn a_real_run_writes_a_library_report_and_summary() {
     assert!(
         files
             .iter()
-            .any(|f| f.contains("/symbols/") && f.ends_with(".snxsym"))
+            .any(|f| in_dir(f, "symbols") && f.ends_with(".snxsym"))
     );
     assert!(
         files
             .iter()
-            .any(|f| f.contains("/footprints/") && f.ends_with(".snxfpt"))
+            .any(|f| in_dir(f, "footprints") && f.ends_with(".snxfpt"))
     );
     for f in &files {
         assert!(
