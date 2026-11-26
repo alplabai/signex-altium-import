@@ -77,6 +77,7 @@ pub const CODES: &[(&str, Severity)] = &[
     // Library runs (`signex-altium-import library`).
     ("library.input_unreadable", E),
     ("library.crossref_mismatch", I),
+    ("library.kept_referenced", I),
 ];
 
 /// The severity of a catalogued code. An uncatalogued code is a bug in the

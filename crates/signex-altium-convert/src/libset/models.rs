@@ -124,6 +124,21 @@ pub fn resolve(
         report.push(item(code, Severity::Error, source, msg));
         None
     };
+    // A body that does not say its model is embedded names a model kept
+    // outside the file (observed in a private corpus: integrated libraries
+    // whose bodies name 3D models stored nowhere in the file).
+    if !body
+        .params
+        .string("MODEL.EMBED")
+        .eq_ignore_ascii_case("TRUE")
+        && find(lib, &id).is_none()
+    {
+        return fail(
+            "model.external",
+            format!("model {name} is not stored in the library"),
+            report,
+        );
+    }
     let Some(m) = find(lib, &id) else {
         return fail(
             "model.missing",
@@ -152,15 +167,19 @@ pub fn resolve(
     let deg = |key: &str| body.params.f64(key).unwrap_or(0.0);
     let rot2d = deg("MODEL.2D.ROTATION");
     let bottom = body.params.i64("BODYPROJECTION").unwrap_or(0) == 1;
-    if rot2d != 0.0 || bottom {
+    let turned = ['X', 'Y', 'Z']
+        .iter()
+        .filter(|a| deg(&format!("MODEL.3D.ROT{a}")) != 0.0)
+        .count();
+    if rot2d != 0.0 || bottom || turned >= 2 {
         report.push(Item {
             kind: ItemKind::Model,
             source: source.to_string(),
             id: None,
             code: "model.placement_approximated",
             severity: Severity::Approximated,
-            message: "the model's 2D rotation is added to its z turn; a bottom-side projection is not applied".into(),
-            detail: json!({ "rotation_2d": rot2d, "bottom": bottom }),
+            message: "the turn order of several rotations is not verified, a 2D rotation is added to the z turn, and a bottom-side projection is not applied".into(),
+            detail: json!({ "rotation_2d": rot2d, "bottom": bottom, "axes_turned": turned }),
         });
     }
     let base = name.rsplit(['/', '\\']).next().unwrap_or(&name);

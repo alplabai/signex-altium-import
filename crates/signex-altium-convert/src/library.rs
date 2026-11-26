@@ -689,11 +689,13 @@ fn pad(p: &apcb::Pad, report: &mut Report) -> Pad {
             PadShape::Rect
         }
     };
-    // The footprint editor's own layer names for new pads.
+    // The named layer tokens of `LIBRARY_FORMAT.md` section 4.2, the sets
+    // the footprint editor writes; any other spelling is unplaceable.
     let layers = match kind {
-        PadKind::Tht | PadKind::NptHole => vec!["*.Cu", "F.Mask", "B.Mask"],
-        _ if bottom => vec!["B.Cu", "B.Mask", "B.Paste"],
-        _ => vec!["F.Cu", "F.Mask", "F.Paste"],
+        PadKind::Tht => vec!["Top Layer", "Bottom Layer", "Top Solder", "Bottom Solder"],
+        PadKind::NptHole => vec!["Top Solder", "Bottom Solder"],
+        _ if bottom => vec!["Bottom Layer", "Bottom Solder", "Bottom Paste"],
+        _ => vec!["Top Layer", "Top Solder", "Top Paste"],
     };
     let drill = drilled.then(|| Drill {
         diameter: mm(p.hole),

@@ -70,6 +70,26 @@ fn snxlib(b: &Built) -> LibraryFile {
     LibraryFile::parse(text).expect("library parses")
 }
 
+/// The board conversion must hold every pad of the footprint: the layer
+/// tokens must be ones it knows. Slotted pads are the one exception (signex
+/// #3128), and they are reported by the converter.
+fn placeable(fp: &signex_library::primitive::Footprint) {
+    let drawn = signex_library::drawn_board_footprint(fp);
+    for i in drawn.unheld_pads {
+        assert!(
+            fp.pads[i]
+                .drill
+                .as_ref()
+                .is_some_and(|d| d.slot_length.is_some()),
+            "pad {} of {} cannot be placed: layers {:?}",
+            fp.pads[i].number,
+            fp.name,
+            fp.pads[i].layers
+        );
+    }
+    assert_eq!(fp.anchor, [0.0, 0.0], "{}", fp.name);
+}
+
 /// Every reference in the library resolves, part numbers are unique, every
 /// structured cell decodes.
 fn self_check(b: &Built) {
@@ -85,6 +105,7 @@ fn self_check(b: &Built) {
             let f = FootprintFile::from_toml_str(text).unwrap();
             assert_eq!(f.footprints.len(), 1, "one footprint per file");
             assert_eq!(format!("{}.snxfpt", f.footprints[0].uuid), id);
+            placeable(&f.footprints[0]);
             footprints.insert(f.footprints[0].uuid.to_string());
         }
     }
