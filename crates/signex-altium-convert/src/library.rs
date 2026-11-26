@@ -90,19 +90,51 @@ fn symbol(c: &Component, report: &mut Report) -> Symbol {
     }
     s.schematic_params = params;
 
-    let in_mode = |m: i32| m == c.display_mode;
-    s.pins = c
-        .pins
-        .iter()
-        .filter(|p| in_mode(p.display_mode))
-        .map(|p| pin(p, report))
-        .collect();
+    // Display modes become body styles: mode 0 is the normal body, mode 1
+    // the alternate (De Morgan) body, an item for no particular mode (-1)
+    // belongs to both. Further modes have no Signex body.
+    for p in &c.pins {
+        match body_style(p.display_mode) {
+            Some(style) => {
+                let mut sp = pin(p, report);
+                sp.body_style = style;
+                s.pins.push(sp);
+            }
+            None => dropped_mode(p.display_mode, "pin", report),
+        }
+    }
     for (part, mode, shape) in &c.shapes {
-        if in_mode(*mode) {
-            s.graphics.extend(graphics(shape, part_of(*part), report));
+        match body_style(*mode) {
+            Some(style) => {
+                let mut gs = graphics(shape, part_of(*part), report);
+                for g in &mut gs {
+                    g.body_style = style;
+                }
+                s.graphics.extend(gs);
+            }
+            None => dropped_mode(*mode, "graphic", report),
         }
     }
     s
+}
+
+/// The Signex body style of an Altium display mode; `None` for a mode
+/// Signex has no body for.
+fn body_style(mode: i32) -> Option<u8> {
+    match mode {
+        m if m < 0 => Some(0),
+        0 => Some(1),
+        1 => Some(2),
+        _ => None,
+    }
+}
+
+fn dropped_mode(mode: i32, what: &str, report: &mut Report) {
+    report.warn_detail(
+        "symbol.display_mode_dropped",
+        format!("{what} of display mode {mode} not imported: Signex has two bodies"),
+        serde_json::json!({ "display_mode": mode }),
+    );
 }
 
 /// Altium part -1 / 0 (every part) -> Signex unit 0 (shared).
@@ -140,8 +172,26 @@ fn pin(p: &APin, report: &mut Report) -> SymbolPin {
     pin.name_visible = p.show_name;
     pin.designator_visible = p.show_designator;
     pin.part_number = part_of(p.owner_part_id);
-    pin.inside_edge_symbol = edge_symbol(p.symbols.inner_edge, report);
-    pin.outside_edge_symbol = edge_symbol(p.symbols.outer_edge, report);
+    // Schematic placement reads only the outside-edge column, so the dot
+    // (outer) and the clock (inner) both land there. A pin with both keeps
+    // the dot and loses the clock.
+    let inner = edge_symbol(p.symbols.inner_edge, report);
+    let outer = edge_symbol(p.symbols.outer_edge, report);
+    pin.outside_edge_symbol = if outer != PinSymbolKind::None {
+        outer
+    } else {
+        inner
+    };
+    if inner != PinSymbolKind::None && outer != PinSymbolKind::None {
+        report.warn_detail(
+            "symbol.pin_decoration_merged",
+            format!(
+                "pin {} has an inner and an outer edge symbol; only the outer is kept",
+                p.designator
+            ),
+            serde_json::json!({ "pin": p.designator }),
+        );
+    }
     for code in [p.symbols.inside, p.symbols.outside] {
         if code != 0 {
             report.warn_detail(
