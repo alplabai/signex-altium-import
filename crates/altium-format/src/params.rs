@@ -16,14 +16,33 @@ pub fn decode_ansi(bytes: &[u8]) -> String {
     text.into_owned()
 }
 
+/// The byte that stands for `|` inside a record value, where a raw `|`
+/// would end the field (`docs/FORMAT_NOTES.md`).
+const PIPE_ANSI: u8 = 0x8E;
+/// The character the `%UTF8%` form of a value uses for the same `|`.
+const PIPE_UTF8: char = '\u{A6}';
+
+/// Decode one ANSI record value, `0x8E` standing for `|`.
+fn decode_value(bytes: &[u8]) -> String {
+    bytes
+        .split(|&b| b == PIPE_ANSI)
+        .map(decode_ansi)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 impl Params {
     /// Parse a raw payload. Trailing NULs are ignored. A `%UTF8%KEY` entry
-    /// carries the UTF-8 form of `KEY` and replaces the ANSI value.
+    /// carries the UTF-8 form of `KEY` and replaces the ANSI value. In a
+    /// value, ANSI byte `0x8E` is a `|`; in the UTF-8 form `¦` is, when the
+    /// ANSI form escapes a `|` and holds no `¦` (`0xA6`) of its own.
     pub fn parse(raw: &[u8]) -> Self {
         let end = raw.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
         let raw = &raw[..end];
         let mut entries: Vec<(String, String)> = Vec::new();
         let mut utf8: Vec<(String, String)> = Vec::new();
+        // Per entry: its ANSI value escapes a `|` as `0x8E`.
+        let mut escapes: Vec<bool> = Vec::new();
         for field in raw.split(|&b| b == b'|') {
             if field.is_empty() {
                 continue;
@@ -39,15 +58,17 @@ impl Params {
                     String::from_utf8_lossy(v).into_owned(),
                 ));
             } else {
-                entries.push((key, decode_ansi(v)));
+                escapes.push(v.contains(&PIPE_ANSI) && !v.contains(&0xA6));
+                entries.push((key, decode_value(v)));
             }
         }
         for (k, v) in utf8 {
             match entries
-                .iter_mut()
-                .find(|(ek, _)| ek.eq_ignore_ascii_case(&k))
+                .iter()
+                .position(|(ek, _)| ek.eq_ignore_ascii_case(&k))
             {
-                Some(slot) => slot.1 = v,
+                Some(i) if escapes[i] => entries[i].1 = v.replace(PIPE_UTF8, "|"),
+                Some(i) => entries[i].1 = v,
                 None => entries.push((k, v)),
             }
         }
@@ -168,6 +189,25 @@ mod tests {
     fn utf8_variant_wins_over_ansi() {
         let p = Params::parse("|Text=?|%UTF8%Text=Ω|".as_bytes());
         assert_eq!(p.str("Text"), "Ω");
+    }
+
+    #[test]
+    fn escaped_pipe_in_a_value() {
+        // As in `simple.SchDoc`'s pin records: `SwapIDPart` is `|&|`.
+        let p = Params::parse(b"|%UTF8%SwapIDPart=\xc2\xa6&\xc2\xa6|SwapIDPart=\x8e&\x8e|");
+        assert_eq!(p.str("SwapIDPart"), "|&|");
+        let p = Params::parse(b"|Name=Netlist|Text=A\x8eB\x8eC|");
+        assert_eq!(p.str("Text"), "A|B|C");
+        assert_eq!(p.str("Name"), "Netlist");
+    }
+
+    #[test]
+    fn broken_bar_without_an_escape_is_kept() {
+        // A real `¦` is `0xA6` in the ANSI form; no `0x8E`, no rewrite.
+        let p = Params::parse(b"|%UTF8%Text=a\xc2\xa6b|Text=a\xa6b|");
+        assert_eq!(p.str("Text"), "a\u{A6}b");
+        let p = Params::parse("|%UTF8%Text=a¦b|".as_bytes());
+        assert_eq!(p.str("Text"), "a\u{A6}b");
     }
 
     #[test]
