@@ -85,7 +85,7 @@ mod tests {
     fn a_bomb_is_refused_by_ratio_and_by_budget() {
         let zeros = vec![0u8; 50 * 1024 * 1024];
         assert!(Budget::default().inflate_zlib("bomb", &z(&zeros)).is_err());
-        let data = vec![7u8, 1, 9, 3].repeat(200);
+        let data = [7u8, 1, 9, 3].repeat(200);
         let mut tiny = Budget::with_limit(100);
         assert!(tiny.inflate_zlib("x", &z(&data)).is_err());
     }
