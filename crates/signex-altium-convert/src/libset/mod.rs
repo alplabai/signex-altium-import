@@ -333,6 +333,27 @@ pub fn build_library(
         })
         .sum();
     let mut done = 0;
+    for s in sources {
+        let repaired = match &s.body {
+            SourceBody::Sch(l) => l.repaired,
+            SourceBody::Pcb(l) => l.repaired,
+            SourceBody::Database(_) => false,
+        };
+        if repaired {
+            report.push(Item {
+                kind: ItemKind::Library,
+                source: s.name.clone(),
+                id: None,
+                code: "library.difat_repaired",
+                severity: Severity::Info,
+                message: format!(
+                    "{} has stale entries in its sector table past the declared count; read with them freed",
+                    s.name
+                ),
+                detail: serde_json::Value::Null,
+            });
+        }
+    }
     // With a database, only the symbols and footprints its rows name are
     // written, and its rows (not the components) are the parts.
     let mut want_symbols: Option<std::collections::HashSet<(String, String)>> = None;

@@ -12,6 +12,7 @@ use crate::error::{Error, Result};
 pub struct Container {
     path: PathBuf,
     cfb: cfb::CompoundFile<std::io::Cursor<Vec<u8>>>,
+    repaired: bool,
 }
 
 impl Container {
@@ -25,26 +26,43 @@ impl Container {
     }
 
     pub fn from_bytes(path: PathBuf, bytes: Vec<u8>) -> Result<Self> {
-        let cfb = match cfb::CompoundFile::open(std::io::Cursor::new(bytes.clone())) {
-            Ok(c) => c,
-            Err(first) => {
-                // Some writers leave stale entries in the DIFAT beyond the
-                // declared FAT sector count (observed in a private corpus
-                // file); a reader must stop at the declared count.
-                match limit_difat(&bytes)
-                    .and_then(|fixed| cfb::CompoundFile::open(std::io::Cursor::new(fixed)).ok())
-                {
-                    Some(c) => c,
-                    None => {
-                        return Err(Error::NotCompound {
-                            path,
-                            source: first,
-                        });
+        // The happy path never copies the file: it is checked in place and
+        // then handed over. Some writers leave stale entries in the DIFAT
+        // beyond the declared FAT sector count (observed in a private corpus
+        // file); only then is a repaired copy made.
+        let first = cfb::CompoundFile::open(std::io::Cursor::new(bytes.as_slice())).err();
+        let (cfb, repaired) = match first {
+            None => (
+                cfb::CompoundFile::open(std::io::Cursor::new(bytes)).map_err(|source| {
+                    Error::NotCompound {
+                        path: path.clone(),
+                        source,
                     }
+                })?,
+                false,
+            ),
+            Some(first) => match limit_difat(&bytes)
+                .and_then(|fixed| cfb::CompoundFile::open(std::io::Cursor::new(fixed)).ok())
+            {
+                Some(c) => (c, true),
+                None => {
+                    return Err(Error::NotCompound {
+                        path,
+                        source: first,
+                    });
                 }
-            }
+            },
         };
-        Ok(Self { path, cfb })
+        Ok(Self {
+            path,
+            cfb,
+            repaired,
+        })
+    }
+
+    /// The file's DIFAT held stale entries and was read after freeing them.
+    pub fn repaired(&self) -> bool {
+        self.repaired
     }
 
     /// The root entry's modified time, when the file records one after the
@@ -158,9 +176,10 @@ fn limit_difat(bytes: &[u8]) -> Option<Vec<u8>> {
     // DIFAT sectors: `sector/4 - 1` entries each, then the next sector.
     let per = sector / 4 - 1;
     let mut next = rd(bytes, 0x44)?;
+    let difat_sectors = rd(bytes, 0x48)? as usize;
     let mut used = 109usize;
     let mut guard = 0;
-    while next < END && guard < 1_000_000 {
+    while next < END && guard < difat_sectors.min(1_000_000) {
         guard += 1;
         let base = 512usize.max(sector) + next as usize * sector;
         for j in 0..per {
@@ -179,6 +198,40 @@ fn limit_difat(bytes: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_entry_in_a_difat_extension_sector_is_freed() {
+        use std::io::Write;
+        // More than 109 FAT sectors need DIFAT extension sectors: an 8 MiB
+        // stream is 16384 sectors, so 128 FAT sectors.
+        let mut c = cfb::CompoundFile::create_with_version(
+            cfb::Version::V3,
+            std::io::Cursor::new(Vec::new()),
+        )
+        .unwrap();
+        c.create_stream("/big")
+            .unwrap()
+            .write_all(&vec![7u8; 8 << 20])
+            .unwrap();
+        c.flush().unwrap();
+        let mut bytes = c.into_inner().into_inner();
+        let declared = u32::from_le_bytes(bytes[0x2C..0x30].try_into().unwrap()) as usize;
+        let ext = u32::from_le_bytes(bytes[0x48..0x4C].try_into().unwrap());
+        assert!(
+            declared > 109 && ext >= 1,
+            "{declared} FAT sectors, {ext} DIFAT sectors"
+        );
+        let shift = u16::from_le_bytes(bytes[0x1E..0x20].try_into().unwrap());
+        let sector = 1usize << shift;
+        let first = u32::from_le_bytes(bytes[0x44..0x48].try_into().unwrap()) as usize;
+        let base = sector + first * sector;
+        // The entry just past the declared count, in the extension sector.
+        let at = base + (declared - 109) * 4;
+        bytes[at..at + 4].copy_from_slice(&5u32.to_le_bytes());
+        let fixed = limit_difat(&bytes).expect("a stale extension entry to free");
+        assert_eq!(&fixed[at..at + 4], &0xFFFF_FFFFu32.to_le_bytes());
+        assert!(cfb::CompoundFile::open(std::io::Cursor::new(fixed)).is_ok());
+    }
 
     #[test]
     fn a_stale_header_difat_entry_is_freed() {

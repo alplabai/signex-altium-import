@@ -217,7 +217,6 @@ pub fn prepare(
             ));
         }
         let targets = map_table(table, &data, input.user_map);
-        let mut data = data;
         mapping.tables.insert(
             table.name.clone(),
             data.columns
@@ -229,7 +228,9 @@ pub fn prepare(
         let key_col = targets.iter().position(|t| t == KEY);
         // A stable order that does not depend on the database's physical row
         // order (a compacted .mdb reorders rows): by key, then every cell.
-        data.rows.sort_by(|a, b| {
+        // Each row keeps its position in the database for its report label.
+        let mut ordered: Vec<(usize, &Vec<String>)> = data.rows.iter().enumerate().collect();
+        ordered.sort_by(|(_, a), (_, b)| {
             let k = |r: &Vec<String>| key_col.and_then(|i| r.get(i)).cloned().unwrap_or_default();
             k(a).cmp(&k(b)).then_with(|| a.cmp(b))
         });
@@ -252,7 +253,7 @@ pub fn prepare(
         }
         let mut sim_noted = false;
         let mut unknown_noted: HashSet<String> = HashSet::new();
-        for (ri, row) in data.rows.iter().enumerate() {
+        for (ri, row) in ordered {
             let cell = |i: usize| row.get(i).map_or("", |s| s.trim());
             let key = key_col.map_or("", cell).to_string();
             let label = if key.is_empty() {
@@ -351,11 +352,17 @@ pub fn prepare(
                 );
                 continue;
             };
+            let mut unreadable_why: Option<String> = None;
             let symbol = match open(&sym_file, &mut sources, &mut files) {
                 Ok((Some((idx, name)), _)) => {
                     let SourceBody::Sch(l) = &sources[idx].body else {
                         unreachable!()
                     };
+                    unreadable_why = l
+                        .unreadable
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&lib_ref))
+                        .map(|(_, why)| why.clone());
                     l.components
                         .iter()
                         .find(|c| c.lib_reference.eq_ignore_ascii_case(&lib_ref))
@@ -366,13 +373,22 @@ pub fn prepare(
                     skip(
                         &mut set,
                         report,
-                        "row.symbol_library_missing",
+                        "row.symbol_library_unreadable",
                         format!("symbol library {lib_path} unreadable: {e}; skipped"),
                     );
                     continue;
                 }
             };
             let Some(symbol) = symbol else {
+                if let Some(why) = unreadable_why {
+                    skip(
+                        &mut set,
+                        report,
+                        "part.symbol_unreadable",
+                        format!("symbol {lib_ref} in {lib_path} could not be read: {why}; skipped"),
+                    );
+                    continue;
+                }
                 skip(
                     &mut set,
                     report,
@@ -432,7 +448,7 @@ pub fn prepare(
                     }
                     Err(e) => {
                         failed = Some((
-                            "row.footprint_library_missing",
+                            "row.footprint_library_unreadable",
                             format!("footprint library {path} unreadable: {e}; skipped"),
                         ));
                         break;

@@ -113,7 +113,7 @@ fn the_fixture_produces_exactly_the_expected_report_entries() {
                 "row.footprint_missing".to_string(),
                 "Resistors:RES-NOALT".to_string()
             ),
-            ("row.key_missing".to_string(), "Resistors:row 1".to_string()),
+            ("row.key_missing".to_string(), "Resistors:row 6".to_string()),
             (
                 "row.symbol_missing".to_string(),
                 "Resistors:RES-NOSYM".to_string()
@@ -294,4 +294,31 @@ fn duplicate_keys_get_their_suffix_whatever_the_row_order() {
             .unwrap()
     };
     assert_eq!(lib(&a), lib(&b));
+}
+
+#[test]
+fn row_labels_point_at_the_position_in_the_database() {
+    let tmp = Tmp::new();
+    let root = setup(&tmp);
+    let out = tmp.0.join("out");
+    convert(&root, &out, &[]);
+    // The row with no key is the sixth data row of the CSV.
+    let r = report(&out);
+    assert!(
+        codes(&r, "row.key_missing")
+            .iter()
+            .any(|(_, s)| s == "Resistors:row 6")
+    );
+}
+
+#[test]
+fn a_library_that_exists_but_cannot_be_read_is_unreadable_not_missing() {
+    let tmp = Tmp::new();
+    let root = setup(&tmp);
+    std::fs::write(root.join("Libs/Passives.SchLib"), b"not a compound file").unwrap();
+    let out = tmp.0.join("out");
+    convert(&root, &out, &[]);
+    let r = report(&out);
+    assert!(!codes(&r, "row.symbol_library_unreadable").is_empty());
+    assert!(codes(&r, "row.symbol_library_missing").is_empty());
 }

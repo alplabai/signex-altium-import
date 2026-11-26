@@ -463,6 +463,8 @@ pub struct PcbLib {
     pub modified: Option<std::time::SystemTime>,
     /// The embedded model table (`Library/Models`), in stream order.
     pub models: Vec<LibModel>,
+    /// The container's DIFAT had to be repaired to be read.
+    pub repaired: bool,
 }
 
 /// One entry of a library's model table: its record in `Library/Models/Data`
@@ -538,6 +540,7 @@ impl PcbLib {
     ) -> Result<Self> {
         let mut lib = PcbLib {
             modified: c.modified(),
+            repaired: c.repaired(),
             ..PcbLib::default()
         };
         if let Some(data) = c.stream_opt("Library/Data")? {

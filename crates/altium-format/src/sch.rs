@@ -692,6 +692,8 @@ pub struct SchLib {
     pub modified: Option<std::time::SystemTime>,
     /// Components whose storage could not be read: (name, why).
     pub unreadable: Vec<(String, String)>,
+    /// The container's DIFAT had to be repaired to be read.
+    pub repaired: bool,
 }
 
 impl SchLib {
@@ -712,6 +714,7 @@ impl SchLib {
         let storages = c.root_storages();
         let mut lib = SchLib {
             modified: c.modified(),
+            repaired: c.repaired(),
             ..SchLib::default()
         };
         for i in 0..count {

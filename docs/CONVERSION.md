@@ -467,6 +467,7 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `row.footprint_library_unreadable` | error | A row's footprint library exists but could not be read; skipped |
 | `symbol.unreadable` | error | A component of a schematic library could not be read; not written |
 | `part.symbol_unreadable` | error | The part of a component that could not be read; not written |
+| `library.difat_repaired` | info | A library's compound file had stale sector-table entries past the declared count; read with them freed |
 | `library.input_unreadable` | error | An input file could not be read (library runs) |
 
-81 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.
+82 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.
