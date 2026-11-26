@@ -594,6 +594,16 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
         }
     }
     sanitize_footprint(&mut fp, report);
+    if fp
+        .pads
+        .iter()
+        .any(|p| p.drill.as_ref().is_some_and(|d| d.slot_length.is_some()))
+    {
+        report.warn(
+            "pad.slot_not_placeable",
+            "Signex cannot place this footprint on a board until slotted drills are supported (signex #3128); the footprint is written exactly",
+        );
+    }
     fp
 }
 

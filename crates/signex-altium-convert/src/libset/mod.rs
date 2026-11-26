@@ -239,6 +239,10 @@ pub struct Counts {
 pub struct Built {
     pub library_id: Uuid,
     pub files: Vec<(String, String)>,
+    /// The ids written, for the report's record of what this converter owns.
+    pub row_ids: Vec<Uuid>,
+    pub symbol_ids: Vec<Uuid>,
+    pub footprint_ids: Vec<Uuid>,
     pub source: Counts,
     pub written: Counts,
 }
@@ -316,6 +320,9 @@ pub fn build_library(
     let mut files: Vec<(String, String)> = Vec::new();
     let mut source = Counts::default();
     let mut written = Counts::default();
+    let mut row_ids: Vec<Uuid> = Vec::new();
+    let mut symbol_ids: Vec<Uuid> = Vec::new();
+    let mut footprint_ids: Vec<Uuid> = Vec::new();
 
     // Footprints first: parts bind to them by name.
     let mut index = FootprintIndex::default();
@@ -348,6 +355,7 @@ pub fn build_library(
                 );
                 report.set_scope("");
             }
+            let fp_uuid = fp.uuid;
             let file_id = ids::item_id(lib_id, "footprint-file", &fp.uuid.to_string());
             let rel = format!("footprints/{}.snxfpt", fp.uuid);
             let file = FootprintFile::with_identity(fp, file_id, stamp);
@@ -356,6 +364,7 @@ pub fn build_library(
                 .map_err(|e| BuildError::Library(e.to_string()))?;
             files.push((rel, text));
             written.footprints += 1;
+            footprint_ids.push(fp_uuid);
             done += 1;
             on_item(
                 done,
@@ -398,6 +407,7 @@ pub fn build_library(
         }
         let sym_versions: Vec<String> = symbols.iter().map(|s| s.version.clone()).collect();
         written.symbols += symbols.len();
+        symbol_ids.extend(symbols.iter().map(|s| s.uuid));
         if !symbols.is_empty() {
             let file_uuid = ids::item_id(lib_id, "symbol-file", &s.name);
             let mut rel = format!("symbols/{}.snxsym", slug(&s.name));
@@ -549,6 +559,7 @@ pub fn build_library(
                     classes.insert(class, classes::class_label(class));
                     rows.entry(class).or_default().push(cells);
                     written.parts += 1;
+                    row_ids.push(row_id);
                 }
                 Err(e) => report.push(error_item(
                     "part.row_invalid",
@@ -575,6 +586,9 @@ pub fn build_library(
     Ok(Built {
         library_id: lib_id,
         files,
+        row_ids,
+        symbol_ids,
+        footprint_ids,
         source,
         written,
     })

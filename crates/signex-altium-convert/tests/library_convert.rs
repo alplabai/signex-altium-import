@@ -248,3 +248,47 @@ fn hostile_pin_text_is_cleaned_and_the_file_still_round_trips() {
             .any(|i| i.code == "symbol.text_sanitized")
     );
 }
+
+#[test]
+fn a_slotted_pad_is_written_exactly_and_reported_once_per_footprint() {
+    let mut lib = PcbLib::open(sample("Simple.PcbLib")).unwrap();
+    let fp = lib
+        .footprints
+        .iter_mut()
+        .find(|f| f.name == "Four pads")
+        .unwrap();
+    for pad in fp.primitives.pads.iter_mut().take(2) {
+        pad.hole = 40.0;
+        pad.plated = true;
+        pad.hole_shape = altium_format::pcb::HoleShape::Slot;
+        pad.slot_length = 80.0;
+    }
+    let mut report = Report::default();
+    let file = footprint_file(&lib, "Simple", &mut report);
+    let back = FootprintFile::from_toml_str(&file.to_toml_string().unwrap()).unwrap();
+    let four = back
+        .footprints
+        .iter()
+        .find(|f| f.name == "Four pads")
+        .unwrap();
+    let slotted: Vec<_> = four
+        .pads
+        .iter()
+        .filter_map(|p| p.drill.clone())
+        .filter(|d| d.slot_length.is_some())
+        .collect();
+    assert_eq!(slotted.len(), 2);
+    assert!((slotted[0].diameter - 1.016).abs() < 1e-6);
+    assert!((slotted[0].slot_length.unwrap() - 2.032).abs() < 1e-6);
+    let items: Vec<_> = report
+        .items()
+        .iter()
+        .filter(|i| i.code == "pad.slot_not_placeable")
+        .collect();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].severity,
+        signex_altium_convert::report::Severity::Approximated
+    );
+    assert!(items[0].message.contains("#3128"));
+}

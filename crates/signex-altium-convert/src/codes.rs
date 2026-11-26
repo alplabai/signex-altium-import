@@ -27,6 +27,7 @@ pub const CODES: &[(&str, Severity)] = &[
     ("footprint.region_dropped", D),
     ("footprint.courtyard_open_bbox", A),
     ("footprint.pad_octagon_rect", A),
+    ("pad.slot_not_placeable", A),
     // Boards.
     ("pcb.keepout_line_no_width", D),
     ("pcb.keepout_non_copper", D),

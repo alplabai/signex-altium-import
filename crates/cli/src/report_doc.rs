@@ -41,6 +41,9 @@ pub struct LibraryReport {
     pub source: Counts,
     pub written: Counts,
     pub report: Report,
+    /// What this run (or, for a run that wrote nothing, the previous one)
+    /// wrote: the record the next `--update` deletes by.
+    pub ledger: Option<crate::ledger::Ledger>,
 }
 
 impl LibraryReport {
@@ -52,6 +55,7 @@ impl LibraryReport {
             source: Counts::default(),
             written: Counts::default(),
             report: Report::default(),
+            ledger: None,
         }
     }
 
@@ -99,7 +103,7 @@ impl LibraryReport {
             .iter()
             .map(|s| json!({ "path": s.path, "sha256": s.sha256 }))
             .collect();
-        json!({
+        let mut v = json!({
             "contract": CONTRACT,
             "converter": CONVERTER,
             "converter_version": env!("CARGO_PKG_VERSION"),
@@ -108,7 +112,11 @@ impl LibraryReport {
             "library_id": self.library_id,
             "counts": { "source": self.source.to_json(), "written": self.written.to_json() },
             "items": items,
-        })
+        });
+        if let Some(l) = &self.ledger {
+            v["ledger"] = l.to_json();
+        }
+        v
     }
 
     pub fn to_markdown(&self) -> String {

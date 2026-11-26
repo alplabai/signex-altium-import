@@ -283,6 +283,7 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `footprint.region_dropped` | dropped | Region (custom pad shape) inside a library footprint not imported |
 | `footprint.courtyard_open_bbox` | approximated | Open courtyard outline replaced by its bounding box |
 | `footprint.pad_octagon_rect` | approximated | Octagonal library pad imported as a rectangle |
+| `pad.slot_not_placeable` | approximated | A footprint has a slotted drill. It is written exactly (slot length kept), but Signex cannot place it on a board until slotted drills are supported (signex #3128). Once per footprint. |
 | `pcb.keepout_line_no_width` | dropped | Keepout line or arc with no width not imported |
 | `pcb.keepout_non_copper` | dropped | Keepout on a non-copper layer not imported |
 | `pcb.footprint_keepout_moved` | approximated | Footprint keepout becomes a board keepout that does not move with the footprint |
@@ -318,4 +319,4 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `footprint.name_collision` | approximated | A footprint name is already defined; parts bind to the first |
 | `library.input_unreadable` | error | An input file could not be read (library runs) |
 
-53 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.
+54 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.

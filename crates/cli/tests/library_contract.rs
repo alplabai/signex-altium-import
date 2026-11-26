@@ -254,21 +254,135 @@ fn update_refuses_a_different_library_and_leaves_it_alone() {
     assert_eq!(before, after, "the library on disk is untouched");
 }
 
+const ID: &str = "5b0f3b0e-0000-4000-8000-0000000000aa";
+
+fn snxlib_path(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "snxlib"))
+        .unwrap()
+}
+
 #[test]
-fn update_removes_what_the_source_no_longer_has() {
+fn an_update_keeps_a_row_and_a_footprint_file_a_user_added() {
     let out = Tmp::new();
     let dir = out.0.join("lib");
-    library_run(&dir, &[]);
-    let stale = dir.join("footprints/00000000-0000-0000-0000-000000000000.snxfpt");
+    library_run(&dir, &["--library-id", ID]);
+    // A user adds a part row (a copy of ours under a new id and number) and a
+    // footprint file of their own.
+    let lib = snxlib_path(&dir);
+    let text = std::fs::read_to_string(&lib).unwrap();
+    let row = text
+        .lines()
+        .find(|l| l.len() > 40 && l.as_bytes()[8] == b'-' && l.split('\t').count() > 20)
+        .unwrap()
+        .to_string();
+    let cells: Vec<&str> = row.split('\t').collect();
+    let mut mine = cells.clone();
+    let user_id = "ffffffff-0000-4000-8000-000000000001";
+    mine[0] = user_id;
+    mine[1] = "USER-PART";
+    let user_row = mine.join("\t");
+    std::fs::write(&lib, text.replacen(&row, &format!("{row}\n{user_row}"), 1)).unwrap();
+    let fps = dir.join("footprints");
+    let real = std::fs::read_dir(&fps)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    let user_fp = fps.join("ffffffff-0000-4000-8000-000000000002.snxfpt");
+    std::fs::copy(&real, &user_fp).unwrap();
+    let user_fp_bytes = std::fs::read(&user_fp).unwrap();
+
+    let (_, s) = library_run(&dir, &["--update", "--library-id", ID]);
+    assert_eq!(s["ok"], true, "{s}");
+    let after = std::fs::read_to_string(snxlib_path(&dir)).unwrap();
+    assert!(
+        after.contains(user_id) && after.contains("USER-PART"),
+        "user row kept"
+    );
+    assert_eq!(
+        std::fs::read(&user_fp).unwrap(),
+        user_fp_bytes,
+        "user file untouched"
+    );
+    // Our own rows are still there once each.
+    assert_eq!(after.matches(cells[0]).count(), 1);
+    // The record names only what we wrote.
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("import-report.json")).unwrap()).unwrap();
+    assert!(!report["ledger"]["rows"].to_string().contains(user_id));
+    assert!(!report["ledger"]["files"].to_string().contains("ffffffff"));
+}
+
+fn run_with(
+    dir: &std::path::Path,
+    inputs: &[&str],
+    extra: &[&str],
+) -> (std::process::Output, Value) {
+    let paths: Vec<_> = inputs.iter().map(|i| sample(i)).collect();
+    let mut args: Vec<&OsStr> = vec![os("library")];
+    args.extend(paths.iter().map(|p| p.as_os_str()));
+    args.extend([
+        os("--output"),
+        dir.as_os_str(),
+        os("--json"),
+        os("--library-id"),
+        os(ID),
+    ]);
+    args.extend(extra.iter().map(|a| os(a)));
+    let o = run(&args);
+    let s = lines(&o.stdout).pop().expect("a summary");
+    (o, s)
+}
+
+#[test]
+fn an_update_deletes_what_left_the_source_but_only_by_a_valid_record() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib", "Simple.PcbLib"], &[]);
+    let count = || std::fs::read_dir(dir.join("footprints")).unwrap().count();
+    let with_fp = count();
+    assert!(with_fp > 0);
+
+    // A tampered record deletes nothing.
+    let rp = dir.join("import-report.json");
+    let mut report: Value = serde_json::from_slice(&std::fs::read(&rp).unwrap()).unwrap();
+    report["ledger"]["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(Value::String("../victim.snxlib".into()));
+    std::fs::write(&rp, report.to_string()).unwrap();
+    let victim = out.0.join("victim.snxlib");
+    std::fs::write(&victim, "keep").unwrap();
+    let (_, s) = run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(count(), with_fp, "no valid record, nothing deleted");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+}
+
+#[test]
+fn an_update_deletes_what_it_wrote_that_left_the_source() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib", "Simple.PcbLib"], &[]);
+    let count = || std::fs::read_dir(dir.join("footprints")).unwrap().count();
+    assert!(count() > 0);
+    let user = dir.join("footprints/ffffffff-0000-4000-8000-000000000002.snxfpt");
     let real = std::fs::read_dir(dir.join("footprints"))
         .unwrap()
         .flatten()
         .next()
         .unwrap()
         .path();
-    std::fs::copy(real, &stale).unwrap();
-    library_run(&dir, &["--update"]);
-    assert!(!stale.exists());
+    std::fs::copy(real, &user).unwrap();
+    let (_, s) = run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(count(), 1, "ours are gone, the user's stays");
+    assert!(user.exists());
 }
 
 #[test]

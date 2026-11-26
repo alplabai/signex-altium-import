@@ -60,7 +60,7 @@ impl ItemKind {
     fn of_code(code: &str) -> Self {
         match code.split('.').next() {
             Some("symbol") => ItemKind::Symbol,
-            Some("footprint") => ItemKind::Footprint,
+            Some("footprint" | "pad") => ItemKind::Footprint,
             Some("part") => ItemKind::Part,
             Some("model") => ItemKind::Model,
             _ => ItemKind::Library,

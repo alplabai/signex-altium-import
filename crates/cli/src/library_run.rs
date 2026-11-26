@@ -15,6 +15,7 @@ use signex_library::{FootprintFile, LibraryFile, LifecycleState};
 use uuid::Uuid;
 
 use crate::contract::{Counts, Exit, LibrarySummary};
+use crate::ledger::Ledger;
 use crate::library_cmd::{LibraryArgs, Source, check_output, classify};
 use crate::output_guard::Guard;
 use crate::progress::Progress;
@@ -238,6 +239,13 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
 
     let mut doc = LibraryReport::new(now());
     doc.library_id = args.library_id.clone();
+    // The previous run's record of what it wrote. It stays in the report of a
+    // run that fails or writes nothing, so a retry still knows what is ours.
+    if args.update
+        && let Ok(canon) = args.output.canonicalize()
+    {
+        doc.ledger = Ledger::read(&canon);
+    }
 
     // Read.
     progress.phase("read", Some(args.inputs.len()));
@@ -290,6 +298,7 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
         .and_then(|s| Uuid::parse_str(s).ok());
     options.now = Utc::now();
     let mut existing = None;
+    let mut usable: Option<Ledger> = None;
     if args.update {
         let canon = args
             .output
@@ -308,6 +317,10 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
                     }
                     Err(e) => return write_report(args, &doc, Some(e), Vec::new()),
                 }
+                usable = doc
+                    .ledger
+                    .clone()
+                    .filter(|l| l.library_id == Some(lib.manifest.library_id));
                 existing = Some((path, lib.manifest.library_id));
             }
             Err(e) => return write_report(args, &doc, Some(e), Vec::new()),
@@ -354,12 +367,39 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
         return write_report(args, &doc, Some(msg), Vec::new());
     }
 
+    // An update merges into the library on disk, keeping its file name and
+    // whatever a user added; only rows this converter wrote earlier go.
+    let mut files = built.files.clone();
+    if let Some((old_path, _)) = &existing {
+        let merged = std::fs::read_to_string(old_path)
+            .map_err(|e| format!("--update: {}: {e}", old_path.display()))
+            .and_then(|old| {
+                let at = files
+                    .iter()
+                    .position(|(p, _)| p.ends_with(".snxlib"))
+                    .ok_or("no library file")?;
+                let before = usable.as_ref().map(|l| l.rows.clone()).unwrap_or_default();
+                let text = crate::update_merge::merge(&old, &files[at].1, &before)?;
+                Ok((at, text))
+            });
+        match merged {
+            Ok((at, text)) => {
+                files[at].0 = old_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| files[at].0.clone());
+                files[at].1 = text;
+            }
+            Err(e) => return write_report(args, &doc, Some(format!("--update: {e}")), Vec::new()),
+        }
+    }
+
     // Write.
     if args.dry_run {
         // A preview writes nothing but the report.
         return write_report(args, &doc, None, Vec::new());
     }
-    progress.phase("write", Some(built.files.len()));
+    progress.phase("write", Some(files.len()));
     let dir = match std::fs::create_dir_all(&args.output).and_then(|()| args.output.canonicalize())
     {
         Ok(d) => d,
@@ -370,16 +410,26 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
     };
     let mut guard = Guard::new(&dir);
     let mut written = Vec::new();
-    let res = write_files(
-        &mut guard,
-        &dir,
-        &built.files,
-        existing.as_ref().map(|e| &e.0),
-        progress,
-        &mut written,
-    );
+    let rels: std::collections::BTreeSet<String> = files.iter().map(|(p, _)| p.clone()).collect();
+    // Stale: only what the (valid) record says this converter wrote and the
+    // source no longer has, and only as plain regular files.
+    let stale: Vec<PathBuf> = usable
+        .iter()
+        .flat_map(|l| l.files.iter())
+        .filter(|f| !rels.contains(*f) && crate::ledger::expected_path(f))
+        .map(|f| dir.join(f))
+        .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
+        .collect();
+    let res = write_files(&mut guard, &dir, &files, &stale, progress, &mut written);
     match res {
         Ok(()) => {
+            doc.ledger = Some(Ledger {
+                library_id: Some(built.library_id),
+                rows: built.row_ids.iter().copied().collect(),
+                symbols: built.symbol_ids.iter().copied().collect(),
+                footprints: built.footprint_ids.iter().copied().collect(),
+                files: rels,
+            });
             let summary = write_report(args, &doc, None, written);
             if summary.error.is_none() {
                 guard.commit();
@@ -407,13 +457,12 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
     }
 }
 
-/// Write the new files, then delete what an update left behind: old
-/// envelopes, footprints and library files the new set does not hold.
+/// Write the new files, then delete the stale ones.
 fn write_files(
     guard: &mut Guard,
     dir: &Path,
     files: &[(String, String)],
-    old_snxlib: Option<&PathBuf>,
+    stale: &[PathBuf],
     progress: &Progress,
     written: &mut Vec<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -424,14 +473,8 @@ fn write_files(
         written.push(path);
     }
     progress.progress(files.len(), Some(files.len()), None);
-    if let Some(old) = old_snxlib {
-        let keep: std::collections::HashSet<PathBuf> = written.iter().cloned().collect();
-        let mut stale: Vec<PathBuf> = vec![old.clone()];
-        stale.extend(plain_files(dir, "symbols", "snxsym", false));
-        stale.extend(plain_files(dir, "footprints", "snxfpt", true));
-        for p in stale.into_iter().filter(|p| !keep.contains(p)) {
-            guard.remove(&p)?;
-        }
+    for p in stale {
+        guard.remove(p)?;
     }
     Ok(())
 }

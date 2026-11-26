@@ -11,11 +11,13 @@
 //! `--json` summary; `docs/APP_INTEGRATION.md` is that contract.
 
 mod contract;
+mod ledger;
 mod library_cmd;
 mod library_run;
 mod output_guard;
 mod progress;
 mod report_doc;
+mod update_merge;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
