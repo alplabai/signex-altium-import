@@ -12,6 +12,7 @@
 
 mod contract;
 mod library_cmd;
+mod output_guard;
 mod progress;
 mod report_doc;
 
@@ -79,7 +80,9 @@ fn main() {
     // `describe` and `library` are the library converter contract
     // (docs/APP_INTEGRATION.md); anything else is the single-file importer.
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    match args.get(1).and_then(|a| a.to_str()) {
+    // An existing file or folder of that name is an input, not a command.
+    let is_path = args.get(1).is_some_and(|a| Path::new(a).exists());
+    match args.get(1).and_then(|a| a.to_str()).filter(|_| !is_path) {
         Some("describe") => std::process::exit(contract::describe_main(&args[2..])),
         Some("library") => std::process::exit(library_cmd::main(&args[2..])),
         _ => {}

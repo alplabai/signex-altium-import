@@ -6,6 +6,7 @@
 //! ends with the report and a failed summary.
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use altium_format::pcb::PcbLib;
@@ -154,7 +155,8 @@ fn check_output(args: &LibraryArgs) -> Result<(), String> {
     match (out.exists(), args.update) {
         (false, false) => Ok(()),
         (false, true) => Err(format!("--update: {} does not exist", out.display())),
-        (true, true) => Ok(()),
+        (true, true) if out.is_dir() => Ok(()),
+        (true, true) => Err(format!("--update: {} is not a directory", out.display())),
         (true, false) => {
             let empty = out.is_dir()
                 && std::fs::read_dir(out)
@@ -344,7 +346,11 @@ pub fn main(raw: &[OsString]) -> i32 {
             eprint!("{msg}");
             let first = msg.lines().next().unwrap_or("invalid arguments");
             let error = first.strip_prefix("error: ").unwrap_or(first);
-            println!("{}", LibrarySummary::failed(error).to_json());
+            let _ = writeln!(
+                std::io::stdout(),
+                "{}",
+                LibrarySummary::failed(error).to_json()
+            );
             return 1;
         }
     };
@@ -353,12 +359,22 @@ pub fn main(raw: &[OsString]) -> i32 {
     } else {
         Progress::disabled()
     };
-    let summary = run(&args, &progress);
+    // A panic is a failed run with a summary, never a bare crash.
+    let summary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&args, &progress)))
+        .unwrap_or_else(|p| {
+            let what = p
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            LibrarySummary::failed(format!("internal error: {what}"))
+        });
     let exit = summary.exit();
     if progress.enabled() {
         progress.summary(&summary.to_json());
     } else if args.json() {
-        println!("{}", summary.to_json());
+        // A closed stdout must not turn into a second panic.
+        let _ = writeln!(std::io::stdout(), "{}", summary.to_json());
     } else if let Some(e) = &summary.error {
         eprintln!("error: {e}");
     } else {

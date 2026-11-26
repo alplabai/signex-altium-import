@@ -80,4 +80,6 @@ report and the summary are in place, and `--dry-run` works end to end. Writing
 the `.snxlib` itself is not: a run without `--dry-run` writes the report and
 fails with `library output not implemented yet`. `.IntLib`, `.DbLib` and
 folder inputs are advertised by `describe` but refused until their readers
-land. In a dry run the summary's `files` is empty and `counts` are zero.
+land. `--help` and `--version` print no summary. A failed run removes the
+library files it wrote, keeps `import-report.*` once the source was read, and
+leaves a library that existed before `--update` as it was. In a dry run the summary's `files` is empty and `counts` are zero.

@@ -214,3 +214,75 @@ fn an_unreadable_input_fails_and_is_reported() {
     assert_eq!(report["items"][0]["code"], "library.input_unreadable");
     assert_eq!(report["items"][0]["severity"], "error");
 }
+
+fn broken_input(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let p = dir.join(name);
+    std::fs::write(&p, bytes).unwrap();
+    p
+}
+
+#[test]
+fn damaged_inputs_fail_with_a_summary_not_a_crash() {
+    let out = Tmp::new();
+    let whole = std::fs::read(sample("simple.SchLib")).unwrap();
+    let cases = [
+        ("truncated.SchLib", whole[..whole.len() / 3].to_vec()),
+        (
+            "garbage.SchLib",
+            (0..4096u32).map(|i| (i * 31 % 251) as u8).collect(),
+        ),
+        ("empty.PcbLib", Vec::new()),
+    ];
+    for (name, bytes) in cases {
+        let input = broken_input(&out.0, name, &bytes);
+        let dir = out.0.join(format!("out-{name}"));
+        let o = run(&[
+            os("library"),
+            input.as_os_str(),
+            os("--output"),
+            dir.as_os_str(),
+            os("--json"),
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{name}");
+        let s = lines(&o.stdout).pop().unwrap();
+        schema().validate(&s).unwrap();
+        assert_eq!(s["ok"], false, "{name}");
+        assert_eq!(s["exit"], "failed", "{name}");
+        assert!(dir.join("import-report.json").is_file(), "{name}");
+    }
+}
+
+#[test]
+fn update_needs_an_existing_directory() {
+    let out = Tmp::new();
+    let file = out.0.join("a-file");
+    std::fs::write(&file, "x").unwrap();
+    for target in [out.0.join("missing"), file] {
+        let o = run(&[
+            os("library"),
+            sample("simple.SchLib").as_os_str(),
+            os("--output"),
+            target.as_os_str(),
+            os("--update"),
+            os("--json"),
+        ]);
+        assert_eq!(o.status.code(), Some(1));
+        let s = lines(&o.stdout).pop().unwrap();
+        assert!(s["error"].as_str().unwrap().contains("--update"));
+    }
+}
+
+#[test]
+fn a_path_named_like_a_command_is_an_input() {
+    let out = Tmp::new();
+    std::fs::write(out.0.join("describe"), "x").unwrap();
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_signex-altium-import"))
+        .current_dir(&out.0)
+        .args(["describe", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let s = lines(&o.stdout).pop().unwrap();
+    // The single-file summary, not a describe object.
+    assert!(s.get("project").is_some() && s.get("contract").is_none());
+}

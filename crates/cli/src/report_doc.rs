@@ -64,7 +64,6 @@ impl LibraryReport {
             .count()
     }
 
-    // Used by the library writer's completeness test (next unit).
     #[allow(dead_code)]
     /// Source items neither written nor reported with severity `error`,
     /// per kind. The completeness rule (contract section 4) wants all zero.
