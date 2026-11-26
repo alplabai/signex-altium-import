@@ -19,6 +19,14 @@ in alplabai/signex). This file records what the reader was built from.
   the sample data.
 - **The Compound File Binary container:** read through the `cfb` crate
   (MIT).
+- **A private corpus** of company libraries (integrated, schematic, footprint
+  and database libraries). Some layouts in `FORMAT_NOTES.md` were observed
+  only there and are marked "observed in a private corpus file": the
+  integrated-library container, the database-library file, the integrated
+  libraries' empty model table, the stale DIFAT entries the container repair
+  frees, and the `0x8E` value escape (also seen in a public sample). They are
+  described generically; no file, name, part number or value from the corpus
+  is in this repository.
 
 ## Sources not used
 
@@ -27,6 +35,16 @@ in alplabai/signex). This file records what the reader was built from.
   docs and tests were not read, and nothing here derives from them.
 - **Any GPL-licensed EDA tool's Altium importer.** None was placed in
   context or consulted.
+- **A reference converter, compared black-box only.** To check output, a
+  third-party Altium reader was installed in an isolated environment outside
+  this repository and run on the public samples and the private corpus; only
+  its `--help` text and its output were read. Its source was never read, it
+  is not a dependency, and it is not run in this repository or its CI. Where
+  this reader follows an observation from that comparison, `FORMAT_NOTES.md`
+  states the evidence in the files themselves.
+- **mdbtools** (GPL), for Access database libraries: run only as separate
+  programs (`mdb-tables`, `mdb-export`) when the user has installed them.
+  It is never linked, vendored or shipped, and none of its source was read.
 
 ## Method
 

@@ -8,6 +8,10 @@ What `altium-format` relies on, as verified against the files in
 Binary Altium files are OLE2 compound documents (Compound File Binary).
 Each document type keeps its records in named streams.
 
+Observed in a private corpus file: a header DIFAT with entries past the
+declared FAT sector count that do not hold the free marker. Such a file is
+read after setting those entries free (`library.difat_repaired`).
+
 ## Schematic (`.SchDoc`, `.SchLib`)
 
 **Framing.** A stream is a run of frames. Each frame starts with a `u32`:
