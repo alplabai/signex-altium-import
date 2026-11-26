@@ -479,10 +479,7 @@ pub struct LibModel {
     pub problem: Option<String>,
 }
 
-/// Largest model accepted after inflating.
-const MAX_MODEL: u64 = 256 * 1024 * 1024;
-
-fn read_models(c: &mut Container) -> Result<Vec<LibModel>> {
+fn read_models(c: &mut Container, budget: &mut crate::limits::Budget) -> Result<Vec<LibModel>> {
     let Some(table) = c.stream_opt("Library/Models/Data")? else {
         return Ok(Vec::new());
     };
@@ -500,21 +497,10 @@ fn read_models(c: &mut Container) -> Result<Vec<LibModel>> {
         };
         if embedded {
             match c.stream_opt(&format!("Library/Models/{i}")) {
-                Ok(Some(raw)) => {
-                    let mut buf = Vec::new();
-                    let res = std::io::Read::read_to_end(
-                        &mut std::io::Read::take(
-                            flate2::read::ZlibDecoder::new(&raw[..]),
-                            MAX_MODEL + 1,
-                        ),
-                        &mut buf,
-                    );
-                    match res {
-                        Ok(_) if buf.len() as u64 <= MAX_MODEL => m.data = Some(buf),
-                        Ok(_) => m.problem = Some("model stream is too large".into()),
-                        Err(e) => m.problem = Some(format!("model stream does not inflate: {e}")),
-                    }
-                }
+                Ok(Some(raw)) => match budget.inflate_zlib(&format!("Library/Models/{i}"), &raw) {
+                    Ok(buf) => m.data = Some(buf),
+                    Err(e) => m.problem = Some(e.to_string()),
+                },
                 Ok(None) => m.problem = Some(format!("model stream Library/Models/{i} is missing")),
                 Err(e) => m.problem = Some(e.to_string()),
             }
@@ -531,6 +517,15 @@ impl PcbLib {
     }
 
     pub fn from_container(c: &mut Container) -> Result<Self> {
+        Self::from_container_with(c, &mut crate::limits::Budget::default())
+    }
+
+    /// As [`PcbLib::from_container`], charging model inflation to a run-wide
+    /// budget (`limits.rs`).
+    pub fn from_container_with(
+        c: &mut Container,
+        budget: &mut crate::limits::Budget,
+    ) -> Result<Self> {
         let mut lib = PcbLib {
             modified: c.modified(),
             ..PcbLib::default()
@@ -542,7 +537,7 @@ impl PcbLib {
                 lib.params = Params::parse(block);
             }
         }
-        lib.models = read_models(c)?;
+        lib.models = read_models(c, budget)?;
         lib.layer_kinds = layer_kinds(c.stream_opt("Library/LayerKindMapping/Data")?.as_deref());
         for storage in c.root_storages() {
             if storage == "Library" {

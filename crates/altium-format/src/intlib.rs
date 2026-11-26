@@ -2,18 +2,20 @@
 //! library and a footprint library, each as a compressed compound file of its
 //! own. Layout notes (observed in a private corpus file): `docs/FORMAT_NOTES.md`.
 
-use std::io::Read;
-
 use crate::container::Container;
 use crate::error::{Error, Result};
+use crate::limits::Budget;
 use crate::pcb::PcbLib;
 use crate::sch::SchLib;
 
-/// Largest inflated stream accepted, so a hostile file cannot exhaust memory.
-const MAX_INFLATED: u64 = 512 * 1024 * 1024;
-
-/// Inflate an embedded stream: a type byte, then a zlib stream.
+/// Inflate an embedded stream: a type byte, then a zlib stream. Limits:
+/// `limits.rs`.
 pub fn inflate_embedded(stream: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    inflate_embedded_with(&mut Budget::default(), stream, bytes)
+}
+
+/// As [`inflate_embedded`], charging a run-wide budget.
+pub fn inflate_embedded_with(budget: &mut Budget, stream: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     let Some((&kind, body)) = bytes.split_first() else {
         return Err(Error::Truncated {
             stream: stream.to_string(),
@@ -26,19 +28,7 @@ pub fn inflate_embedded(stream: &str, bytes: &[u8]) -> Result<Vec<u8>> {
             "embedded stream `{stream}` has type {kind}, expected 2 (zlib)"
         )));
     }
-    let mut out = Vec::new();
-    flate2::read::ZlibDecoder::new(body)
-        .take(MAX_INFLATED + 1)
-        .read_to_end(&mut out)
-        .map_err(|e| {
-            Error::Malformed(format!("embedded stream `{stream}` does not inflate: {e}"))
-        })?;
-    if out.len() as u64 > MAX_INFLATED {
-        return Err(Error::Malformed(format!(
-            "embedded stream `{stream}` is too large"
-        )));
-    }
-    Ok(out)
+    budget.inflate_zlib(stream, body)
 }
 
 /// One embedded library, with the stream it came from.
@@ -130,13 +120,14 @@ impl IntLib {
                 "SchLib/*.schlib or PCBLib/*.pcblib".into(),
             ));
         }
-        let open = |c: &mut Container, name: &str| -> Result<Container> {
+        let mut budget = Budget::default();
+        let open = |c: &mut Container, budget: &mut Budget, name: &str| -> Result<Container> {
             let raw = c.stream(name)?;
-            let inner = inflate_embedded(name, &raw)?;
+            let inner = inflate_embedded_with(budget, name, &raw)?;
             Container::from_bytes(std::path::PathBuf::from(name), inner)
         };
         for name in sch {
-            let mut inner = open(c, &name)?;
+            let mut inner = open(c, &mut budget, &name)?;
             let l = SchLib::from_container(&mut inner)?;
             lib.schlibs.push(Embedded {
                 stream: name,
@@ -144,8 +135,8 @@ impl IntLib {
             });
         }
         for name in pcb {
-            let mut inner = open(c, &name)?;
-            let l = PcbLib::from_container(&mut inner)?;
+            let mut inner = open(c, &mut budget, &name)?;
+            let l = PcbLib::from_container_with(&mut inner, &mut budget)?;
             lib.pcblibs.push(Embedded {
                 stream: name,
                 lib: l,
@@ -159,7 +150,7 @@ impl IntLib {
         if let Some(n) = xref
             && let Ok(raw) = c.stream(&n)
         {
-            lib.cross_ref = inflate_embedded(&n, &raw).ok();
+            lib.cross_ref = inflate_embedded_with(&mut budget, &n, &raw).ok();
         }
         Ok(lib)
     }
