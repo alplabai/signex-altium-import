@@ -4,8 +4,6 @@
 //! through the guard, and dropping it uncommitted restores the old state.
 //! The report files are written outside the guard; they stay.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};

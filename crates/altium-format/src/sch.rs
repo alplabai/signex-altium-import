@@ -274,6 +274,10 @@ pub struct Implementation {
     pub model_name: String,
     pub model_type: String,
     pub is_current: bool,
+    /// Symbol pin designator to footprint pad name, for pins whose pad is
+    /// not the same name. Never filled by the reader yet: no sample holds a
+    /// pin map (`docs/FORMAT_NOTES.md`).
+    pub pin_map: Vec<(String, String)>,
 }
 
 /// Body graphics, shared by symbols and sheets.
@@ -572,6 +576,7 @@ impl SchDoc {
                             model_name: p.string("ModelName"),
                             model_type: p.string("ModelType"),
                             is_current: p.bool("IsCurrent"),
+                            pin_map: Vec::new(),
                         });
                     }
                 }
@@ -744,6 +749,7 @@ pub fn parse_symbol_stream(data: &[u8]) -> Result<Component> {
                             model_name: p.string("ModelName"),
                             model_type: p.string("ModelType"),
                             is_current: p.bool("IsCurrent"),
+                            pin_map: Vec::new(),
                         })
                     }
                     _ => {

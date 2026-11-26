@@ -61,6 +61,8 @@ impl ItemKind {
         match code.split('.').next() {
             Some("symbol") => ItemKind::Symbol,
             Some("footprint") => ItemKind::Footprint,
+            Some("part") => ItemKind::Part,
+            Some("model") => ItemKind::Model,
             _ => ItemKind::Library,
         }
     }
@@ -101,6 +103,7 @@ impl Item {
 pub struct Report {
     items: Vec<Item>,
     scope: String,
+    scope_id: Option<String>,
 }
 
 impl Report {
@@ -115,7 +118,7 @@ impl Report {
         self.items.push(Item {
             kind: ItemKind::of_code(code),
             source: self.scope.clone(),
-            id: None,
+            id: self.scope_id.clone(),
             code,
             severity: codes::severity(code),
             message: message.into(),
@@ -131,6 +134,13 @@ impl Report {
     /// Name the source item later warnings belong to (empty to clear).
     pub fn set_scope(&mut self, source: impl Into<String>) {
         self.scope = source.into();
+        self.scope_id = None;
+    }
+
+    /// As [`Report::set_scope`], with the Signex id written for the item.
+    pub fn set_scope_with_id(&mut self, source: impl Into<String>, id: impl ToString) {
+        self.scope = source.into();
+        self.scope_id = Some(id.to_string());
     }
 
     pub fn is_empty(&self) -> bool {

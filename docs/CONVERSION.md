@@ -130,6 +130,76 @@ The vendored Signex types are still those of the format's 1.1 revision
 (no pad rotation column, no `remove_dead_islands`); moving them to 1.4 is
 a follow-up.
 
+## Library conversion
+
+`signex-altium-import library <input>... --output <dir>` turns `.SchLib` and
+`.PcbLib` files into one Signex library (`docs/LIBRARY_FORMAT.md` in the
+Signex repository is the format; `docs/APP_INTEGRATION.md` the command).
+
+```text
+<dir>/
+  <name>.snxlib             manifest and one table per part class
+  symbols/<name>.snxsym     one envelope per SchLib, every symbol in it
+  footprints/<uuid>.snxfpt  one footprint per file (Signex reaches only
+                            the first in a file)
+  import-report.json, import-report.md
+```
+
+- **Ids** are derived (UUIDv5), never random. The library id comes from the
+  input file names (lower case, sorted), so moving or reordering inputs keeps
+  it; `--library-id` overrides it. Symbol, footprint and part ids come from
+  the library id, the source library's name and the item's name; a repeated
+  name inside one library adds `#2`, `#3`.
+- **Same inputs, same bytes.** Every written time is the Unix epoch, and
+  every primitive and part starts at version `1.0.0`. The converter writes
+  through the vendored serializers and re-reads its own `.snxlib` to check it
+  is canonical.
+- **One part per SchLib component**, in (source path, source order). Part
+  number = the component name; the second and later parts with the same name
+  are `name~2`, `name~3` (report `part.pn_collision`). State `draft`. The
+  parameter `designator_prefix` holds the designator's leading letters
+  (`R?` gives `R`), when it has any.
+- **Class** from the designator prefix, limited to the classes the vendored
+  templates know:
+
+  | Prefix | Class |
+  |---|---|
+  | `R` | `resistor` |
+  | `C` | `capacitor` |
+  | `L` | `inductor` |
+  | anything else (`D`, `LED`, `Q`, `U`, `IC`, `J`, `P`, `CN`, `SW`, `S`, `Y`, `X`, `H`, `MH`, `FID`, none) | `generic` |
+
+  One table per class used, named by the class key; the manifest lists those
+  classes. More classes follow when templates exist for them.
+- **Footprints** keep the footprint converter's frame: Signex's footprint
+  frame has +y down, so every Altium y and angle is negated and each arc's
+  start and end swap. Every footprint of every PcbLib is written; parts bind
+  to them by name, case-insensitive, the first definition winning
+  (`footprint.name_collision` for a repeat).
+- **Footprint binding.** A component's PCB model marked current is the
+  default footprint; its other PCB models are alternates in list order. When
+  none is marked current the first is the default (`part.footprint_no_current`).
+  A model whose pin map renames pins gives `pin_map_overrides` (default) or
+  the alternate's own overrides; identical pairs are not overrides. A named
+  footprint that is in none of the given PcbLibs skips the **part** with
+  `part.footprint_missing` (`error`). A component that names no footprint
+  gets a row without one. Models of other kinds (a simulation, for example)
+  are reported as `info` (`part.model_skipped`) and not imported. Pin maps are
+  not read from files yet (`docs/FORMAT_NOTES.md`).
+- **`--update`** needs the directory to hold exactly one `.snxlib`, with the
+  same library id as this source gives (else the run fails and writes
+  nothing). It rewrites the library in place and deletes envelopes,
+  footprints and library files the source no longer has. A part keeps its
+  lifecycle state, `released` flag and created time; its version and updated
+  time stay while its content hash is unchanged and otherwise the patch
+  version rises and updated is set to now. Symbol and footprint versions stay
+  `1.0.0`.
+- **Not carried yet:** embedded 3D models, `.IntLib` and `.DbLib` sources,
+  folder inputs, simulation models.
+- **Completeness.** Every source component is a written part or a part item
+  with severity `error`; the run fails with an internal error if the report
+  does not account for every one.
+
 ## Report codes
 
 Every approximation or loss has a stable code, `<area>.<what>`; a code never
@@ -178,7 +248,16 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `pcb.pad_rotation_dropped` | approximated | Pad turned off a quarter turn from its footprint imported unrotated |
 | `pcb.pad_octagon_rect` | approximated | Octagonal pad imported as a rectangle |
 | `project.several_boards` | info | Project has several PCB documents; the first is the project's board |
+| `part.pn_collision` | approximated | A part number was taken; the part got a `~n` suffix |
+| `part.footprint_missing` | error | A named footprint is in none of the given PcbLibs; part skipped |
+| `part.footprint_no_current` | info | No footprint is marked current; the first is the default |
+| `part.model_skipped` | info | A model of another kind, or a footprint bound twice, not imported |
+| `part.param_ambiguous` | info | A parameter value kept as text or not imported because it is unclear |
+| `part.param_dropped` | dropped | A parameter without a usable name, or one that repeats another |
+| `part.text_sanitized` | info | Control characters or a triple apostrophe in a value replaced |
+| `part.template_incomplete` | info | The class template wants parameters the part lacks |
+| `part.row_invalid` | error | The part row failed the writer's checks; part not written |
+| `footprint.name_collision` | info | A footprint name is already defined; parts bind to the first |
 | `library.input_unreadable` | error | An input file could not be read (library runs) |
-| `library.output_not_implemented` | error | The `.snxlib` writer is not available yet (library runs) |
 
-39 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.
+48 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.

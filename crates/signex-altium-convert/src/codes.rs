@@ -48,9 +48,19 @@ pub const CODES: &[(&str, Severity)] = &[
     ("pcb.pad_octagon_rect", A),
     // Projects.
     ("project.several_boards", I),
+    // Parts of a library run.
+    ("part.pn_collision", A),
+    ("part.footprint_missing", E),
+    ("part.footprint_no_current", I),
+    ("part.model_skipped", I),
+    ("part.param_ambiguous", I),
+    ("part.param_dropped", D),
+    ("part.text_sanitized", I),
+    ("part.template_incomplete", I),
+    ("part.row_invalid", E),
+    ("footprint.name_collision", I),
     // Library runs (`signex-altium-import library`).
     ("library.input_unreadable", E),
-    ("library.output_not_implemented", E),
 ];
 
 /// The severity of a catalogued code. An uncatalogued code is a bug in the

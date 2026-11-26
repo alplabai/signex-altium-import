@@ -12,6 +12,7 @@ pub mod check;
 pub mod codes;
 mod keepouts;
 pub mod library;
+pub mod libset;
 pub mod pcb;
 pub mod report;
 pub mod sch;

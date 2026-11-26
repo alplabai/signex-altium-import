@@ -12,6 +12,7 @@
 
 mod contract;
 mod library_cmd;
+mod library_run;
 mod output_guard;
 mod progress;
 mod report_doc;

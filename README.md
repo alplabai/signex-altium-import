@@ -9,6 +9,7 @@ One-way converter from Altium Designer files to Signex native files.
 | `.PcbDoc` | `.snxpcb` | supported |
 | `.SchLib` | `.snxsym` (every symbol in one file) | supported |
 | `.PcbLib` | `.snxfpt` (every footprint in one file) | supported |
+| `.SchLib` + `.PcbLib` (`library`) | one Signex library directory | supported |
 
 Source-available under **FSL-1.1-ALv2**, like
 [Signex](https://github.com/alplabai/signex); see [License](#license). The
@@ -47,9 +48,9 @@ signex-altium-import describe --json
 signex-altium-import library Passives.SchLib Passives.PcbLib --output out/Passives --dry-run --progress
 ```
 
-`library` writes `import-report.json` and `import-report.md` into `--output`
-and exits 0 (ok), 2 (partial) or 1 (failed). Writing the Signex library
-itself is not available yet; `--dry-run` gives the report preview.
+`library` writes the library (a `.snxlib`, its symbol and footprint files)
+plus `import-report.json` and `import-report.md` into `--output`, and exits 0
+(ok), 2 (partial) or 1 (failed). `--dry-run` writes only the report.
 
 ## Install
 

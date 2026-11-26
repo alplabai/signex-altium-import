@@ -35,6 +35,29 @@ pub fn symbol_file(lib: &SchLib, name: &str, report: &mut Report) -> SymbolFile 
     file
 }
 
+/// Every symbol of a schematic library with the ids the caller chose (one
+/// per component). Report items name `<library>:<symbol>` and carry the id.
+pub fn symbols_scoped(
+    lib: &SchLib,
+    library: &str,
+    ids: &[uuid::Uuid],
+    report: &mut Report,
+) -> Vec<Symbol> {
+    let out = lib
+        .components
+        .iter()
+        .zip(ids)
+        .map(|(c, id)| {
+            report.set_scope_with_id(format!("{library}:{}", c.lib_reference), id);
+            let mut s = symbol(c, report);
+            s.uuid = *id;
+            s
+        })
+        .collect();
+    report.set_scope("");
+    out
+}
+
 fn symbol(c: &Component, report: &mut Report) -> Symbol {
     let mut s = Symbol::empty(c.lib_reference.clone());
     s.description = c.description.clone();
@@ -306,6 +329,30 @@ pub fn footprint_file(lib: &PcbLib, name: &str, report: &mut Report) -> Footprin
     file.footprints.extend(fps);
     file.display_name = name.to_string();
     file
+}
+
+/// Every footprint of a PCB library with the ids the caller chose (one per
+/// footprint). Report items name `<library>:<footprint>` and carry the id.
+pub fn footprints_scoped(
+    lib: &PcbLib,
+    library: &str,
+    ids: &[uuid::Uuid],
+    report: &mut Report,
+) -> Vec<Footprint> {
+    let names = LayerNames::from_params(&lib.params, &lib.layer_kinds);
+    let out = lib
+        .footprints
+        .iter()
+        .zip(ids)
+        .map(|(f, id)| {
+            report.set_scope_with_id(format!("{library}:{}", f.name), id);
+            let mut fp = footprint(f, &names, report);
+            fp.uuid = *id;
+            fp
+        })
+        .collect();
+    report.set_scope("");
+    out
 }
 
 /// Footprint-local Altium (mils, Y up) -> editor mm, Y down.

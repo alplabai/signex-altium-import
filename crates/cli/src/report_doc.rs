@@ -55,7 +55,6 @@ impl LibraryReport {
         }
     }
 
-    #[allow(dead_code)]
     fn errors_of(&self, kind: ItemKind) -> usize {
         self.report
             .items()
@@ -64,7 +63,6 @@ impl LibraryReport {
             .count()
     }
 
-    #[allow(dead_code)]
     /// Source items neither written nor reported with severity `error`,
     /// per kind. The completeness rule (contract section 4) wants all zero.
     pub fn unaccounted(&self) -> Counts {
@@ -81,7 +79,6 @@ impl LibraryReport {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_complete(&self) -> bool {
         self.unaccounted() == Counts::default()
     }

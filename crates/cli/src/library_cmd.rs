@@ -1,25 +1,17 @@
 //! `signex-altium-import library <input>... --output <dir> [options]`
 //! (library converter contract, section 2.2).
 //!
-//! The run is read, convert, write. Reading and converting are real; the
-//! `.snxlib` writer is not written yet, so a run that is not `--dry-run`
-//! ends with the report and a failed summary.
+//! The run itself is `library_run`.
 
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use altium_format::pcb::PcbLib;
-use altium_format::sch::SchLib;
 use clap::{Parser, ValueEnum};
-use signex_altium_convert::Report;
-use signex_altium_convert::report::{Item, ItemKind, Severity};
 
-use crate::contract::{Exit, LibrarySummary};
+use crate::contract::LibrarySummary;
+use crate::library_run::run;
 use crate::progress::Progress;
-use crate::report_doc::{LibraryReport, SourceFile};
-
-pub const NOT_IMPLEMENTED: &str = "library output not implemented yet";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Models {
@@ -118,12 +110,12 @@ impl LibraryArgs {
 
 /// A source format `library` knows by extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Source {
+pub(crate) enum Source {
     SchLib,
     PcbLib,
 }
 
-fn classify(path: &Path) -> Result<Source, String> {
+pub(crate) fn classify(path: &Path) -> Result<Source, String> {
     if path.is_dir() {
         return Err(format!(
             "{}: folder inputs are not implemented yet",
@@ -150,7 +142,7 @@ fn classify(path: &Path) -> Result<Source, String> {
 }
 
 /// Without `--update` the output must not exist or be empty.
-fn check_output(args: &LibraryArgs) -> Result<(), String> {
+pub(crate) fn check_output(args: &LibraryArgs) -> Result<(), String> {
     let out = &args.output;
     match (out.exists(), args.update) {
         (false, false) => Ok(()),
@@ -172,163 +164,6 @@ fn check_output(args: &LibraryArgs) -> Result<(), String> {
             }
         }
     }
-}
-
-enum Loaded {
-    Sym(SchLib),
-    Fp(PcbLib),
-}
-
-fn stem(p: &Path) -> String {
-    p.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("library")
-        .to_string()
-}
-
-fn now() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
-/// What a run produced: the summary, and the report when one was written.
-pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
-    if let Err(e) = args.validate() {
-        return LibrarySummary::failed(e);
-    }
-    let mut kinds = Vec::new();
-    for p in &args.inputs {
-        match classify(p) {
-            Ok(k) => kinds.push(k),
-            Err(e) => return LibrarySummary::failed(e),
-        }
-    }
-    if let Err(e) = check_output(args) {
-        return LibrarySummary::failed(e);
-    }
-
-    let mut doc = LibraryReport::new(now());
-    doc.library_id = args.library_id.clone();
-
-    // Read.
-    progress.phase("read", Some(args.inputs.len()));
-    let mut loaded = Vec::new();
-    let mut unreadable = 0;
-    for (i, (path, kind)) in args.inputs.iter().zip(&kinds).enumerate() {
-        let name = stem(path);
-        progress.progress(i, Some(args.inputs.len()), Some(&name));
-        let abs = path.canonicalize().unwrap_or_else(|_| path.clone());
-        let read = SourceFile::hash(&abs).and_then(|src| {
-            let l = match kind {
-                Source::SchLib => Loaded::Sym(SchLib::open(&abs)?),
-                Source::PcbLib => Loaded::Fp(PcbLib::open(&abs)?),
-            };
-            Ok((src, l))
-        });
-        match read {
-            Ok((src, l)) => {
-                match &l {
-                    Loaded::Sym(s) => doc.source.symbols += s.components.len(),
-                    Loaded::Fp(f) => doc.source.footprints += f.footprints.len(),
-                }
-                doc.sources.push(src);
-                loaded.push((name, l));
-            }
-            Err(e) => {
-                unreadable += 1;
-                doc.report.push(Item {
-                    kind: ItemKind::Library,
-                    source: name,
-                    id: None,
-                    code: "library.input_unreadable",
-                    severity: Severity::Error,
-                    message: format!("{}: {e:#}", path.display()),
-                    detail: serde_json::Value::Null,
-                });
-            }
-        }
-    }
-    progress.progress(args.inputs.len(), Some(args.inputs.len()), None);
-    if unreadable > 0 {
-        let msg = format!("{unreadable} input(s) could not be read");
-        return finish_failed(args, doc, msg);
-    }
-
-    // Convert.
-    progress.phase("convert", Some(loaded.len()));
-    for (i, (name, l)) in loaded.iter().enumerate() {
-        progress.progress(i, Some(loaded.len()), Some(name));
-        doc.report.set_scope(name.clone());
-        let mut r = Report::default();
-        match l {
-            Loaded::Sym(s) => {
-                signex_altium_convert::library::symbol_file(s, name, &mut r);
-            }
-            Loaded::Fp(f) => {
-                signex_altium_convert::library::footprint_file(f, name, &mut r);
-            }
-        }
-        for mut item in r.items().iter().cloned() {
-            item.source = name.clone();
-            doc.report.push(item);
-        }
-    }
-    doc.report.set_scope("");
-    progress.progress(loaded.len(), Some(loaded.len()), None);
-
-    // Write.
-    if args.dry_run {
-        // A preview writes nothing but the report.
-        return write_report(args, &doc, Exit::of_report(&doc.report), None);
-    }
-    progress.phase("write", None);
-    doc.report.push(Item {
-        kind: ItemKind::Library,
-        source: String::new(),
-        id: None,
-        code: "library.output_not_implemented",
-        severity: Severity::Error,
-        message: NOT_IMPLEMENTED.into(),
-        detail: serde_json::Value::Null,
-    });
-    finish_failed(args, doc, NOT_IMPLEMENTED.into())
-}
-
-/// Write the report into `--output`; `error` turns the summary into a
-/// failed one that still names the report.
-fn write_report(
-    args: &LibraryArgs,
-    doc: &LibraryReport,
-    exit: Exit,
-    error: Option<String>,
-) -> LibrarySummary {
-    let dir = &args.output;
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        return LibrarySummary::failed(format!("creating {}: {e}", dir.display()));
-    }
-    let dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-    let (json, _md) = match doc.write(&dir) {
-        Ok(p) => p,
-        Err(e) => return LibrarySummary::failed(format!("{e:#}")),
-    };
-    LibrarySummary {
-        exit: Some(if error.is_some() { Exit::Failed } else { exit }),
-        error,
-        library: Some(dir),
-        report: Some(json),
-        files: Vec::new(),
-        counts: Some(doc.written),
-        skipped: doc.skipped(),
-        warnings: doc
-            .report
-            .warnings()
-            .into_iter()
-            .map(|(m, n)| (m.to_string(), n))
-            .collect(),
-    }
-}
-
-fn finish_failed(args: &LibraryArgs, doc: LibraryReport, error: String) -> LibrarySummary {
-    write_report(args, &doc, Exit::Failed, Some(error))
 }
 
 /// Entry point of the `library` subcommand; returns the process exit code.

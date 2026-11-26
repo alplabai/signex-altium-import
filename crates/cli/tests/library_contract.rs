@@ -99,27 +99,178 @@ fn dry_run_streams_valid_events_and_writes_only_the_report() {
     }
 }
 
-#[test]
-fn real_run_fails_cleanly_until_output_lands() {
-    let out = Tmp::new();
-    let dir = out.0.join("lib");
-    let o = run(&[
+fn library_run(dir: &std::path::Path, extra: &[&str]) -> (std::process::Output, Value) {
+    let (sch, pcb) = (sample("simple.SchLib"), sample("Simple.PcbLib"));
+    let mut args = vec![
         os("library"),
-        sample("simple.SchLib").as_os_str(),
+        sch.as_os_str(),
+        pcb.as_os_str(),
         os("--output"),
         dir.as_os_str(),
         os("--json"),
-    ]);
+    ];
+    args.extend(extra.iter().map(|a| os(a)));
+    let o = run(&args);
+    let s = lines(&o.stdout).pop().expect("a summary");
+    schema().validate(&s).expect("summary matches schema");
+    (o, s)
+}
+
+fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(
+        root: &std::path::Path,
+        d: &std::path::Path,
+        out: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
+        for e in std::fs::read_dir(d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else {
+                out.insert(
+                    p.strip_prefix(root).unwrap().display().to_string(),
+                    std::fs::read(&p).unwrap(),
+                );
+            }
+        }
+    }
+    let mut out = Default::default();
+    walk(dir, dir, &mut out);
+    out
+}
+
+#[test]
+fn a_real_run_writes_a_library_report_and_summary() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    let (o, s) = library_run(&dir, &["--name", "Samples"]);
+    assert_eq!(s["ok"], true);
+    assert!([0, 2].contains(&o.status.code().unwrap()));
+    assert_eq!(
+        s["exit"],
+        if o.status.code() == Some(0) {
+            "ok"
+        } else {
+            "partial"
+        }
+    );
+    let canon = dir.canonicalize().unwrap();
+    let files: Vec<String> = s["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap().to_string())
+        .collect();
+    assert!(files.iter().any(|f| f.ends_with("samples.snxlib")));
+    assert!(
+        files
+            .iter()
+            .any(|f| f.contains("/symbols/") && f.ends_with(".snxsym"))
+    );
+    assert!(
+        files
+            .iter()
+            .any(|f| f.contains("/footprints/") && f.ends_with(".snxfpt"))
+    );
+    for f in &files {
+        assert!(
+            std::path::Path::new(f).starts_with(&canon) && std::path::Path::new(f).is_file(),
+            "{f}"
+        );
+    }
+    assert!(s["counts"]["parts"].as_u64().unwrap() > 0);
+    assert_eq!(
+        s["counts"]["parts"].as_u64().unwrap() + s["counts"]["skipped"].as_u64().unwrap(),
+        serde_json::from_slice::<Value>(&std::fs::read(dir.join("import-report.json")).unwrap())
+            .unwrap()["counts"]["source"]["parts"]
+            .as_u64()
+            .unwrap()
+    );
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("import-report.json")).unwrap()).unwrap();
+    schema().validate(&report).unwrap();
+    assert!(report["library_id"].as_str().is_some());
+    assert!(dir.join("import-report.md").is_file());
+}
+
+#[test]
+fn a_second_run_into_a_fresh_directory_is_byte_identical() {
+    let out = Tmp::new();
+    let (a, b) = (out.0.join("a"), out.0.join("b"));
+    library_run(&a, &[]);
+    library_run(&b, &[]);
+    let (mut ta, mut tb) = (tree(&a), tree(&b));
+    // The report names its sources and start time; the library is the contract.
+    for t in [&mut ta, &mut tb] {
+        t.remove("import-report.json");
+        t.remove("import-report.md");
+    }
+    assert_eq!(ta, tb);
+}
+
+#[test]
+fn update_over_the_same_source_changes_nothing() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    library_run(&dir, &[]);
+    let before = tree(&dir);
+    let (_, s) = library_run(&dir, &["--update"]);
+    assert_eq!(s["ok"], true);
+    let mut after = tree(&dir);
+    let mut before = before;
+    for t in [&mut before, &mut after] {
+        t.remove("import-report.json");
+        t.remove("import-report.md");
+    }
+    assert_eq!(before, after);
+}
+
+#[test]
+fn update_refuses_a_different_library_and_leaves_it_alone() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    library_run(
+        &dir,
+        &["--library-id", "5b0f3b0e-0000-4000-8000-000000000001"],
+    );
+    let before = tree(&dir);
+    let (o, s) = library_run(
+        &dir,
+        &[
+            "--update",
+            "--library-id",
+            "5b0f3b0e-0000-4000-8000-000000000002",
+        ],
+    );
     assert_eq!(o.status.code(), Some(1));
-    let ev = lines(&o.stdout);
-    assert_eq!(ev.len(), 1, "no progress without --progress");
-    let s = &ev[0];
-    schema().validate(s).expect("failed summary matches schema");
     assert_eq!(s["ok"], false);
-    assert_eq!(s["exit"], "failed");
-    assert_eq!(s["error"], "library output not implemented yet");
-    assert!(dir.join("import-report.json").is_file());
-    assert!(!dir.join("simple.snxsym").exists());
+    assert!(s["error"].as_str().unwrap().contains("id"));
+    let mut after = tree(&dir);
+    let mut before = before;
+    for t in [&mut before, &mut after] {
+        t.remove("import-report.json");
+        t.remove("import-report.md");
+    }
+    assert_eq!(before, after, "the library on disk is untouched");
+}
+
+#[test]
+fn update_removes_what_the_source_no_longer_has() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    library_run(&dir, &[]);
+    let stale = dir.join("footprints/00000000-0000-0000-0000-000000000000.snxfpt");
+    std::fs::write(&stale, "x").unwrap();
+    library_run(&dir, &["--update"]);
+    assert!(!stale.exists());
+}
+
+#[test]
+fn update_needs_a_library_in_the_directory() {
+    let out = Tmp::new();
+    let (o, s) = library_run(&out.0, &["--update"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(s["error"].as_str().unwrap().contains(".snxlib"));
 }
 
 #[test]
