@@ -528,8 +528,8 @@ pub(crate) fn skip_write_lock_files(path: &Path, _spec: &[u8]) -> i32 {
 
 pub use disk_sync::DiskStamp;
 pub use write_lock::{
-    WRITE_LOCK_WAIT, enclosing_library_file, is_write_lock_file, rewrite_file_under_library_lock,
-    write_lock_path,
+    HeldWriteLock, WRITE_LOCK_WAIT, enclosing_library_file, hold_library_write_lock,
+    is_write_lock_file, rewrite_file_under_library_lock, write_lock_path,
 };
 mod helpers;
 mod ignore_rules;
@@ -537,12 +537,17 @@ mod index_lock;
 #[cfg(test)]
 mod index_lock_tests;
 mod reinit_tree;
+pub(crate) use adapter::check_table_name;
 pub use helpers::component_to_library_row;
+pub(crate) use helpers::library_row_to_component;
+pub use helpers::slugify;
+pub(crate) use write_lock::lock_library_file;
 #[cfg(test)]
 mod ledger_hygiene_tests;
 pub(crate) mod lfs;
 mod pinned_assets;
 mod primitives;
+mod provenance;
 mod read_cache;
 mod row_edit;
 mod tree_path;
@@ -581,6 +586,7 @@ mod tests {
             library: LibrarySection {
                 name: name.into(),
                 description: None,
+                ..Default::default()
             },
             mode: LibraryMode::default(),
             workflow: WorkflowConfig::default(),
