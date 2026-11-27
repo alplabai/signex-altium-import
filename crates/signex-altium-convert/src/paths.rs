@@ -128,7 +128,10 @@ mod tests {
     #[test]
     fn a_library_path_takes_the_platform_separator() {
         assert_eq!(
-            with_separator("footprints/0cb7388f-0000-4000-8000-000000000001.snxfpt", '\\'),
+            with_separator(
+                "footprints/0cb7388f-0000-4000-8000-000000000001.snxfpt",
+                '\\'
+            ),
             r"footprints\0cb7388f-0000-4000-8000-000000000001.snxfpt"
         );
         assert_eq!(with_separator("a.snxlib", '\\'), "a.snxlib");
