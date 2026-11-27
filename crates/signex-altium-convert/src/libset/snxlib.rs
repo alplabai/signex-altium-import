@@ -115,6 +115,7 @@ pub fn library_text(
         library: LibrarySection {
             name: name.to_string(),
             description: None,
+            ..LibrarySection::default()
         },
         mode: LibraryMode::default(),
         workflow: WorkflowConfig::default(),
