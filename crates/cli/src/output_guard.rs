@@ -20,7 +20,7 @@ impl Guard {
     pub fn new(root: &Path) -> Self {
         Guard {
             root: signex_altium_convert::paths::canonical(root)
-                .unwrap_or_else(|_| root.to_path_buf()),
+                .unwrap_or_else(|_| signex_altium_convert::paths::plain(root.to_path_buf())),
             undo: Vec::new(),
             committed: false,
         }
@@ -29,7 +29,10 @@ impl Guard {
     /// `path` is under the root by plain names only (no `..`), no folder on
     /// the way is a symlink, and the target, if it exists, is a regular file.
     fn check(&self, path: &Path) -> Result<()> {
-        let rel = path
+        // The root is in the plain form; a caller's path may still be
+        // verbatim (`\\?\C:\...` on Windows), so compare the same form.
+        let plain = signex_altium_convert::paths::plain(path.to_path_buf());
+        let rel = plain
             .strip_prefix(&self.root)
             .map_err(|_| anyhow::anyhow!("{} is outside the output folder", path.display()))?;
         let mut cur = self.root.clone();
@@ -104,12 +107,16 @@ impl Guard {
 
     fn undo_all(&mut self, root: Option<&Path>) -> Vec<String> {
         let mut errors = Vec::new();
+        // The same form as the recorded paths, so the walk up stops at it.
+        let root = root.map(|r| signex_altium_convert::paths::plain(r.to_path_buf()));
+        let root = root.as_deref();
         let guard_root = Guard {
             root: self.root.clone(),
             undo: Vec::new(),
             committed: true,
         };
         for (path, old) in self.undo.drain(..).rev() {
+            let path = signex_altium_convert::paths::plain(path);
             if let Err(e) = guard_root.check(&path) {
                 errors.push(format!("could not restore {}: {e}", path.display()));
                 continue;
@@ -158,6 +165,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p.canonicalize().unwrap()
+    }
+
+    /// A verbatim path to a file inside the folder is inside it.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_path_under_a_plain_root_is_inside() {
+        let d = tmp("verbatim");
+        let plain_root = signex_altium_convert::paths::plain(d.clone());
+        let mut g = Guard::new(&plain_root);
+        g.write(&d.join("a.txt"), b"a").unwrap();
+        g.commit();
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

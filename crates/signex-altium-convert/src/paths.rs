@@ -97,6 +97,17 @@ mod tests {
         assert_eq!(p(&long), PathBuf::from(&long));
     }
 
+    /// The output guard compares a written file with its plain root: a
+    /// verbatim file path under that root must come out under it.
+    #[test]
+    fn a_verbatim_file_under_a_plain_root_comes_out_under_it() {
+        let root = p(r"\\?\C:\Users\me\AppData\Local\Temp\out");
+        let file = p(r"\\?\C:\Users\me\AppData\Local\Temp\out\a.txt");
+        let (root, file) = (root.to_str().unwrap(), file.to_str().unwrap());
+        assert_eq!(root, r"C:\Users\me\AppData\Local\Temp\out");
+        assert!(file.starts_with(&format!("{root}\\")), "{file}");
+    }
+
     #[test]
     fn com0_and_longer_names_are_ordinary() {
         assert_eq!(
