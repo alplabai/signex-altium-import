@@ -260,16 +260,18 @@ primitive records of any type. The name block holds exactly the string:
 its length is one more than the string's length byte. Observed in
 `tests/samples/Simple.PcbLib`:
 
-- The root also holds storage `FileVersionInfo` (as do most footprint
-  libraries of a private corpus), whose `Data` stream is one
-  `[u32 len]|COUNT=n|VER0=…` text record. Its first block is not a name
-  block (the byte after the length is `|`), and the reader skips every root
-  storage whose first block is not one. `Library` is skipped by name.
 - `Library/Data` follows its header text record with a `u32` count (13) and
   that many `[u32 len][length-prefixed name]` entries, the footprints in
   library order; storage names are cut to 31 characters
   (`SQFP50P800X800X300_HS-33T300X30` holds `…T300X300`), with the cut name
   also listed in `SectionKeys`.
+- The root also holds storage `FileVersionInfo` (as do most footprint
+  libraries of a private corpus), whose `Data` stream is one
+  `[u32 len]|COUNT=n|VER0=…` text record. A record of 125 bytes would look
+  like a name block (`|` is 124), so the reader takes as footprints only the
+  storages whose name block names an entry of the directory, and reports
+  the others (`library.storage_skipped`). Without a directory, a name block
+  must hold exactly one length-prefixed string. `Library` is skipped by name.
 
 ## Project (`.PrjPcb`)
 

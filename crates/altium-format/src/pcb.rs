@@ -465,6 +465,36 @@ pub struct PcbLib {
     pub models: Vec<LibModel>,
     /// The container's DIFAT had to be repaired to be read.
     pub repaired: bool,
+    /// Root storages with a `Data` stream that are not footprints.
+    pub skipped: Vec<SkippedStorage>,
+}
+
+/// A root storage of a footprint library read as not a footprint.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SkippedStorage {
+    /// It is the library's `FileVersionInfo`.
+    pub version_info: bool,
+    /// Size of its `Data` stream.
+    pub data_len: usize,
+}
+
+/// The footprint directory after `Library/Data`'s header: a `u32` count and
+/// that many `[u32 len][length-prefixed name]` blocks.
+fn footprint_list(r: &mut Reader) -> Option<Vec<String>> {
+    let n = r.u32("footprint count").ok()? as usize;
+    if n > r.remaining() / 5 {
+        return None;
+    }
+    (0..n)
+        .map(|_| pascal(r.block("footprint entry").ok()?))
+        .collect::<Option<Vec<_>>>()
+        .filter(|l| !l.is_empty())
+}
+
+/// The length-prefixed string a block opens with.
+fn pascal(b: &[u8]) -> Option<String> {
+    let n = *b.first()? as usize;
+    Some(crate::params::decode_ansi(b.get(1..1 + n)?))
 }
 
 /// One entry of a library's model table: its record in `Library/Models/Data`
@@ -543,11 +573,13 @@ impl PcbLib {
             repaired: c.repaired(),
             ..PcbLib::default()
         };
+        let mut listed = None;
         if let Some(data) = c.stream_opt("Library/Data")? {
-            // Only the leading text record; binary sections follow it.
+            // The header text record, then the footprint directory.
             let mut r = Reader::new(&data, "Library/Data");
             if let Ok(block) = r.block("library header") {
                 lib.params = Params::parse(block);
+                listed = footprint_list(&mut r);
             }
         }
         lib.models = read_models(c, budget)?;
@@ -559,16 +591,25 @@ impl PcbLib {
             let Some(data) = c.stream_opt(&format!("{storage}/Data"))? else {
                 continue;
             };
+            // A footprint's Data opens with a block holding its name. The
+            // directory decides which storages are footprints; without one,
+            // the block must hold exactly one length-prefixed string.
             let mut r = Reader::new(&data, "footprint Data");
-            let name_block = r.block("footprint name")?;
-            // A footprint's Data opens with a block holding exactly one
-            // length-prefixed name. Other root storages with a Data stream
-            // (`FileVersionInfo`: one `|KEY=VALUE` text record) are not
-            // footprints.
-            if name_block.first().map(|&n| n as usize + 1) != Some(name_block.len()) {
+            let name = r.block("footprint name").ok().and_then(|b| {
+                let exact = b.first().map(|&n| n as usize + 1) == Some(b.len());
+                let name = pascal(b)?;
+                match &listed {
+                    Some(list) => list.contains(&name).then_some(name),
+                    None => exact.then_some(name),
+                }
+            });
+            let Some(name) = name else {
+                lib.skipped.push(SkippedStorage {
+                    version_info: storage == "FileVersionInfo",
+                    data_len: data.len(),
+                });
                 continue;
-            }
-            let name = crate::params::decode_ansi(&name_block[1..]);
+            };
             let wide = wide_strings(c.stream_opt(&format!("{storage}/WideStrings"))?.as_deref());
             let mut primitives = Primitives::default();
             parse_primitives(&data[r.pos()..], &storage, &wide, &mut primitives)?;

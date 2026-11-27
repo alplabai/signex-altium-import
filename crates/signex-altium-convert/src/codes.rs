@@ -85,6 +85,7 @@ pub const CODES: &[(&str, Severity)] = &[
     ("table.lossy_text", I),
     ("library.search_truncated", I),
     ("library.difat_repaired", I),
+    ("library.storage_skipped", I),
     ("row.key_missing", E),
     ("row.symbol_missing", E),
     ("row.symbol_library_missing", E),

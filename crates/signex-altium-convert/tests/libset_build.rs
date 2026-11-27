@@ -826,6 +826,19 @@ fn a_part_name_the_writer_would_refuse_is_cleaned() {
 }
 
 #[test]
+fn the_version_info_storage_is_reported_not_converted() {
+    let (b, r) = convert(&[pcb("Simple.PcbLib")]);
+    assert_eq!(b.source.footprints, 13);
+    let skipped: Vec<_> = r
+        .items()
+        .iter()
+        .filter(|i| i.code == "library.storage_skipped")
+        .collect();
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].detail["version_info"], true);
+}
+
+#[test]
 fn a_source_saved_again_with_a_newer_time_changes_nothing() {
     let mk = |secs: u64| {
         let mut l = sch("simple.SchLib");

@@ -353,6 +353,30 @@ pub fn build_library(
                 detail: serde_json::Value::Null,
             });
         }
+        if let SourceBody::Pcb(l) = &s.body {
+            for k in &l.skipped {
+                let what = if k.version_info {
+                    "its version-info storage"
+                } else {
+                    "a storage the footprint list does not name"
+                };
+                report.push(Item {
+                    kind: ItemKind::Library,
+                    source: s.name.clone(),
+                    id: None,
+                    code: "library.storage_skipped",
+                    severity: Severity::Info,
+                    message: format!(
+                        "{}: {what} ({} bytes of data) is not a footprint; skipped",
+                        s.name, k.data_len
+                    ),
+                    detail: serde_json::json!({
+                        "version_info": k.version_info,
+                        "bytes": k.data_len,
+                    }),
+                });
+            }
+        }
     }
     // With a database, only the symbols and footprints its rows name are
     // written, and its rows (not the components) are the parts.
