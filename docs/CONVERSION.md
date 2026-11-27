@@ -437,6 +437,7 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `part.param_ambiguous` | info | A parameter value kept as text or not imported because it is unclear |
 | `part.param_dropped` | dropped | A parameter without a usable name, or one that repeats another |
 | `part.text_sanitized` | info | Control characters or a triple apostrophe in a value replaced |
+| `part.ansi_pipe_assumed` | info | A record of the part has a value with byte `0x8E` and no UTF-8 form; read as `\|` (an escaped `\|`, not `Ž`), once per record |
 | `part.template_incomplete` | info | The class template wants parameters the part lacks |
 | `part.row_invalid` | error | The part row failed the writer's checks; part not written |
 | `footprint.name_collision` | approximated | A footprint name is already defined; parts bind to the first |
@@ -471,4 +472,4 @@ contract's: `info` (nothing lost), `approximated` (written, approximately),
 | `library.storage_skipped` | info | A footprint library's root storage with data is not in its footprint list (for example its version info); skipped |
 | `library.input_unreadable` | error | An input file could not be read (library runs) |
 
-83 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.
+84 codes. The catalogue lives in `crates/signex-altium-convert/src/codes.rs`.

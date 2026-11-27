@@ -839,6 +839,20 @@ fn the_version_info_storage_is_reported_not_converted() {
 }
 
 #[test]
+fn each_record_read_with_an_assumed_pipe_is_reported() {
+    let mut c = base_component();
+    c.ansi_pipe_assumed = 2;
+    let (b, r) = convert(&[schlib_of(vec![c])]);
+    assert_eq!(b.written.parts, 1);
+    let n = r
+        .items()
+        .iter()
+        .filter(|i| i.code == "part.ansi_pipe_assumed")
+        .count();
+    assert_eq!(n, 2);
+}
+
+#[test]
 fn a_source_saved_again_with_a_newer_time_changes_nothing() {
     let mk = |secs: u64| {
         let mut l = sch("simple.SchLib");

@@ -64,6 +64,7 @@ pub const CODES: &[(&str, Severity)] = &[
     ("part.param_ambiguous", I),
     ("part.param_dropped", D),
     ("part.text_sanitized", I),
+    ("part.ansi_pipe_assumed", I),
     ("part.template_incomplete", I),
     ("part.row_invalid", E),
     ("footprint.name_collision", A),

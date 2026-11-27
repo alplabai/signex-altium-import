@@ -7,6 +7,7 @@
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Params {
     entries: Vec<(String, String)>,
+    ansi_pipe_assumed: bool,
 }
 
 /// Decode legacy ANSI text. Altium writes the system code page; Windows-1252
@@ -31,17 +32,38 @@ fn decode_value(bytes: &[u8]) -> String {
         .join("|")
 }
 
+/// The `%UTF8%` form `text` of a value whose ANSI form is `ansi`: the `¦`
+/// that stand where the ANSI form has `0x8E` become `|`. The ANSI form's
+/// `0x8E` and `0xA6` (a real `¦`) pair, in order, with the UTF-8 form's `¦`.
+fn unescape_utf8(ansi: &[u8], text: &str) -> String {
+    if !ansi.contains(&PIPE_ANSI) {
+        return text.to_string();
+    }
+    let mut marks = ansi.iter().filter(|&&b| b == PIPE_ANSI || b == 0xA6);
+    text.chars()
+        .map(|c| match c {
+            PIPE_UTF8 if marks.next() == Some(&PIPE_ANSI) => '|',
+            c => c,
+        })
+        .collect()
+}
+
 impl Params {
     /// Parse a raw payload. Trailing NULs are ignored. A `%UTF8%KEY` entry
-    /// carries the UTF-8 form of `KEY` and replaces the ANSI value. In a
-    /// value, ANSI byte `0x8E` is a `|`; in the UTF-8 form `¦` is, when the
-    /// ANSI form escapes a `|` and holds no `¦` (`0xA6`) of its own.
+    /// carries the UTF-8 form of `KEY` and replaces the ANSI value. A `|`
+    /// inside a value is byte `0x8E` in the ANSI form and `¦` at the same
+    /// place in the UTF-8 form; see [`Params::ansi_pipe_assumed`].
     pub fn parse(raw: &[u8]) -> Self {
+        struct Entry<'a> {
+            key: String,
+            value: String,
+            ansi: Option<&'a [u8]>,
+            utf8: bool,
+        }
         let end = raw.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
         let raw = &raw[..end];
-        // Key, value, and whether the ANSI value escapes a `|` as `0x8E`.
-        let mut entries: Vec<(String, String, bool)> = Vec::new();
-        let mut utf8: Vec<(String, String)> = Vec::new();
+        let mut entries: Vec<Entry> = Vec::new();
+        let mut utf8: Vec<(String, &[u8])> = Vec::new();
         for field in raw.split(|&b| b == b'|') {
             if field.is_empty() {
                 continue;
@@ -52,28 +74,48 @@ impl Params {
             let (k, v) = (&field[..eq], &field[eq + 1..]);
             let key = decode_ansi(k);
             if let Some(stripped) = key.strip_prefix("%UTF8%") {
-                utf8.push((
-                    stripped.to_string(),
-                    String::from_utf8_lossy(v).into_owned(),
-                ));
+                utf8.push((stripped.to_string(), v));
             } else {
-                let escapes = v.contains(&PIPE_ANSI) && !v.contains(&0xA6);
-                entries.push((key, decode_value(v), escapes));
+                entries.push(Entry {
+                    key,
+                    value: decode_value(v),
+                    ansi: Some(v),
+                    utf8: false,
+                });
             }
         }
         for (k, v) in utf8 {
-            match entries
-                .iter_mut()
-                .find(|(ek, _, _)| ek.eq_ignore_ascii_case(&k))
-            {
-                Some(slot) if slot.2 => slot.1 = v.replace(PIPE_UTF8, "|"),
-                Some(slot) => slot.1 = v,
-                None => entries.push((k, v, false)),
+            let text = String::from_utf8_lossy(v);
+            match entries.iter_mut().find(|e| e.key.eq_ignore_ascii_case(&k)) {
+                Some(e) => {
+                    e.value = match e.ansi {
+                        Some(a) => unescape_utf8(a, &text),
+                        None => text.into_owned(),
+                    };
+                    e.utf8 = true;
+                }
+                None => entries.push(Entry {
+                    key: k,
+                    value: text.into_owned(),
+                    ansi: None,
+                    utf8: true,
+                }),
             }
         }
+        let ansi_pipe_assumed = entries
+            .iter()
+            .any(|e| !e.utf8 && e.ansi.is_some_and(|a| a.contains(&PIPE_ANSI)));
         Self {
-            entries: entries.into_iter().map(|(k, v, _)| (k, v)).collect(),
+            entries: entries.into_iter().map(|e| (e.key, e.value)).collect(),
+            ansi_pipe_assumed,
         }
+    }
+
+    /// A value had byte `0x8E` and no `%UTF8%` form, and was read as `|`.
+    /// In such a value a real `Ž` (Windows-1252 `0x8E`) cannot be told
+    /// apart from an escaped `|`.
+    pub fn ansi_pipe_assumed(&self) -> bool {
+        self.ansi_pipe_assumed
     }
 
     pub fn from_pairs<K: Into<String>, V: Into<String>>(
@@ -84,6 +126,7 @@ impl Params {
                 .into_iter()
                 .map(|(k, v)| (k.into(), v.into()))
                 .collect(),
+            ansi_pipe_assumed: false,
         }
     }
 
@@ -243,6 +286,24 @@ mod tests {
                 assert!(p.get(k).is_some());
             }
         }
+    }
+
+    #[test]
+    fn real_broken_bars_and_escaped_pipes_by_position() {
+        let p = Params::parse(b"|%UTF8%Text=a\xc2\xa6b\xc2\xa6c\xc2\xa6d|Text=a\xa6b\x8ec\xa6d|");
+        assert_eq!(p.str("Text"), "a\u{A6}b|c\u{A6}d");
+        assert!(!p.ansi_pipe_assumed());
+    }
+
+    #[test]
+    fn an_ansi_only_escape_is_read_as_a_pipe_and_flagged() {
+        let p = Params::parse(b"|Name=Netlist|Text=a\x8eb|");
+        assert_eq!(p.str("Text"), "a|b");
+        assert!(p.ansi_pipe_assumed());
+        let p = Params::parse(b"|Text=a\x8eb|%UTF8%Text=a\xc2\xa6b|");
+        assert_eq!(p.str("Text"), "a|b");
+        assert!(!p.ansi_pipe_assumed());
+        assert!(!Params::parse(b"|Text=ab|").ansi_pipe_assumed());
     }
 
     #[test]

@@ -381,6 +381,8 @@ pub struct Component {
     /// Body graphics with the part id they belong to (-1 = every part).
     pub shapes: Vec<(i32, i32, Shape)>,
     pub params: Params,
+    /// Records of a library symbol read with [`Params::ansi_pipe_assumed`].
+    pub ansi_pipe_assumed: usize,
 }
 
 impl Component {
@@ -397,6 +399,7 @@ impl Component {
             mirrored: p.bool("IsMirrored"),
             unique_id: p.string("UniqueID"),
             params: p.clone(),
+            ansi_pipe_assumed: usize::from(p.ansi_pipe_assumed()),
             ..Default::default()
         }
     }
@@ -805,6 +808,7 @@ pub fn parse_symbol_stream(data: &[u8]) -> Result<Component> {
                     continue;
                 }
                 let Some(c) = comp.as_mut() else { continue };
+                c.ansi_pipe_assumed += usize::from(p.ansi_pipe_assumed());
                 let part = p.i32_or("OwnerPartId", -1);
                 let mode = p.i32_or("OwnerPartDisplayMode", 0);
                 match rec {

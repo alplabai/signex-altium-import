@@ -57,6 +57,12 @@ impl Parts {
     pub fn add(&mut self, cx: &PartCx, report: &mut Report, input: PartInput) -> bool {
         let comp = input.comp;
         report.set_scope_with_id(input.source_name.clone(), input.row_id);
+        for _ in 0..comp.ansi_pipe_assumed {
+            report.warn(
+                "part.ansi_pipe_assumed",
+                "a value holds byte 0x8E with no UTF-8 form; read as an escaped | (a real \u{17D} would read the same)",
+            );
+        }
         let Some(binding) = bind(comp, cx.index, report) else {
             // The error item says why; the part is not written.
             report.set_scope("");

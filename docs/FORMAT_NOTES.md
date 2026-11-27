@@ -21,15 +21,18 @@ with a `%UTF8%KEY` entry overriding `KEY`. Kind 1 is a packed binary
 record (library pins).
 
 **`|` inside a value.** A raw `|` would end the field, so a value stores it
-as byte `0x8E` in the ANSI form and as `¦` (U+00A6) in the `%UTF8%` form.
-Observed in `tests/samples/simple.SchDoc`: pin records carry
+as byte `0x8E` in the ANSI form and as `¦` (U+00A6) at the same place in the
+`%UTF8%` form. Observed in `tests/samples/simple.SchDoc`: pin records carry
 `SwapIDPart=<8E>&<8E>` beside `%UTF8%SwapIDPart=¦&¦`, the same `|&|` that
 library pads hold length-prefixed (`Simple.PcbLib`, block after the pad
 name). Observed in a private corpus file: parameter values whose ANSI form
-holds `0x8E` where a black-box reference read shows `|`. The reader decodes
-`0x8E` in a value as `|`, and `¦` in a `%UTF8%` value as `|` only when the
-ANSI form has a `0x8E` and no `0xA6` (a real `¦`). Keys, length-prefixed
-strings and other text are not touched.
+holds `0x8E`, with no `%UTF8%` form, where a black-box reference read shows
+`|`. The reader pairs the ANSI form's `0x8E` and `0xA6` (a real `¦`), in
+order, with the `%UTF8%` form's `¦`, and only the ones paired with `0x8E`
+become `|`. An ANSI-only value's `0x8E` is read as `|` too, but there it is
+ambiguous: a real `Ž` (Windows-1252 `0x8E`) in an older ANSI-only value
+cannot be told apart, so such a record is reported (`part.ansi_pipe_assumed`).
+Keys, length-prefixed strings and other text are not touched.
 
 **Documents.** Stream `FileHeader`. Frame 0 is the header. The other
 frames are records numbered from 0, and a child names its parent with

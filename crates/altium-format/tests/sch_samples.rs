@@ -173,3 +173,24 @@ fn one_unreadable_component_is_skipped_and_listed_not_fatal() {
     assert_eq!(lib.unreadable.len(), 1);
     assert_eq!(lib.unreadable[0].0, "Position");
 }
+
+#[test]
+fn records_with_an_ansi_only_escaped_pipe_are_counted() {
+    let mut s = Vec::new();
+    for rec in [
+        &b"|RECORD=1|LibReference=X|ComponentDescription=a\x8eb|"[..],
+        b"|RECORD=41|Name=Netlist|Text=p\x8eq\x8er|",
+        b"|RECORD=41|Name=Other|Text=p\x8eq|%UTF8%Text=p\xc2\xa6q|",
+        b"|RECORD=41|Name=Plain|Text=pq|",
+    ] {
+        let mut payload = rec.to_vec();
+        payload.push(0);
+        s.extend((payload.len() as u32).to_le_bytes());
+        s.extend(payload);
+    }
+    let c = altium_format::sch::parse_symbol_stream(&s).unwrap();
+    assert_eq!(c.ansi_pipe_assumed, 2, "the component and Netlist records");
+    assert_eq!(c.description, "a|b");
+    assert_eq!(c.parameters[0].text.text, "p|q|r");
+    assert_eq!(c.parameters[1].text.text, "p|q");
+}
