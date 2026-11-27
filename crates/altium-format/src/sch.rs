@@ -60,6 +60,8 @@ pub mod kind {
     pub const PARAMETER: i64 = 41;
     pub const IMPLEMENTATION_LIST: i64 = 44;
     pub const IMPLEMENTATION: i64 = 45;
+    pub const MAP_DEFINER_LIST: i64 = 46;
+    pub const MAP_DEFINER: i64 = 47;
 }
 
 /// Pin electrical type, as stored.
@@ -177,7 +179,8 @@ impl Pin {
         }
         r.skip(1, "pin reserved")?;
         let owner_part_id = i32::from(r.i16("owner part")?);
-        let display_mode = i32::from(r.u8("display mode")?);
+        // Signed: -1 (stored 0xFF) is an item for no particular display mode.
+        let display_mode = i32::from(r.u8("display mode")? as i8);
         let symbols = PinSymbols {
             inner_edge: r.u8("inner edge")?,
             outer_edge: r.u8("outer edge")?,
@@ -274,6 +277,28 @@ pub struct Implementation {
     pub model_name: String,
     pub model_type: String,
     pub is_current: bool,
+    /// Symbol pin designator to footprint pad name, for pins whose pad is
+    /// not the same name. Never filled by the reader yet: no sample holds a
+    /// pin map (`docs/FORMAT_NOTES.md`).
+    pub pin_map: Vec<(String, String)>,
+    /// The model has a pin map this reader does not decode (a record 46 with
+    /// keys, or any record 47). The map must not be read as 1:1.
+    pub pin_map_unread: bool,
+}
+
+/// A map record 46 that says something: it has keys beyond its framing.
+fn map_list_has_content(p: &Params) -> bool {
+    p.iter().any(|(k, _)| {
+        ![
+            "RECORD",
+            "OwnerIndex",
+            "IndexInSheet",
+            "OwnerPartId",
+            "OwnerPartDisplayMode",
+        ]
+        .iter()
+        .any(|f| k.eq_ignore_ascii_case(f))
+    })
 }
 
 /// Body graphics, shared by symbols and sheets.
@@ -356,6 +381,8 @@ pub struct Component {
     /// Body graphics with the part id they belong to (-1 = every part).
     pub shapes: Vec<(i32, i32, Shape)>,
     pub params: Params,
+    /// Records of a library symbol read with [`Params::ansi_pipe_assumed`].
+    pub ansi_pipe_assumed: usize,
 }
 
 impl Component {
@@ -372,6 +399,7 @@ impl Component {
             mirrored: p.bool("IsMirrored"),
             unique_id: p.string("UniqueID"),
             params: p.clone(),
+            ansi_pipe_assumed: usize::from(p.ansi_pipe_assumed()),
             ..Default::default()
         }
     }
@@ -515,6 +543,8 @@ impl SchDoc {
         let mut sheet_slot: HashMap<usize, usize> = HashMap::new();
         // Implementation lists sit between a component and its models.
         let mut impl_list_owner: HashMap<usize, usize> = HashMap::new();
+        // Record index of a model or its map list -> (component, model).
+        let mut impl_at: HashMap<usize, (usize, usize)> = HashMap::new();
 
         for (index, frame) in records.iter().enumerate() {
             let p = match frame {
@@ -572,7 +602,24 @@ impl SchDoc {
                             model_name: p.string("ModelName"),
                             model_type: p.string("ModelType"),
                             is_current: p.bool("IsCurrent"),
+                            pin_map: Vec::new(),
+                            pin_map_unread: false,
                         });
+                        let at = doc.components[slot].implementations.len() - 1;
+                        impl_at.insert(index, (slot, at));
+                    }
+                }
+                kind::MAP_DEFINER_LIST => {
+                    if let Some((slot, at)) = owner.and_then(|o| impl_at.get(&o).copied()) {
+                        impl_at.insert(index, (slot, at));
+                        if map_list_has_content(p) {
+                            doc.components[slot].implementations[at].pin_map_unread = true;
+                        }
+                    }
+                }
+                kind::MAP_DEFINER => {
+                    if let Some((slot, at)) = owner.and_then(|o| impl_at.get(&o).copied()) {
+                        doc.components[slot].implementations[at].pin_map_unread = true;
                     }
                 }
                 kind::WIRE => doc.wires.push(points(p)),
@@ -623,8 +670,9 @@ impl SchDoc {
                     }
                 }
                 kind::SHEET => doc.setup = sheet_setup(p),
-                // Template link and model-map internals: metadata, not design.
-                39 | 46 | 47 | 48 => {}
+                // Template link and a model's trailing record: metadata, not
+                // design. Map records 46 and 47 are read above.
+                39 | 48 => {}
                 _ => match shape(rec, p) {
                     Some(shape) => match (owner_comp, owner) {
                         (Some(slot), _) => doc.components[slot].shapes.push((part, mode, shape)),
@@ -643,6 +691,12 @@ impl SchDoc {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SchLib {
     pub components: Vec<Component>,
+    /// The container's root-entry modified time, if it records one.
+    pub modified: Option<std::time::SystemTime>,
+    /// Components whose storage could not be read: (name, why).
+    pub unreadable: Vec<(String, String)>,
+    /// The container's DIFAT had to be repaired to be read.
+    pub repaired: bool,
 }
 
 impl SchLib {
@@ -661,31 +715,56 @@ impl SchLib {
         let count = h.i64("CompCount").unwrap_or(0).max(0) as usize;
         let section_keys = section_keys(c)?;
         let storages = c.root_storages();
-        let mut lib = SchLib::default();
+        let mut lib = SchLib {
+            modified: c.modified(),
+            repaired: c.repaired(),
+            ..SchLib::default()
+        };
         for i in 0..count {
             let libref = h.string(&format!("LibRef{i}"));
             let storage = section_keys
                 .get(&libref)
                 .cloned()
                 .unwrap_or_else(|| storage_name(&libref));
-            if !storages.iter().any(|s| s == &storage) {
-                return Err(Error::MissingStream(format!("{storage}/Data")));
+            // One component that cannot be read is skipped and reported, not
+            // the whole library.
+            let one = (|| -> Result<Component> {
+                if !storages.iter().any(|s| s == &storage) {
+                    return Err(Error::MissingStream(format!("{storage}/Data")));
+                }
+                let data = c.stream(&format!("{storage}/Data"))?;
+                let mut comp = parse_symbol_stream(&data)?;
+                apply_pin_fracs(c, &storage, &mut comp)?;
+                Ok(comp)
+            })();
+            match one {
+                Ok(mut comp) => {
+                    if comp.lib_reference.is_empty() {
+                        comp.lib_reference = libref;
+                    }
+                    lib.components.push(comp);
+                }
+                Err(e) => lib.unreadable.push((libref, e.to_string())),
             }
-            let data = c.stream(&format!("{storage}/Data"))?;
-            let mut comp = parse_symbol_stream(&data)?;
-            apply_pin_fracs(c, &storage, &mut comp)?;
-            if comp.lib_reference.is_empty() {
-                comp.lib_reference = libref;
-            }
-            lib.components.push(comp);
         }
         Ok(lib)
     }
 }
 
-/// Storage names are capped at 31 characters and cannot hold `/`.
+/// Storage names are capped at 31 characters and cannot hold `/`, `\\`, `:`
+/// or `!` (written as `_`; observed in a private corpus file).
 fn storage_name(libref: &str) -> String {
-    libref.replace('/', "_").chars().take(31).collect()
+    libref
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '!') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(31)
+        .collect()
 }
 
 /// Long or unusual names map to their storage through `SectionKeys`.
@@ -729,6 +808,7 @@ pub fn parse_symbol_stream(data: &[u8]) -> Result<Component> {
                     continue;
                 }
                 let Some(c) = comp.as_mut() else { continue };
+                c.ansi_pipe_assumed += usize::from(p.ansi_pipe_assumed());
                 let part = p.i32_or("OwnerPartId", -1);
                 let mode = p.i32_or("OwnerPartDisplayMode", 0);
                 match rec {
@@ -744,7 +824,21 @@ pub fn parse_symbol_stream(data: &[u8]) -> Result<Component> {
                             model_name: p.string("ModelName"),
                             model_type: p.string("ModelType"),
                             is_current: p.bool("IsCurrent"),
+                            pin_map: Vec::new(),
+                            pin_map_unread: false,
                         })
+                    }
+                    kind::MAP_DEFINER_LIST if in_impl_list => {
+                        if map_list_has_content(&p)
+                            && let Some(i) = c.implementations.last_mut()
+                        {
+                            i.pin_map_unread = true;
+                        }
+                    }
+                    kind::MAP_DEFINER if in_impl_list => {
+                        if let Some(i) = c.implementations.last_mut() {
+                            i.pin_map_unread = true;
+                        }
                     }
                     _ => {
                         if let Some(s) = shape(rec, &p) {

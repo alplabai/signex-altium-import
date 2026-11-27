@@ -1,0 +1,5 @@
+# Mapping override for the synthetic fixture: two columns the default name
+# recognition does not know.
+[tables."Resistors"]
+"Maker" = "Manufacturer"
+"Maker Part No" = "Manufacturer Part Number"

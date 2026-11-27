@@ -14,7 +14,6 @@
 //! only place nanometres are used; `crate::coord` no longer defines a
 //! competing integer-nm coordinate type (#394).
 
-const MM_PER_NM: f64 = 1.0e-6;
 const NM_PER_MM: f64 = 1.0e6;
 
 /// A document value that cannot be written to the wire format: NaN,
@@ -37,6 +36,25 @@ pub(in crate::format) fn mm_to_nm(mm: f64, field: &'static str) -> Result<i64, N
     Ok(scaled as i64)
 }
 
-pub(in crate::format) fn nm_to_mm(nm: i64) -> f64 {
-    (nm as f64) * MM_PER_NM
+/// `mm` as the integer nanometres the file stores, or `None` for a value
+/// the file cannot hold. Two lengths that save to the same nm compare
+/// equal here, which raw `f64` mm need not after a save + load
+/// (`0.1 + 0.2` is 0.30000000000000004 and reads back as 0.3): use this to
+/// compare or hash geometry across a save.
+pub fn mm_as_stored_nm(mm: f64) -> Option<i64> {
+    mm_to_nm(mm, "length").ok()
+}
+
+/// Whether `nm` converts to mm and back without hitting the [`mm_to_nm`]
+/// refusal, i.e. whether a document holding it can be saved. Range only: a
+/// value beyond 2^53 nm (9007 km) may come back a few nm off, which no
+/// drawing can tell from the original.
+pub(in crate::format) fn nm_survives_round_trip(nm: i64) -> bool {
+    mm_to_nm(nm_to_mm(nm), "length").is_ok()
+}
+
+pub(crate) fn nm_to_mm(nm: i64) -> f64 {
+    // Divided, not multiplied by 1e-6: the quotient is the double nearest
+    // the decimal mm, so 100000 nm reads back as 0.1, not 0.09999999999999999.
+    (nm as f64) / NM_PER_MM
 }

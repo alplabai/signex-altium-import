@@ -67,7 +67,6 @@ fn component_rotation_rejects_non_finite() {
 fn wire_stroke_width_rejects_non_finite() {
     let row = SchWireRow {
         uuid: Uuid::nil(),
-        net: "n".into(),
         start_x: 0,
         start_y: 0,
         end_x: 1,
@@ -152,7 +151,6 @@ fn format_f64_refuses_non_finite_and_keeps_finite_output() {
 fn write_tsv_block_names_block_row_and_field() {
     let finite = SchWireRow {
         uuid: Uuid::nil(),
-        net: "n".into(),
         start_x: 0,
         start_y: 0,
         end_x: 1,
@@ -210,6 +208,7 @@ fn a_non_finite_symbol_text_in_extras_fails_the_save_naming_the_path() {
                 position: Point { x: 0.0, y: 0.0 },
                 rotation: 0.0,
                 font_size: bad,
+                font_family: None,
                 justify_h: HAlign::default(),
                 justify_v: VAlign::default(),
                 hidden: false,
@@ -272,6 +271,10 @@ fn a_non_finite_manifest_stackup_or_zone_number_fails_the_save() {
         thermal_width: 0.0,
         clearance: 0.0,
         min_thickness,
+        min_island_area: 0.0,
+        remove_dead_islands: false,
+        shelved: false,
+        unfilled: false,
         unknown: Default::default(),
     };
     for bad in [f64::NAN, f64::INFINITY] {
@@ -314,6 +317,7 @@ fn finite_extras_still_save() {
             position: Point { x: 1.0, y: 2.0 },
             rotation: 90.0,
             font_size: 1.27,
+            font_family: None,
             justify_h: HAlign::default(),
             justify_v: VAlign::default(),
             hidden: false,

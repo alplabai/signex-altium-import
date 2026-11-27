@@ -8,6 +8,10 @@ What `altium-format` relies on, as verified against the files in
 Binary Altium files are OLE2 compound documents (Compound File Binary).
 Each document type keeps its records in named streams.
 
+Observed in a private corpus file: a header DIFAT with entries past the
+declared FAT sector count that do not hold the free marker. Such a file is
+read after setting those entries free (`library.difat_repaired`).
+
 ## Schematic (`.SchDoc`, `.SchLib`)
 
 **Framing.** A stream is a run of frames. Each frame starts with a `u32`:
@@ -15,6 +19,20 @@ the low 24 bits give the payload length and the high byte gives its kind.
 Kind 0 is text: `|KEY=VALUE|KEY=VALUE…`, NUL-terminated, Windows-1252,
 with a `%UTF8%KEY` entry overriding `KEY`. Kind 1 is a packed binary
 record (library pins).
+
+**`|` inside a value.** A raw `|` would end the field, so a value stores it
+as byte `0x8E` in the ANSI form and as `¦` (U+00A6) at the same place in the
+`%UTF8%` form. Observed in `tests/samples/simple.SchDoc`: pin records carry
+`SwapIDPart=<8E>&<8E>` beside `%UTF8%SwapIDPart=¦&¦`, the same `|&|` that
+library pads hold length-prefixed (`Simple.PcbLib`, block after the pad
+name). Observed in a private corpus file: parameter values whose ANSI form
+holds `0x8E`, with no `%UTF8%` form, where a black-box reference read shows
+`|`. The reader pairs the ANSI form's `0x8E` and `0xA6` (a real `¦`), in
+order, with the `%UTF8%` form's `¦`, and only the ones paired with `0x8E`
+become `|`. An ANSI-only value's `0x8E` is read as `|` too, but there it is
+ambiguous: a real `Ž` (Windows-1252 `0x8E`) in an older ANSI-only value
+cannot be told apart, so such a record is reported (`part.ansi_pipe_assumed`).
+Keys, length-prefixed strings and other text are not touched.
 
 **Documents.** Stream `FileHeader`. Frame 0 is the header. The other
 frames are records numbered from 0, and a child names its parent with
@@ -64,6 +82,99 @@ the name.
 `PinFrac` (per symbol) holds fractions, `[u8 tag][len-prefixed pin
 index][u32 len][zlib]`. Inflated, it gives three `i32` values (x, y,
 length) in 1/100000 units.
+
+### Integrated library (`.IntLib`)
+
+Observed in a private corpus file (two integrated libraries; no sample is
+committed). The compound file holds, at its root:
+
+- `SchLib/<n>.schlib` and `PCBLib/<n>.pcblib`: one embedded library each, in
+  numbered streams (one of each in the observed files). The stream is a type
+  byte `0x02` followed by a zlib stream (`78 xx`); the inflated bytes are
+  themselves a compound file, a complete `.SchLib` or `.PcbLib`, read by the
+  existing readers.
+- `Version.Txt`: five bytes.
+- `LibCrossRef.Txt` and `Parameters   .bin` (three spaces in the name): same
+  type byte and zlib framing. The cross-reference opens with a `u32` entry
+  count equal to the number of schematic components, then per-entry
+  length-prefixed strings (component name, a path inside the file, a
+  description, a source path, the footprint name). It is read only as a
+  cross-check (count and names), never for bindings. `Parameters` holds
+  per-component parameter text and is not read.
+- `CKT/<n>.ckt` simulation models in one of the files: not read.
+
+In the observed integrated libraries the embedded footprint library's model
+table (`Library/Models/Data`, `Library/ModelsNoEmbed/Data`) is empty while
+its component bodies name models by id with no embed flag: the 3D models are
+stored nowhere in the file. The root also holds a storage of simulation
+model streams (`MDL/<n>.mdl`), one with a type byte `0x00`, one zlib
+(type `0x02`); they are not read.
+
+A stream that is empty, has another type byte, does not inflate, or inflates
+to something that is not a compound file is an error, as is a file with no
+embedded library at all.
+
+### Component bodies and the model table (`.PcbLib`)
+
+Observed in `tests/samples/Simple.PcbLib`.
+
+- A footprint's primitive stream holds record type 12, a component body: the
+  common 13-byte header, five bytes, then a length-prefixed text block of
+  `KEY=value` pairs. The keys used: `MODELID` (a GUID in braces),
+  `MODEL.NAME`, `MODEL.EMBED`, `MODEL.2D.X` / `MODEL.2D.Y` (lengths in mil),
+  `MODEL.2D.ROTATION`, `MODEL.3D.ROTX` / `ROTY` / `ROTZ` (degrees),
+  `MODEL.3D.DZ` (length), `BODYPROJECTION`, `OVERALLHEIGHT`. Outline geometry
+  follows the text and is not read.
+- `Library/Models/Data` is a run of length-prefixed text records, one per
+  model: `ID` (the GUID a body names), `NAME`, `EMBED`, `ROTX/Y/Z`, `DZ`,
+  `CHECKSUM`. Record *i* belongs to stream `Library/Models/<i>`, a bare zlib
+  stream (no type byte) holding the model file; in the sample, a STEP file.
+
+### Database library (`.DbLib`)
+
+Observed in a private corpus file. An INI text file in the local code page
+(no byte-order mark). `[DatabaseLinks]` holds `ConnectionString`,
+`LibraryDatabaseType`, `LibraryDatabasePath`, `DatabasePathRelative`,
+`LibrarySearchPath` (folders joined by `;`, relative to the file),
+`SearchSubDirectories`, quoting keys and others. Each table is a `[TableN]`
+with `TableName`, `SchemaName`, `Enabled` (`True`/`False` or `1`/`0`),
+`UserWhere` and `UserWhereText`. Each column mapping is a `[FieldMapN]` with
+one `Options=` line of `key=value` pairs joined by `|`: `FieldName`
+(`<table>.<column>`), `TableNameOnly`, `FieldNameOnly`, `FieldType`,
+`ParameterName` (a parameter, or a reserved name in brackets such as
+`[Library Ref]`, `[Footprint Path 2]`), and the add, update and remove modes.
+`FieldType=0` marks the key field: exactly one per enabled table. Columns of
+a table without a field map exist in the database and are parameters of their
+own name. Field maps belong to a table by `TableNameOnly`. Disabled tables
+may have no field maps.
+
+### Container time
+
+A library's compound-file root entry may record a modified time; a zero time
+reads as 1601 and counts as none (`SchLib::modified`, `PcbLib::modified`).
+The library converter stamps its output with the newest of them.
+
+### Implementations (footprint links)
+
+A component's footprint and other model links are records 44 to 48 below the
+component record:
+
+- `RECORD=44` is the list, owned by the component.
+- `RECORD=45` is one model, owned by the list: `ModelName`, `ModelType`
+  (`PCBLIB` for a footprint; other kinds name other models, for example a
+  simulation), `IsCurrent=T` on the one in use, plus `DatafileCount`,
+  `ModelDatafileEntity0` and `ModelDatafileKind0`. Observed in
+  `tests/samples/simple.SchDoc` (`ModelName=R0603L`, `ModelType=PCBLIB`,
+  `IsCurrent=T`).
+- `RECORD=46` and `RECORD=48` follow each model, owned by it, and carry no
+  keys in the samples (`simple.SchDoc`). Pin maps would live below record 46;
+  **no sample holds one, so they are not decoded**: `Implementation::pin_map`
+  stays empty. A record 46 with keys, or any record 47, sets
+  `Implementation::pin_map_unread`, and the converter skips that part
+  (`part.pin_map_unread`) instead of binding it 1:1. Decoding needs a sample
+  with a non-trivial pin map.
+- The `SchLib` samples hold a list (44) with no models at all, so the library
+  samples bind no footprints; the binding tests build components in memory.
 
 ## PCB (`.PcbDoc`, `.PcbLib`)
 
@@ -148,7 +259,22 @@ kinds, by matching them against layer names:
 
 **Library footprints.** Each footprint is a storage whose `Data` stream
 starts with `[u32 len][length-prefixed name]` and is followed by
-primitive records of any type.
+primitive records of any type. The name block holds exactly the string:
+its length is one more than the string's length byte. Observed in
+`tests/samples/Simple.PcbLib`:
+
+- `Library/Data` follows its header text record with a `u32` count (13) and
+  that many `[u32 len][length-prefixed name]` entries, the footprints in
+  library order; storage names are cut to 31 characters
+  (`SQFP50P800X800X300_HS-33T300X30` holds `…T300X300`), with the cut name
+  also listed in `SectionKeys`.
+- The root also holds storage `FileVersionInfo` (as do most footprint
+  libraries of a private corpus), whose `Data` stream is one
+  `[u32 len]|COUNT=n|VER0=…` text record. A record of 125 bytes would look
+  like a name block (`|` is 124), so the reader takes as footprints only the
+  storages whose name block names an entry of the directory, and reports
+  the others (`library.storage_skipped`). Without a directory, a name block
+  must hold exactly one length-prefixed string. `Library` is skipped by name.
 
 ## Project (`.PrjPcb`)
 

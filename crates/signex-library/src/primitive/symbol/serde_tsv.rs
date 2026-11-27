@@ -1,131 +1,50 @@
 //! Pin TSV codec + token conversions for the symbol wire format.
 
 use super::*;
+use crate::primitive::tsv_cell::{fmt_f64, parse_finite_cell};
 
 // ---- Pin TSV codec --------------------------------------------------
 
-pub(super) fn pin_direction_token(d: PinDirection) -> &'static str {
-    match d {
-        PinDirection::Input => "Input",
-        PinDirection::Output => "Output",
-        PinDirection::Bidirectional => "Bidirectional",
-        PinDirection::Power => "Power",
-        PinDirection::Passive => "Passive",
-        PinDirection::OpenCollector => "OpenCollector",
-        PinDirection::OpenEmitter => "OpenEmitter",
-        PinDirection::NotConnected => "NotConnected",
-        PinDirection::Tristate => "Tristate",
-        PinDirection::Unspecified => "Unspecified",
-    }
+/// The `.snxsym` text for a pin type: the one table on [`PinDirection`].
+pub(super) fn pin_direction_token(value: PinDirection) -> &'static str {
+    value.as_token()
 }
 
-pub(super) fn pin_direction_from_token(s: &str) -> Result<PinDirection, SymbolFileError> {
-    Ok(match s {
-        "Input" => PinDirection::Input,
-        "Output" => PinDirection::Output,
-        "Bidirectional" => PinDirection::Bidirectional,
-        "Power" => PinDirection::Power,
-        "Passive" => PinDirection::Passive,
-        "OpenCollector" => PinDirection::OpenCollector,
-        "OpenEmitter" => PinDirection::OpenEmitter,
-        "NotConnected" => PinDirection::NotConnected,
-        "Tristate" => PinDirection::Tristate,
-        "Unspecified" => PinDirection::Unspecified,
-        other => {
-            return Err(SymbolFileError::UnknownEnumToken {
-                kind: "PinDirection",
-                got: other.to_string(),
-            });
-        }
+pub(super) fn pin_direction_from_token(text: &str) -> Result<PinDirection, SymbolFileError> {
+    PinDirection::from_token(text).ok_or_else(|| SymbolFileError::UnknownEnumToken {
+        kind: "PinDirection",
+        got: text.to_string(),
     })
 }
 
-pub(super) fn pin_orientation_token(o: PinOrientation) -> &'static str {
-    match o {
-        PinOrientation::Up => "Up",
-        PinOrientation::Down => "Down",
-        PinOrientation::Left => "Left",
-        PinOrientation::Right => "Right",
+signex_types::token_enum! {
+    pub(super) fn pin_orientation_token / pin_orientation_from_token for PinOrientation,
+    error SymbolFileError {
+        Up => "Up",
+        Down => "Down",
+        Left => "Left",
+        Right => "Right",
     }
 }
 
-pub(super) fn pin_orientation_from_token(s: &str) -> Result<PinOrientation, SymbolFileError> {
-    Ok(match s {
-        "Up" => PinOrientation::Up,
-        "Down" => PinOrientation::Down,
-        "Left" => PinOrientation::Left,
-        "Right" => PinOrientation::Right,
-        other => {
-            return Err(SymbolFileError::UnknownEnumToken {
-                kind: "PinOrientation",
-                got: other.to_string(),
-            });
-        }
-    })
-}
-
-pub(super) fn pin_symbol_kind_token(k: PinSymbolKind) -> &'static str {
-    match k {
-        PinSymbolKind::None => "None",
-        PinSymbolKind::Dot => "Dot",
-        PinSymbolKind::ClockEdge => "ClockEdge",
-        PinSymbolKind::ActiveLowInput => "ActiveLowInput",
-        PinSymbolKind::ActiveLowOutput => "ActiveLowOutput",
-        PinSymbolKind::SchmittTrigger => "SchmittTrigger",
-        PinSymbolKind::Analog => "Analog",
-        PinSymbolKind::Digital => "Digital",
-        PinSymbolKind::ShiftRight => "ShiftRight",
-        PinSymbolKind::ShiftLeft => "ShiftLeft",
-        PinSymbolKind::Pi => "Pi",
-        PinSymbolKind::Sigma => "Sigma",
-        PinSymbolKind::OpenCollector => "OpenCollector",
-        PinSymbolKind::OpenEmitter => "OpenEmitter",
-        PinSymbolKind::HiZ => "HiZ",
-    }
-}
-
-pub(super) fn pin_symbol_kind_from_token(s: &str) -> Result<PinSymbolKind, SymbolFileError> {
-    Ok(match s {
-        "None" => PinSymbolKind::None,
-        "Dot" => PinSymbolKind::Dot,
-        "ClockEdge" => PinSymbolKind::ClockEdge,
-        "ActiveLowInput" => PinSymbolKind::ActiveLowInput,
-        "ActiveLowOutput" => PinSymbolKind::ActiveLowOutput,
-        "SchmittTrigger" => PinSymbolKind::SchmittTrigger,
-        "Analog" => PinSymbolKind::Analog,
-        "Digital" => PinSymbolKind::Digital,
-        "ShiftRight" => PinSymbolKind::ShiftRight,
-        "ShiftLeft" => PinSymbolKind::ShiftLeft,
-        "Pi" => PinSymbolKind::Pi,
-        "Sigma" => PinSymbolKind::Sigma,
-        "OpenCollector" => PinSymbolKind::OpenCollector,
-        "OpenEmitter" => PinSymbolKind::OpenEmitter,
-        "HiZ" => PinSymbolKind::HiZ,
-        other => {
-            return Err(SymbolFileError::UnknownEnumToken {
-                kind: "PinSymbolKind",
-                got: other.to_string(),
-            });
-        }
-    })
-}
-
-/// Format an `f64` for a TSV cell. `0.0` emits literally as `"0"` so
-/// the most common default is short; non-zero values use the
-/// shortest precision-preserving form via `Display`. Cells must be
-/// re-parseable by `f64::from_str`.
-///
-/// `None` for NaN / ±Inf: `Display` would write `NaN` / `inf`, which
-/// the reader refuses (#678), and an empty cell would silently reset the
-/// value on reopen. The caller turns it into a save error naming the
-/// pin and column (#828).
-fn fmt_f64(v: f64) -> Option<String> {
-    if v == 0.0 {
-        Some("0".to_string())
-    } else if !v.is_finite() {
-        None
-    } else {
-        Some(format!("{v}"))
+signex_types::token_enum! {
+    pub(super) fn pin_symbol_kind_token / pin_symbol_kind_from_token for PinSymbolKind,
+    error SymbolFileError {
+        None => "None",
+        Dot => "Dot",
+        ClockEdge => "ClockEdge",
+        ActiveLowInput => "ActiveLowInput",
+        ActiveLowOutput => "ActiveLowOutput",
+        SchmittTrigger => "SchmittTrigger",
+        Analog => "Analog",
+        Digital => "Digital",
+        ShiftRight => "ShiftRight",
+        ShiftLeft => "ShiftLeft",
+        Pi => "Pi",
+        Sigma => "Sigma",
+        OpenCollector => "OpenCollector",
+        OpenEmitter => "OpenEmitter",
+        HiZ => "HiZ",
     }
 }
 
@@ -139,14 +58,10 @@ fn fmt_opt_f64(v: Option<f64>) -> Option<String> {
 }
 
 fn parse_f64_cell(col: &'static str, s: &str) -> Result<f64, SymbolFileError> {
-    // #678: reject `NaN` / `inf` (and `1e999`, which overflows to inf).
-    s.parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite())
-        .ok_or_else(|| SymbolFileError::InvalidNumericCell {
-            column: col,
-            value: s.to_string(),
-        })
+    parse_finite_cell(s).ok_or_else(|| SymbolFileError::InvalidNumericCell {
+        column: col,
+        value: s.to_string(),
+    })
 }
 
 fn parse_opt_f64_cell(col: &'static str, s: &str) -> Result<Option<f64>, SymbolFileError> {
@@ -168,14 +83,20 @@ fn parse_bool_cell(col: &'static str, s: &str) -> Result<bool, SymbolFileError> 
     }
 }
 
-fn pin_to_tsv_row(pin: &SymbolPin) -> Result<String, SymbolFileError> {
+fn pin_to_tsv_row(pin: &SymbolPin, with_body: bool) -> Result<String, SymbolFileError> {
+    // The cell is `|`-separated with no escaping (the layout every
+    // `.snxsym` on disk uses, backslashes literal), so an item holding `|`
+    // would reload as two items. Refuse it at save instead.
+    if let Some(bad) = pin.function.iter().find(|f| f.contains('|')) {
+        return Err(SymbolFileError::PipeInPinFunction { value: bad.clone() });
+    }
     let function_str = pin.function.join("|");
     let non_finite = |column: &str| SymbolFileError::NonFiniteField {
         field: format!("pin {:?} {column}", pin.number),
     };
     let num = |v: f64, column: &str| fmt_f64(v).ok_or_else(|| non_finite(column));
     let opt = |v: Option<f64>, column: &str| fmt_opt_f64(v).ok_or_else(|| non_finite(column));
-    let cells: [String; 20] = [
+    let mut cells: Vec<String> = vec![
         pin.number.clone(),
         pin.name.clone(),
         pin_direction_token(pin.electrical).to_string(),
@@ -197,7 +118,13 @@ fn pin_to_tsv_row(pin: &SymbolPin) -> Result<String, SymbolFileError> {
         pin.locked.to_string(),
         pin.part_number.to_string(),
     ];
-    for (col, cell) in PIN_TSV_COLUMNS.iter().zip(cells.iter()) {
+    if with_body {
+        cells.push(pin.body_style.to_string());
+    }
+    let columns = PIN_TSV_COLUMNS
+        .iter()
+        .chain(with_body.then_some(&PIN_TSV_BODY_COLUMN));
+    for (col, cell) in columns.zip(cells.iter()) {
         if cell.contains('\t') || cell.contains('\n') || cell.contains("'''") {
             return Err(SymbolFileError::InvalidTsvCell {
                 column: col,
@@ -211,12 +138,20 @@ fn pin_to_tsv_row(pin: &SymbolPin) -> Result<String, SymbolFileError> {
 /// Encode a slice of pins as TSV — header row first, then one row
 /// per pin. Empty slice still emits the header row so the round-trip
 /// produces a parseable block.
+///
+/// The legacy 20-column layout is written unless some pin is off the
+/// normal body, in which case the `body_style` column is appended.
 pub(crate) fn pins_to_tsv(pins: &[SymbolPin]) -> Result<String, SymbolFileError> {
+    let with_body = pins.iter().any(|p| p.body_style != BODY_NORMAL);
     let mut out = String::new();
     out.push_str(&PIN_TSV_COLUMNS.join("\t"));
+    if with_body {
+        out.push('\t');
+        out.push_str(PIN_TSV_BODY_COLUMN);
+    }
     out.push('\n');
     for pin in pins {
-        out.push_str(&pin_to_tsv_row(pin)?);
+        out.push_str(&pin_to_tsv_row(pin, with_body)?);
         out.push('\n');
     }
     Ok(out)
@@ -233,12 +168,13 @@ pub(crate) fn pins_from_tsv(tsv: &str) -> Result<Vec<SymbolPin>, SymbolFileError
     let mut lines = trimmed.split('\n');
     let header = lines.next().ok_or(SymbolFileError::EmptyPinsTsv)?;
     let header_cols: Vec<&str> = header.split('\t').collect();
-    if header_cols.len() != PIN_TSV_COLUMNS.len()
-        || header_cols
-            .iter()
-            .zip(PIN_TSV_COLUMNS.iter())
-            .any(|(g, e)| g != e)
-    {
+    // Legacy files have the 20 base columns; a De Morgan file appends one.
+    let with_body = header_cols.len() == PIN_TSV_COLUMNS.len() + 1;
+    let expected_len = PIN_TSV_COLUMNS.len() + usize::from(with_body);
+    let expected = PIN_TSV_COLUMNS
+        .iter()
+        .chain(with_body.then_some(&PIN_TSV_BODY_COLUMN));
+    if header_cols.len() != expected_len || header_cols.iter().zip(expected).any(|(g, e)| g != e) {
         return Err(SymbolFileError::PinsTsvSchemaMismatch {
             got: header_cols.iter().map(|s| (*s).to_string()).collect(),
         });
@@ -246,11 +182,11 @@ pub(crate) fn pins_from_tsv(tsv: &str) -> Result<Vec<SymbolPin>, SymbolFileError
     let mut pins = Vec::new();
     for (row_idx, line) in lines.enumerate() {
         let cells: Vec<&str> = line.split('\t').collect();
-        if cells.len() != PIN_TSV_COLUMNS.len() {
+        if cells.len() != expected_len {
             return Err(SymbolFileError::PinsTsvCellCountMismatch {
                 row_index: row_idx,
                 got: cells.len(),
-                expected: PIN_TSV_COLUMNS.len(),
+                expected: expected_len,
             });
         }
         pins.push(pin_from_tsv_row(&cells)?);
@@ -267,6 +203,19 @@ fn pin_from_tsv_row(cells: &[&str]) -> Result<SymbolPin, SymbolFileError> {
                 column: "part_number",
                 value: part_number_raw.to_string(),
             })?;
+    // Absent column = a legacy file: every pin is on the normal body.
+    let body_style = match cells.get(20) {
+        None => BODY_NORMAL,
+        Some(raw) => match raw.parse::<u8>() {
+            Ok(tag @ (BODY_COMMON | BODY_NORMAL | BODY_ALTERNATE)) => tag,
+            _ => {
+                return Err(SymbolFileError::InvalidNumericCell {
+                    column: "body_style",
+                    value: (*raw).to_string(),
+                });
+            }
+        },
+    };
     Ok(SymbolPin {
         number: cells[0].to_string(),
         name: cells[1].to_string(),
@@ -294,6 +243,7 @@ fn pin_from_tsv_row(cells: &[&str]) -> Result<SymbolPin, SymbolFileError> {
         hidden: parse_bool_cell("hidden", cells[17])?,
         locked: parse_bool_cell("locked", cells[18])?,
         part_number,
+        body_style,
     })
 }
 

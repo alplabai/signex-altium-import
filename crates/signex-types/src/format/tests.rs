@@ -10,8 +10,7 @@ use crate::pcb::{
     Zone,
 };
 use crate::schematic::{
-    HAlign, Junction, Label, LabelType as LType, LibSymbol, Point as SchPoint, SchematicSheet,
-    Symbol, VAlign, Wire,
+    Junction, Label, LabelType as LType, LibSymbol, Point as SchPoint, SchematicSheet, Symbol, Wire,
 };
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -30,6 +29,10 @@ pub(super) fn empty_sheet() -> SchematicSheet {
 
 pub(super) fn empty_board() -> PcbBoard {
     PcbBoard {
+        sketch: None,
+        stackup: None,
+        rooms: Vec::new(),
+        options: Default::default(),
         unknown: Default::default(),
         uuid: Uuid::nil(),
         version: 1,
@@ -45,6 +48,7 @@ pub(super) fn empty_board() -> PcbBoard {
         zones: vec![],
         graphics: vec![],
         texts: vec![],
+        free: Default::default(),
     }
 }
 
@@ -52,7 +56,7 @@ pub(super) fn empty_board() -> PcbBoard {
 fn snxsch_round_trip_empty() {
     let snx = SnxSchematic::new(empty_sheet());
     let s = snx.write_string().expect("serialise");
-    assert!(s.contains("format = \"snxsch/1\""));
+    assert!(s.contains("format = \"snxsch/1.1\""));
     let back = SnxSchematic::parse(&s).expect("round-trip");
     assert_eq!(back.format, SNXSCH_FORMAT_V1);
     assert!(back.sheet.symbols.is_empty());
@@ -94,16 +98,10 @@ fn escape_tsv_body_for_toml_never_leaves_a_triple_quote_run() {
 
 fn label_with_text(text: &str) -> Label {
     Label {
-        unknown_columns: Default::default(),
         uuid: Uuid::nil(),
-        text: text.to_string(),
-        position: SchPoint { x: 0.0, y: 0.0 },
-        rotation: 0.0,
-        label_type: LType::Net,
-        shape: String::new(),
-        font_size: 1.27,
         justify: Default::default(),
         justify_v: Default::default(),
+        ..Label::new(text, SchPoint { x: 0.0, y: 0.0 }, LType::Net)
     }
 }
 
@@ -213,9 +211,9 @@ fn rejects_wrong_format_version() {
     let bad = "format = \"snxsch/99\"\nschematic_id = \"00000000-0000-0000-0000-000000000000\"\n";
     let err = SnxSchematic::parse(bad).expect_err("must reject");
     match err {
-        FormatError::UnsupportedVersion { found, expected } => {
+        FormatError::Version(FormatVersionError::Newer { found, readable }) => {
             assert_eq!(found, "snxsch/99");
-            assert_eq!(expected, SNXSCH_FORMAT_V1);
+            assert!(readable.contains(SNXSCH_FORMAT_V1), "{readable}");
         }
         other => panic!("unexpected error: {other:?}"),
     }
@@ -225,7 +223,10 @@ fn rejects_wrong_format_version() {
 fn rejects_wrong_pcb_format_version() {
     let bad = "format = \"snxpcb/99\"\npcb_id = \"00000000-0000-0000-0000-000000000000\"\n";
     let err = SnxPcb::parse(bad).expect_err("must reject");
-    assert!(matches!(err, FormatError::UnsupportedVersion { .. }));
+    assert!(matches!(
+        err,
+        FormatError::Version(FormatVersionError::Newer { .. })
+    ));
 }
 
 #[test]
@@ -262,7 +263,7 @@ pub(super) fn sample_symbol() -> Symbol {
 
 fn sample_wire(sx: f64, sy: f64, ex: f64, ey: f64) -> Wire {
     Wire {
-        uuid: Uuid::new_v4(),
+        uuid: Uuid::now_v7(),
         start: SchPoint { x: sx, y: sy },
         end: SchPoint { x: ex, y: ey },
         ..Default::default()
@@ -280,14 +281,19 @@ fn show_serialised_pcb_for_inspection() {
             id: 0,
             name: "TopCopper".into(),
             layer_type: "copper".into(),
+            display_name: String::new(),
         },
         crate::pcb::LayerDef {
             id: 1,
             name: "BottomCopper".into(),
             layer_type: "copper".into(),
+            display_name: String::new(),
         },
     ];
     board.footprints.push(Footprint {
+        schematic_link: None,
+        library_ref: None,
+        component: Default::default(),
         unknown_columns: Default::default(),
         unknown: Default::default(),
         uuid: Uuid::parse_str("0192a8c0-0010-7000-8000-000000000001").unwrap(),
@@ -320,16 +326,8 @@ fn snxsch_round_trip_with_data() {
         ..Default::default()
     });
     sheet.labels.push(Label {
-        unknown_columns: Default::default(),
         uuid: Uuid::parse_str("0192a8c0-0003-7000-8000-000000000001").unwrap(),
-        text: "VIN".to_string(),
-        position: SchPoint { x: 10.0, y: 20.0 },
-        rotation: 0.0,
-        label_type: LType::Net,
-        shape: String::new(),
-        font_size: 1.27,
-        justify: HAlign::Left,
-        justify_v: VAlign::Bottom,
+        ..Label::new("VIN", SchPoint { x: 10.0, y: 20.0 }, LType::Net)
     });
 
     let snx = SnxSchematic::new(sheet.clone());
@@ -450,6 +448,11 @@ fn snxpcb_round_trip_with_data() {
             name: "VCC".into(),
         }),
         roundrect_ratio: 0.25,
+        trapezoid_delta: Default::default(),
+        custom_outline: Vec::new(),
+        rotation: 0.0,
+        layer_sizes: None,
+        net_locked: false,
     };
     let pad2 = Pad {
         unknown_columns: Default::default(),
@@ -467,9 +470,17 @@ fn snxpcb_round_trip_with_data() {
             name: "GND".into(),
         }),
         roundrect_ratio: 0.25,
+        trapezoid_delta: Default::default(),
+        custom_outline: Vec::new(),
+        rotation: 0.0,
+        layer_sizes: None,
+        net_locked: false,
     };
 
     let footprint = Footprint {
+        schematic_link: None,
+        library_ref: None,
+        component: Default::default(),
         unknown_columns: Default::default(),
         unknown: Default::default(),
         uuid: Uuid::parse_str("0192a8c0-0010-7000-8000-000000000001").unwrap(),
@@ -510,7 +521,9 @@ fn snxpcb_round_trip_with_data() {
         ),
     ] {
         board.segments.push(Segment {
+            attributes: Default::default(),
             unknown_columns: Default::default(),
+            locked: false,
             uuid: Uuid::parse_str(uuid).unwrap(),
             start: PcbPoint { x: sx, y: sy },
             end: PcbPoint { x: ex, y: ey },
@@ -521,6 +534,7 @@ fn snxpcb_round_trip_with_data() {
     }
 
     board.vias.push(Via {
+        attributes: Default::default(),
         unknown_columns: Default::default(),
         uuid: Uuid::parse_str("0192a8c0-0030-7000-8000-000000000001").unwrap(),
         position: PcbPoint { x: 100.0, y: 200.0 },
@@ -528,6 +542,8 @@ fn snxpcb_round_trip_with_data() {
         drill: 0.3,
         layers: vec!["TopCopper".into(), "BottomCopper".into()],
         net: 1,
+        locked: false,
+        layer_sizes: None,
         via_type: ViaType::Through,
     });
 
@@ -554,6 +570,10 @@ fn snxpcb_round_trip_with_data() {
         thermal_width: 0.0,
         clearance: 0.0,
         min_thickness: 0.0,
+        min_island_area: 0.0,
+        remove_dead_islands: false,
+        shelved: false,
+        unfilled: false,
         unknown: Default::default(),
     });
 
@@ -607,6 +627,10 @@ fn zone_without_holes_writes_no_holes_key() {
         thermal_width: 0.0,
         clearance: 0.0,
         min_thickness: 0.0,
+        min_island_area: 0.0,
+        remove_dead_islands: false,
+        shelved: false,
+        unfilled: false,
         unknown: Default::default(),
     });
     let text = SnxPcb::new(board).write_string().expect("serialise");
@@ -698,6 +722,23 @@ fn extras_preserve_symbol_fields() {
     assert!(recovered.dnp);
 }
 
+/// #1080 — title-block values typed in the Properties panel may hold any
+/// text; tabs, newlines, quotes and backslashes survive a save and reload.
+#[test]
+fn title_block_values_with_tabs_newlines_and_quotes_round_trip() {
+    let mut sheet = empty_sheet();
+    for (key, value) in [
+        ("title", "Power \"supply\"\tboard"),
+        ("drawn_by", "A. Engineer\nB. Engineer"),
+        ("document_number", "DOC\\0042"),
+    ] {
+        sheet.title_block.insert(key.into(), value.into());
+    }
+    let written = SnxSchematic::new(sheet.clone()).write_string().unwrap();
+    let parsed = SnxSchematic::parse(&written).unwrap();
+    assert_eq!(parsed.sheet.title_block, sheet.title_block);
+}
+
 #[test]
 fn schematic_extras_are_byte_identical_after_parse() {
     let mut sheet = empty_sheet();
@@ -711,28 +752,26 @@ fn schematic_extras_are_byte_identical_after_parse() {
     }
 
     for id in ["zeta", "alpha", "middle"] {
-        sheet.lib_symbols.insert(
-            id.into(),
-            LibSymbol {
-                id: id.into(),
-                reference: "U".into(),
-                value: id.into(),
-                footprint: String::new(),
-                datasheet: String::new(),
-                description: format!("{id} library symbol"),
-                keywords: String::new(),
-                fp_filters: String::new(),
-                in_bom: true,
-                on_board: true,
-                in_pos_files: true,
-                duplicate_pin_numbers_are_jumpers: false,
-                graphics: Vec::new(),
-                pins: Vec::new(),
-                show_pin_numbers: true,
-                show_pin_names: true,
-                pin_name_offset: 0.0,
-            },
-        );
+        let body = LibSymbol {
+            id: id.into(),
+            reference: "U".into(),
+            value: id.into(),
+            footprint: String::new(),
+            datasheet: String::new(),
+            description: format!("{id} library symbol"),
+            keywords: String::new(),
+            fp_filters: String::new(),
+            in_bom: true,
+            on_board: true,
+            in_pos_files: true,
+            duplicate_pin_numbers_are_jumpers: false,
+            graphics: Vec::new(),
+            pins: Vec::new(),
+            show_pin_numbers: true,
+            show_pin_names: true,
+            pin_name_offset: 0.0,
+        };
+        sheet.lib_symbols.insert(body.body_ref(), body);
     }
 
     let mut symbol = sample_symbol();
@@ -769,7 +808,13 @@ fn schematic_extras_are_byte_identical_after_parse() {
 
     assert_eq!(first, second);
     assert_eq!(parsed.sheet.title_block["revision"], "A");
-    assert_eq!(parsed.sheet.lib_symbols["alpha"].value, "alpha");
+    assert!(
+        parsed
+            .sheet
+            .lib_symbols
+            .iter()
+            .any(|(key, body)| key.starts_with("alpha#") && body.value == "alpha")
+    );
     assert_eq!(
         parsed.sheet.symbols[0].fields["Manufacturer"],
         "Example Semi"
@@ -878,4 +923,169 @@ values = [1.0, {bad}]
             other => panic!("{bad}: expected NonFiniteNumber, got {other:?}"),
         }
     }
+}
+
+// --- versioned embedded library symbols (#2209) ---------------------------
+
+fn lib_body(id: &str, description: &str) -> LibSymbol {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "description": description,
+        "pin_name_offset": 0.5,
+    }))
+    .expect("lib symbol")
+}
+
+#[test]
+fn a_body_hash_is_stable_and_tells_versions_apart() {
+    let a = lib_body("L:A", "1");
+    assert_eq!(a.content_hash(), a.clone().content_hash());
+    assert_eq!(a.content_hash().len(), 8);
+    assert_ne!(a.content_hash(), lib_body("L:A", "2").content_hash());
+    // Pinned: the hash is part of the saved form, so a change here is a
+    // format change (see docs/architecture/library-symbol-versions.md).
+    assert_eq!(a.body_ref(), format!("L:A#{}", a.content_hash()));
+    assert_eq!(a.content_hash(), "eb13bdee");
+}
+
+#[test]
+fn a_body_ref_collision_is_an_error_not_a_merge() {
+    let mut sheet = empty_sheet();
+    let a = lib_body("L:A", "1");
+    let other = lib_body("L:A", "2");
+    sheet.lib_symbols.insert(a.body_ref(), other);
+    let err = sheet.embed_body(a.clone()).expect_err("collision");
+    assert_eq!(err.body_ref, a.body_ref());
+    let mut clean = empty_sheet();
+    assert_eq!(clean.embed_body(a.clone()), Ok(a.body_ref()));
+    assert_eq!(
+        clean.embed_body(a.clone()),
+        Ok(a.body_ref()),
+        "same body reuses"
+    );
+}
+
+#[test]
+fn two_versions_of_one_symbol_round_trip_on_one_sheet() {
+    let mut sheet = empty_sheet();
+    let (v1, v2) = (lib_body("L:A", "1"), lib_body("L:A", "2"));
+    let (k1, k2) = (
+        sheet.embed_body(v1.clone()).unwrap(),
+        sheet.embed_body(v2.clone()).unwrap(),
+    );
+    for (n, key) in [(0u128, &k1), (1, &k2)] {
+        let mut sym = sample_symbol();
+        sym.uuid = Uuid::from_u128(n + 1);
+        sym.lib_id = "L:A".into();
+        sym.body_ref = key.clone();
+        sheet.symbols.push(sym);
+    }
+    let text = SnxSchematic::new(sheet).write_string().unwrap();
+    let back = SnxSchematic::parse(&text).unwrap();
+    assert_eq!(back.sheet.lib_symbols.len(), 2);
+    assert_eq!(back.sheet.body_of(&back.sheet.symbols[0]), Some(&v1));
+    assert_eq!(back.sheet.body_of(&back.sheet.symbols[1]), Some(&v2));
+    assert_eq!(back.write_string().unwrap(), text);
+}
+
+#[test]
+fn an_old_form_sheet_upgrades_on_load_and_saves_in_the_new_form() {
+    // Old form: the body keyed by plain lib id, symbols naming no body_ref.
+    let mut sheet = empty_sheet();
+    let body = lib_body("L:A", "1");
+    sheet.lib_symbols.insert("L:A".into(), body.clone());
+    let mut sym = sample_symbol();
+    sym.lib_id = "L:A".into();
+    sheet.symbols.push(sym);
+    let old = SnxSchematic::new(sheet).write_string().unwrap();
+    assert!(!old.contains("body_ref"), "{old}");
+
+    let loaded = SnxSchematic::parse(&old).unwrap();
+    let key = body.body_ref();
+    assert_eq!(loaded.sheet.symbols[0].body_ref, key);
+    assert_eq!(loaded.sheet.lib_symbols.get(&key), Some(&body));
+    assert!(!loaded.sheet.lib_symbols.contains_key("L:A"));
+    let new = loaded.write_string().unwrap();
+    assert!(new.contains(&format!("body_ref = \"{key}\"")), "{new}");
+    assert_eq!(
+        SnxSchematic::parse(&new).unwrap().write_string().unwrap(),
+        new
+    );
+}
+
+/// A sheet whose one symbol U7 names `L:A#00000000` while the table holds the
+/// bodies `held`; parsed back, with the repairs it reports.
+fn load_with_dangling_ref(held: &[&str]) -> (SnxSchematic, Vec<String>) {
+    let mut sheet = empty_sheet();
+    for tag in held {
+        sheet.embed_body(lib_body("L:A", tag)).unwrap();
+    }
+    let mut sym = sample_symbol();
+    sym.lib_id = "L:A".into();
+    sym.reference = "U7".into();
+    sym.body_ref = "L:A#00000000".into();
+    sheet.symbols.push(sym);
+    let text = SnxSchematic::new(sheet).write_string().unwrap();
+    let mut loaded = SnxSchematic::parse(&text).unwrap();
+    let repairs = loaded
+        .sheet
+        .take_load_repairs()
+        .iter()
+        .map(SheetLoadRepair::describe)
+        .collect();
+    (loaded, repairs)
+}
+
+#[test]
+fn a_dangling_body_ref_among_several_versions_is_reported_and_left_alone() {
+    let (loaded, repairs) = load_with_dangling_ref(&["1", "2"]);
+    assert_eq!(loaded.sheet.symbols[0].body_ref, "L:A#00000000");
+    assert!(loaded.sheet.body_of(&loaded.sheet.symbols[0]).is_none());
+    assert_eq!(repairs.len(), 1, "{repairs:?}");
+    assert!(repairs[0].contains("symbol U7 #1"), "{}", repairs[0]);
+    assert!(repairs[0].contains("L:A#00000000"), "{}", repairs[0]);
+    assert!(repairs[0].contains("2 other versions"), "{}", repairs[0]);
+}
+
+#[test]
+fn a_dangling_body_ref_with_one_candidate_is_repointed_and_reported() {
+    let (loaded, repairs) = load_with_dangling_ref(&["1"]);
+    let only = lib_body("L:A", "1").body_ref();
+    assert_eq!(loaded.sheet.symbols[0].body_ref, only);
+    assert!(loaded.sheet.body_of(&loaded.sheet.symbols[0]).is_some());
+    assert_eq!(repairs.len(), 1, "{repairs:?}");
+    assert!(repairs[0].contains("symbol U7 #1"), "{}", repairs[0]);
+    assert!(repairs[0].contains("L:A#00000000"), "{}", repairs[0]);
+    assert!(repairs[0].contains(&only), "{}", repairs[0]);
+}
+
+#[test]
+fn the_shared_resolver_gives_each_instance_the_version_it_draws_with() {
+    // ERC, the netlist and the output writers all read a placed symbol's body
+    // through `resolve_lib_symbol`.
+    let mut sheet = empty_sheet();
+    let (v1, v2) = (lib_body("L:A", "one"), lib_body("L:A", "two"));
+    let keys = [
+        sheet.embed_body(v1.clone()).unwrap(),
+        sheet.embed_body(v2.clone()).unwrap(),
+    ];
+    for (n, key) in keys.iter().enumerate() {
+        let mut sym = sample_symbol();
+        sym.lib_id = "L:A".into();
+        sym.body_ref = key.clone();
+        sheet.symbols.push(sym);
+        assert_eq!(n + 1, sheet.symbols.len());
+    }
+    let bodies: Vec<_> = sheet
+        .symbols
+        .iter()
+        .map(|s| {
+            sheet
+                .resolve_lib_symbol(s)
+                .expect("body")
+                .description
+                .clone()
+        })
+        .collect();
+    assert_eq!(bodies, ["one", "two"]);
 }

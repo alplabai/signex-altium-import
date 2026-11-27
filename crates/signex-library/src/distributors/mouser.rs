@@ -18,9 +18,10 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::distributor::{
-    DistributorAdapter, DistributorError, DistributorPart, DistributorSource,
+    DistributorAdapter, DistributorError, DistributorPart, DistributorSource, PriceBreak,
+    PricingSnapshot,
 };
-use crate::distributors::cache::{DEFAULT_TTL, DistributorCache};
+use crate::distributors::cache::DistributorCache;
 use crate::distributors::keyring::{KeyringError, KeyringStore};
 use crate::param::ParamMap;
 
@@ -41,7 +42,7 @@ pub struct MouserAdapter {
     base_url: String,
     cache: Option<DistributorCache>,
     throttle: Mutex<Option<Instant>>,
-    http: reqwest::blocking::Client,
+    http: super::http::LazyClient,
     auth: AuthSource,
 }
 
@@ -61,7 +62,7 @@ impl MouserAdapter {
             base_url: MOUSER_DEFAULT_BASE.into(),
             cache,
             throttle: Mutex::new(None),
-            http: super::http::build_client(),
+            http: super::http::LazyClient::standard(),
             auth: AuthSource::Keyring(KeyringStore::for_provider("mouser", "default")?),
         })
     }
@@ -76,7 +77,7 @@ impl MouserAdapter {
             base_url: base_url.into(),
             cache,
             throttle: Mutex::new(None),
-            http: super::http::build_client(),
+            http: super::http::LazyClient::standard(),
             auth: AuthSource::Inline(api_key.into()),
         }
     }
@@ -98,13 +99,6 @@ impl MouserAdapter {
     }
 
     fn search_by_keyword(&self, mpn: &str) -> Result<Vec<DistributorPart>, DistributorError> {
-        let api_key = self.resolve_api_key()?;
-        // H2: previously the Mouser API key was placed on the query string
-        // (`?apiKey=...`), which leaks into proxy logs, CDN access logs, and
-        // browser history if the URL is ever inspected via the wire. The
-        // Mouser SearchAPI also accepts the key via the `apiKey` HTTP header,
-        // which keeps the credential out of URL space.
-        let url = self.base_url.clone();
         let body = serde_json::json!({
             "SearchByKeywordRequest": {
                 "keyword": mpn,
@@ -112,44 +106,47 @@ impl MouserAdapter {
                 "startingRecord": 0,
             }
         });
+        self.post_search(&self.base_url, &body)
+    }
+
+    /// Look a Mouser part number up directly (`/search/partnumber`).
+    fn search_by_part_number(&self, sku: &str) -> Result<Vec<DistributorPart>, DistributorError> {
+        let url = match self.base_url.strip_suffix("/keyword") {
+            Some(prefix) => format!("{prefix}/partnumber"),
+            None => self.base_url.clone(),
+        };
+        let body = serde_json::json!({
+            "SearchByPartRequest": { "mouserPartNumber": sku }
+        });
+        self.post_search(&url, &body)
+    }
+
+    fn post_search(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<Vec<DistributorPart>, DistributorError> {
+        let api_key = self.resolve_api_key()?;
+        // H2: previously the Mouser API key was placed on the query string
+        // (`?apiKey=...`), which leaks into proxy logs, CDN access logs, and
+        // browser history if the URL is ever inspected via the wire. The
+        // Mouser SearchAPI also accepts the key via the `apiKey` HTTP header,
+        // which keeps the credential out of URL space.
         self.polite_wait();
         let resp = self
             .http
-            .post(&url)
+            .get()?
+            .post(url)
             .header("Accept", "application/json")
             .header("apiKey", &api_key)
-            .json(&body)
+            .json(body)
             .send()
             .map_err(|e| DistributorError::Network(e.to_string()))?;
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            || resp.status() == reqwest::StatusCode::FORBIDDEN
-        {
-            return Err(DistributorError::Auth(format!(
-                "Mouser rejected key (HTTP {})",
-                resp.status()
-            )));
-        }
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after_seconds = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(60);
-            return Err(DistributorError::RateLimited {
-                retry_after_seconds,
-            });
-        }
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(DistributorError::NotFound);
-        }
-        if !resp.status().is_success() {
-            return Err(DistributorError::Backend(format!("HTTP {}", resp.status())));
-        }
+        let resp = super::http::check_response(resp, Some("Mouser rejected key"))?;
         let raw: MouserResponse = resp
             .json()
             .map_err(|e| DistributorError::Backend(format!("decode: {e}")))?;
-        Ok(raw.into_parts())
+        raw.into_parts()
     }
 }
 
@@ -185,40 +182,54 @@ impl DistributorAdapter for MouserAdapter {
         if token.is_empty() {
             return Ok(None);
         }
-        let mut hits = self.search_by_keyword(&token)?;
-        Ok(hits.pop())
+        let hits = self.search_by_keyword(&token)?;
+        Ok(super::price::pick_url_hit(hits, &token, &["mouser_pn"]))
     }
 
     fn lookup_by_mpn(&self, mpn: &str) -> Result<Vec<DistributorPart>, DistributorError> {
-        if let Some(cache) = &self.cache
-            && let Some(hit) = cache.get_or_warn(MOUSER_PROVIDER_KEY, mpn, DEFAULT_TTL)
-        {
-            return Ok(vec![hit]);
-        }
-        let hits = self.search_by_keyword(mpn)?;
-        if let (Some(cache), Some(first)) = (&self.cache, hits.first()) {
-            // H4: cache-write failures (disk full, permissions, traversal-rejected
-            // MPN) used to be silently swallowed. Surface them via tracing so
-            // the next API call doesn't burn quota with no operator signal —
-            // the lookup still succeeds because the live result is in `hits`.
-            if let Err(e) = cache.put(MOUSER_PROVIDER_KEY, first) {
-                tracing::warn!(
-                    error = %e,
-                    mpn = %mpn,
-                    "Mouser cache write failed; live result returned but not persisted",
-                );
-            }
-        }
-        Ok(hits)
+        super::http::cached_lookup(
+            self.cache.as_ref(),
+            MOUSER_PROVIDER_KEY,
+            MOUSER_NAME,
+            mpn,
+            || self.search_by_keyword(mpn),
+        )
     }
 
     fn refresh_pricing(
         &self,
         part: &DistributorPart,
     ) -> Result<crate::distributor::PricingSnapshot, DistributorError> {
-        let mut hits = self.search_by_keyword(&part.mpn)?;
-        let fresh = hits.pop().ok_or(DistributorError::NotFound)?;
-        fresh.pricing.ok_or(DistributorError::NotFound)
+        let sku = part
+            .extra
+            .get("sku")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        // The part searches are fuzzy, so a hit is accepted only when it IS
+        // the row's part: the SKU exactly, or (no SKU) the MPN and maker
+        // exactly. Anything else is "not found" — never a neighbour's price.
+        let fresh = match sku {
+            Some(sku) => self
+                .search_by_part_number(sku)?
+                .into_iter()
+                .find(|p| {
+                    p.extra
+                        .get("mouser_pn")
+                        .is_some_and(|pn| pn.trim().eq_ignore_ascii_case(sku))
+                })
+                .ok_or(DistributorError::NotFound)?,
+            None => {
+                let hits = self.search_by_keyword(&part.mpn)?;
+                super::price::pick_exact_mpn_hit(&hits, part)
+                    .cloned()
+                    .ok_or(DistributorError::NotFound)?
+            }
+        };
+        super::price::pricing_or_error(fresh)
+    }
+
+    fn supports_pricing(&self) -> bool {
+        true
     }
 }
 
@@ -228,8 +239,47 @@ impl DistributorAdapter for MouserAdapter {
 
 #[derive(Debug, Deserialize)]
 struct MouserResponse {
+    /// Mouser reports a bad key or an exhausted quota with HTTP 200 and this
+    /// list populated, not with a 4xx.
+    #[serde(default, rename = "Errors")]
+    errors: Vec<MouserApiError>,
     #[serde(default, rename = "SearchResults")]
     search_results: Option<MouserSearchResults>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MouserApiError {
+    #[serde(default, rename = "Code")]
+    code: String,
+    #[serde(default, rename = "Message")]
+    message: String,
+    #[serde(default, rename = "ResourceKey")]
+    resource_key: String,
+}
+
+impl MouserApiError {
+    fn into_error(self) -> DistributorError {
+        let text = format!("{} {} {}", self.code, self.resource_key, self.message).to_lowercase();
+        let detail = if self.message.trim().is_empty() {
+            self.code.clone()
+        } else {
+            self.message.clone()
+        };
+        if text.contains("toomany") || text.contains("too many") || text.contains("limit") {
+            DistributorError::RateLimited {
+                retry_after_seconds: 60,
+            }
+        } else if text.contains("unauthor")
+            || text.contains("apikey")
+            || text.contains("api key")
+            || text.contains("identifier")
+            || text.contains("forbidden")
+        {
+            DistributorError::Auth(detail)
+        } else {
+            DistributorError::Backend(detail)
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,26 +302,101 @@ struct MouserPartDto {
     datasheet_url: Option<String>,
     #[serde(default, rename = "Availability")]
     availability: Option<String>,
+    /// Units in stock as a bare number (string or number in the payload).
+    #[serde(default, rename = "AvailabilityInStock")]
+    availability_in_stock: Option<serde_json::Value>,
+    #[serde(default, rename = "PriceBreaks")]
+    price_breaks: Vec<MouserPriceBreak>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MouserPriceBreak {
+    #[serde(default, rename = "Quantity")]
+    quantity: u32,
+    /// Display string in the request locale: `"$0.10"`, `"0,10 €"`.
+    #[serde(default, rename = "Price")]
+    price: String,
+    #[serde(default, rename = "Currency")]
+    currency: String,
+}
+
+/// Read Mouser's `PriceBreaks`: one currency across the breaks, finite
+/// prices. `None` when the part lists no prices (a quote-only part).
+fn mouser_pricing(
+    breaks: &[MouserPriceBreak],
+    stock: Option<u32>,
+    part_number: Option<String>,
+) -> Option<Result<PricingSnapshot, String>> {
+    let first = breaks.first()?;
+    let read = || -> Result<PricingSnapshot, String> {
+        let currency = first.currency.trim().to_ascii_uppercase();
+        let mut out = Vec::with_capacity(breaks.len());
+        for b in breaks {
+            if !b.currency.trim().eq_ignore_ascii_case(&currency) {
+                return Err(format!(
+                    "price breaks mix currencies ({currency} and {})",
+                    b.currency
+                ));
+            }
+            out.push(PriceBreak {
+                qty: b.quantity,
+                unit_price: super::price::parse_price(&b.price, &currency)?,
+            });
+        }
+        Ok(super::price::snapshot(
+            MOUSER_NAME,
+            &currency,
+            stock,
+            part_number,
+            out,
+        ))
+    };
+    Some(read())
 }
 
 impl MouserResponse {
-    fn into_parts(self) -> Vec<DistributorPart> {
+    fn into_parts(mut self) -> Result<Vec<DistributorPart>, DistributorError> {
+        if !self.errors.is_empty() {
+            return Err(self.errors.remove(0).into_error());
+        }
         let Some(results) = self.search_results else {
-            return vec![];
+            return Ok(vec![]);
         };
-        results
+        Ok(results
             .parts
             .into_iter()
             .map(|p| {
                 let mut extra = BTreeMap::new();
-                if !p.mouser_pn.is_empty() {
-                    extra.insert("mouser_pn".into(), p.mouser_pn);
+                let mouser_pn = Some(p.mouser_pn.clone()).filter(|pn| !pn.is_empty());
+                if let Some(pn) = &mouser_pn {
+                    extra.insert("mouser_pn".into(), pn.clone());
                 }
                 let stock = p
-                    .availability
-                    .as_deref()
-                    .and_then(|s| s.split_whitespace().next())
-                    .and_then(|n| n.replace(',', "").parse::<u32>().ok());
+                    .availability_in_stock
+                    .as_ref()
+                    .and_then(|v| match v {
+                        serde_json::Value::Number(n) => {
+                            n.as_u64().and_then(|n| u32::try_from(n).ok())
+                        }
+                        serde_json::Value::String(s) => {
+                            s.replace(',', "").trim().parse::<u32>().ok()
+                        }
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        p.availability
+                            .as_deref()
+                            .and_then(|s| s.split_whitespace().next())
+                            .and_then(|n| n.replace(',', "").parse::<u32>().ok())
+                    });
+                let pricing = match mouser_pricing(&p.price_breaks, stock, mouser_pn.clone()) {
+                    Some(Ok(snapshot)) => Some(snapshot),
+                    Some(Err(why)) => {
+                        extra.insert(super::price::PRICING_ERROR_KEY.into(), why);
+                        None
+                    }
+                    None => None,
+                };
                 DistributorPart {
                     mpn: p.manufacturer_pn,
                     manufacturer: p.manufacturer,
@@ -279,14 +404,14 @@ impl MouserResponse {
                     datasheet_url: p.datasheet_url.as_deref().and_then(|u| Url::parse(u).ok()),
                     footprint_hint: None,
                     parameters: ParamMap::new(),
-                    pricing: None,
+                    pricing,
                     stock,
                     source: DistributorSource::Mouser,
                     captured_at: Utc::now(),
                     extra,
                 }
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -321,7 +446,7 @@ mod tests {
             base_url: "http://unused.invalid".into(),
             cache: None,
             throttle: Mutex::new(None),
-            http: super::super::http::build_client(),
+            http: super::super::http::LazyClient::standard(),
             auth: AuthSource::Keyring(store),
         };
         let err = adapter.resolve_api_key().expect_err("should be Auth");

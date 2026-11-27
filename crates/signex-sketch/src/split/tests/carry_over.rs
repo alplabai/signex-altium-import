@@ -10,7 +10,7 @@ use crate::attr::{
 };
 use crate::constraint::{Constraint, ConstraintKind, DimTarget};
 use crate::split::*;
-use signex_types::layer::SignexLayer;
+use signex_types::pcb_layer::{CopperLayer, PcbLayer, TechnicalLayer};
 
 // ─── Plain split ───
 
@@ -82,7 +82,7 @@ fn bake_attributes_and_flags_carry_onto_both_halves() {
         let e = sketch.entities.iter_mut().find(|e| e.id == line).unwrap();
         e.construction = true;
         e.silk = Some(SilkAttr {
-            layer: SignexLayer::TopSilk,
+            layer: PcbLayer::Technical(TechnicalLayer::SilkscreenTop),
         });
     }
     let result = split_line(&mut sketch, line, 0.5).unwrap();
@@ -111,7 +111,7 @@ fn closed_profile_seed_attrs_stay_on_line_a_only() {
         // Per-segment (must carry to BOTH halves — regression guard).
         e.construction = true;
         e.silk = Some(SilkAttr {
-            layer: SignexLayer::TopSilk,
+            layer: PcbLayer::Technical(TechnicalLayer::SilkscreenTop),
         });
         e.v_score = Some(VScoreHintAttr {
             depth_fraction_expr: "0.5".into(),
@@ -119,18 +119,18 @@ fn closed_profile_seed_attrs_stay_on_line_a_only() {
             side: VScoreSide::Both,
         });
         // Closed-profile seed (must stay on line_a ONLY).
-        e.courtyard = Some(CourtyardAttr);
+        e.courtyard = Some(CourtyardAttr {});
         e.mask_opening = Some(MaskOpeningAttr {
-            layer: SignexLayer::TopSolderMask,
+            layer: PcbLayer::Technical(TechnicalLayer::SolderMaskTop),
         });
         e.mask_exclude = Some(MaskExcludeAttr {
-            layer: SignexLayer::BottomSolderMask,
+            layer: PcbLayer::Technical(TechnicalLayer::SolderMaskBottom),
         });
         e.paste_aperture = Some(PasteApertureAttr {
-            layer: SignexLayer::TopPaste,
+            layer: PcbLayer::Technical(TechnicalLayer::PasteTop),
         });
         e.pour = Some(PourAttr {
-            layer: SignexLayer::TopCopper,
+            layer: PcbLayer::Copper(CopperLayer::Top),
             net: None,
             fill_type: PourFillType::Solid,
             thermal_relief: ThermalRelief::default(),
@@ -139,7 +139,7 @@ fn closed_profile_seed_attrs_stay_on_line_a_only() {
             priority: 0,
         });
         e.keepout = Some(KeepoutAttr {
-            layer: SignexLayer::TopCopper,
+            layer: PcbLayer::Copper(CopperLayer::Top),
             kinds: KeepoutKinds::default(),
         });
         e.board_cutout = Some(BoardCutoutAttr {
@@ -565,4 +565,35 @@ fn paste_aperture_custom_source_retargets_to_line_a() {
         }
         other => panic!("paste_apertures must still be Custom, got {other:?}"),
     }
+}
+
+#[test]
+fn pad_owned_ledger_swaps_retired_line_for_halves_and_mid_point() {
+    let (mut sketch, line, ..) = line_sketch((0.0, 0.0), (10.0, 0.0));
+    let plane = sketch.entities[0].plane;
+    let other = SketchEntityId::new();
+    let pad_point = SketchEntityId::new();
+    let mut pad_entity = Entity::new(pad_point, plane, EntityKind::Point { x: 20.0, y: 20.0 });
+    pad_entity.pad = Some(PadAttr {
+        number: "1".into(),
+        size_x_expr: "1".into(),
+        size_y_expr: "1".into(),
+        owned: vec![pad_point, line, other],
+        ..PadAttr::default()
+    });
+    sketch.entities.push(pad_entity);
+
+    let result = split_line(&mut sketch, line, 0.5).unwrap();
+
+    let pad = sketch.entities.iter().find(|e| e.id == pad_point).unwrap();
+    assert_eq!(
+        pad.pad.as_ref().unwrap().owned,
+        vec![
+            pad_point,
+            result.line_a,
+            result.mid_point,
+            result.line_b,
+            other
+        ],
+    );
 }

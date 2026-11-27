@@ -17,16 +17,49 @@ use uuid::Uuid;
 
 use crate::param::ParamMap;
 
+mod format_token;
+#[cfg(test)]
+mod format_token_tests;
+#[cfg(test)]
+mod format_version_tests;
+mod generated;
 mod load_repair;
+mod models;
+#[cfg(test)]
+mod models_tests;
+mod mount_style;
 mod pad;
+mod pad_columns;
+mod pad_shape_check;
+mod pitch;
 mod serde_tsv;
+mod silk_marker;
 #[cfg(test)]
 mod tests;
+mod textconv;
+#[cfg(test)]
+mod textconv_tests;
+mod wire;
 
+#[cfg(test)]
+use format_token::FOOTPRINT_FILE_VERSION;
+use format_token::SNXFPT_FORMAT_V1_1;
+pub use generated::{
+    DEFAULT_COURTYARD_LINE_WIDTH_MM, DEFAULT_PAD_CLEARANCE_MM, DEFAULT_SILK_LINE_WIDTH_MM,
+    GeneratedFeatures,
+};
 pub use load_repair::LoadRepair;
+pub use models::{
+    EmbeddedModel, EmbeddedModels, MODEL_DEFLATE_LEVEL, MODEL_ENCODING, ModelError, ModelFault,
+    step_model_hash,
+};
+pub use mount_style::MountStyle;
 pub use pad::*;
 pub use serde_tsv::FootprintFileError;
 pub(crate) use serde_tsv::{pads_from_tsv, pads_to_tsv};
+pub use textconv::textconv_footprint_text;
+#[cfg(test)]
+use wire::PADS_TSV_PLACEHOLDER_PREFIX;
 
 /// Footprint graphic kinds — silkscreen / fab outline primitives.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -44,6 +77,18 @@ pub enum FpGraphicKind {
         center: [f64; 2],
         radius: f64,
     },
+    /// Circular arc about `center`.
+    ///
+    /// **Sweep convention:** the arc runs from `start_deg` to `end_deg` in
+    /// the direction of *increasing* angle (angles measured from +X with
+    /// `atan2(dy, dx)`; CCW in a y-up frame, which reads clockwise on the
+    /// y-down footprint canvas), wrapping through 360 when `start_deg > end_deg`.
+    /// So `300 -> 60` is the 120 degree arc through 0, not the 240 degree
+    /// one; `10 -> 80` is the 70 degree arc. Angles may be given outside
+    /// `[0, 360)` (the placement tool stores `atan2` output in
+    /// `(-180, 180]`). A sweep of 360 or more (`|end - start| >= 360`) is a
+    /// full circle and equal angles are a zero-length arc; see
+    /// [`FpGraphicKind::arc_sweep_deg`].
     Arc {
         center: [f64; 2],
         radius: f64,
@@ -67,6 +112,23 @@ pub enum FpGraphicKind {
     },
 }
 
+impl FpGraphicKind {
+    /// CCW sweep in degrees of an [`FpGraphicKind::Arc`], in `[0, 360]`.
+    ///
+    /// `0.0` for a degenerate zero-length arc, `360.0` for a full circle
+    /// (`|end - start| >= 360`), otherwise `(end - start).rem_euclid(360)`.
+    pub fn arc_sweep_deg(start_deg: f64, end_deg: f64) -> f64 {
+        let raw = (end_deg - start_deg).abs();
+        if raw < 1e-6 {
+            0.0
+        } else if raw >= 359.999 {
+            360.0
+        } else {
+            (end_deg - start_deg).rem_euclid(360.0)
+        }
+    }
+}
+
 /// One footprint silkscreen / fab graphic.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FpGraphic {
@@ -81,6 +143,28 @@ pub struct FpGraphic {
     /// `Polygon` / `Rectangle` / `Circle` / `Arc` (closed shapes).
     #[serde(default)]
     pub filled: bool,
+    /// The sketch entity a bake made this entry from; `None` = drawn by
+    /// hand. A re-bake replaces only marked entries. See
+    /// `docs/FOOTPRINT_SKETCH.md`, "Bake ownership".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sketch_entity: Option<signex_sketch::id::SketchEntityId>,
+}
+
+impl FpGraphic {
+    /// A hand-drawn graphic: no sketch entity owns it.
+    pub fn drawn(kind: FpGraphicKind, stroke_width: f64, filled: bool) -> Self {
+        Self {
+            kind,
+            stroke_width,
+            filled,
+            sketch_entity: None,
+        }
+    }
+
+    /// Whether a sketch bake made this entry (it carries a marker).
+    pub fn is_baked(&self) -> bool {
+        self.sketch_entity.is_some()
+    }
 }
 
 /// 3D body shape — drives the procedural render (no STEP required).
@@ -139,7 +223,7 @@ impl Default for Body3D {
 }
 
 /// Net reference — string for now, will become a UUID once nets are
-/// first-class library citizens (v0.16+). v0.14 introduces this as a
+/// first-class library citizens. v0.14 introduced this as a
 /// thin wrapper so future migration can be one-shot.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -175,8 +259,8 @@ pub enum ThermalReliefStyle {
     None,
 }
 
-/// Copper pour / region. Fill generation lives in v0.15 — v0.14 stores
-/// the boundary + metadata only.
+/// Copper pour / region. Stores the boundary + metadata only; fill
+/// generation lands with the PCB Routing plan (Copper Pour).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FpPour {
     pub boundary: Polygon,
@@ -195,7 +279,8 @@ pub struct FpPour {
     pub priority: u8,
 }
 
-/// What a keepout zone forbids. DRC enforcement lands in v0.15.
+/// What a keepout zone forbids. DRC enforcement lands with the Advanced PCB plan
+/// (Routing Polish & Geometry).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -208,7 +293,7 @@ pub enum KeepoutForbid {
     Copper,
 }
 
-/// DRC keepout zone. v0.14 stores the polygon + layer + forbid kind.
+/// DRC keepout zone. Stores the polygon + layer + forbid kind.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FpKeepout {
     pub boundary: Polygon,
@@ -287,12 +372,12 @@ pub struct FpPasteAperture {
     pub layer: LayerId,
 }
 
-/// Optional STEP/WRL attachment for mech-CAD export. Content-hashed so two
-/// MPNs with identical STEP geometry de-duplicate to one file in
-/// `mylib.snxlib/step/<sha256>.step`.
+/// Optional STEP attachment for mech-CAD export. The model bytes live in the
+/// same file's `[[models]]` entry under `content_hash`; a library written
+/// before #3107 keeps them in `step/<sha256>.step`, read as a fallback.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StepAttachment {
-    /// SHA-256 hex of the .step file contents — also the on-disk filename stem.
+    /// SHA-256 hex of the STEP bytes: the `[[models]]` entry's `hash`.
     pub content_hash: String,
     /// Original filename hint for UX ("LM358.step").
     pub filename: String,
@@ -363,17 +448,19 @@ pub struct Footprint {
     /// serialised. The editor that opens the footprint reports and clears it.
     #[serde(skip)]
     pub load_repairs: Vec<LoadRepair>,
-    /// Copper pour / region polygons. v0.14+; fill generation is v0.15.
+    /// Copper pour / region polygons. v0.14+; fill generation lands with
+    /// the PCB Routing plan (Copper Pour).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pours: Vec<FpPour>,
-    /// DRC keepout zones. v0.14 records; v0.15 enforces.
+    /// DRC keepout zones. Recorded only; enforcement lands with the
+    /// Advanced PCB plan.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keepouts: Vec<FpKeepout>,
     /// Board cutouts. v0.14 records; outline subtraction at PCB-export.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cutouts: Vec<FpCutout>,
-    /// V-score panelisation hints. v0.14 records; panelisation tool
-    /// consumes them in v0.16+.
+    /// V-score panelisation hints. Recorded only; the panelisation tool
+    /// (Advanced Output plan, Panelization) consumes them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub v_scores: Vec<FpVScore>,
     /// Standalone solder-mask openings (separate from pad mask margins).
@@ -400,6 +487,9 @@ pub struct Footprint {
     pub component_type: ComponentType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height_mm: Option<f64>,
+    /// Generated silkscreen, pin 1 and assembly features (`snxfpt/1.3`).
+    #[serde(default, skip_serializing_if = "GeneratedFeatures::is_default")]
+    pub generated: GeneratedFeatures,
 }
 
 /// v0.21 — Altium-parity component type. Drives whether the part
@@ -479,7 +569,8 @@ pub const FOOTPRINT_SCHEMA_VERSION: u32 = 3;
 /// inline TOML since they're variant-shaped or sparse.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FootprintFile {
-    /// Schema sentinel — current emitters write `"snxfpt/1"`.
+    /// The format token the file was read with; a save writes
+    /// [`FootprintFile::format_token`].
     #[serde(default = "default_footprint_format")]
     pub format: String,
     /// File-level UUID — distinct from any contained footprint's uuid.
@@ -489,18 +580,24 @@ pub struct FootprintFile {
     /// panel header. Defaults to the file stem when empty.
     #[serde(default)]
     pub display_name: String,
+    /// The `file_uuid` of the stock file this one was copied from (#813);
+    /// see `SymbolFile::copied_from`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_from: Option<Uuid>,
     /// All footprints in this file. Order is the Footprint Library
     /// panel order.
     pub footprints: Vec<Footprint>,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
+    /// STEP models the footprints attach, by hash (`[[models]]`, #3107).
+    #[serde(default, skip_serializing_if = "EmbeddedModels::is_empty")]
+    pub models: EmbeddedModels,
 }
 
-const FOOTPRINT_FILE_FORMAT_TOKEN: &str = "snxfpt/1";
-
-/// Stable column layout for the per-footprint `pads_tsv` block.
-/// Adding or reordering columns is a wire-format break — bump
-/// [`FOOTPRINT_FILE_FORMAT_TOKEN`].
+/// Base column layout for the per-footprint `pads_tsv` block; these
+/// lead every header. Reordering them is a wire-format break — bump
+/// the `.snxfpt` token (`format_token`). The remaining `Pad` fields are
+/// optional trailing columns, see `pad_columns`.
 const PAD_TSV_COLUMNS: &[&str] = &[
     "number",
     "kind",
@@ -517,92 +614,9 @@ const PAD_TSV_COLUMNS: &[&str] = &[
     "paste_margin",
 ];
 
-/// Sentinel string substituted for each footprint's `pads_tsv` field
-/// before TOML serialise; replaced post-emit with the literal multi-
-/// line `'''…'''` block.
-const PADS_TSV_PLACEHOLDER_PREFIX: &str = "__SIGNEX_PADS_TSV_a1b2c3d4_";
-
 fn default_footprint_format() -> String {
-    FOOTPRINT_FILE_FORMAT_TOKEN.to_string()
+    SNXFPT_FORMAT_V1_1.to_string()
 }
-
-/// On-disk wire shape. Mirrors [`FootprintFile`] but each
-/// [`Footprint`]'s `pads` Vec is replaced with a `pads_tsv: String`
-/// carrying the TSV-encoded payload.
-#[derive(Serialize, Deserialize)]
-struct FootprintFileWire {
-    format: String,
-    file_uuid: Uuid,
-    #[serde(default)]
-    display_name: String,
-    created: DateTime<Utc>,
-    updated: DateTime<Utc>,
-    #[serde(default)]
-    footprints: Vec<FootprintWire>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct FootprintWire {
-    uuid: Uuid,
-    name: String,
-    #[serde(default)]
-    anchor: [f64; 2],
-    /// TSV-encoded pad list — header row + one row per pad.
-    pads_tsv: String,
-    #[serde(default)]
-    courtyard: Polygon,
-    #[serde(default)]
-    silk_f: Vec<FpGraphic>,
-    #[serde(default)]
-    silk_b: Vec<FpGraphic>,
-    #[serde(default)]
-    fab_f: Vec<FpGraphic>,
-    #[serde(default)]
-    fab_b: Vec<FpGraphic>,
-    #[serde(default)]
-    body_3d: Body3D,
-    #[serde(default)]
-    step_attachment: Option<StepAttachment>,
-    #[serde(default)]
-    pcb_params: ParamMap,
-    #[serde(default = "default_footprint_version")]
-    version: String,
-    #[serde(default)]
-    released: bool,
-    created: DateTime<Utc>,
-    updated: DateTime<Utc>,
-    #[serde(default = "default_schema_v2")]
-    schema_version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    sketch: Option<signex_sketch::SketchData>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pours: Vec<FpPour>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    keepouts: Vec<FpKeepout>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    cutouts: Vec<FpCutout>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    v_scores: Vec<FpVScore>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    mask_openings: Vec<FpMaskOpening>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    mask_excludes: Vec<FpMaskExclude>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    paste_apertures: Vec<FpPasteAperture>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    description: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    default_designator: String,
-    #[serde(default, skip_serializing_if = "ComponentType::is_default")]
-    component_type: ComponentType,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    height_mm: Option<f64>,
-    // FootprintWire (per-footprint) wire fields below; the
-    // FootprintFile (file-level) wire ends here.
-}
-
-// ── FootprintWire mirrors Footprint for the multi-footprint TOML
-//    wire format. Adding the four v0.21 fields here too.
 
 impl FootprintFile {
     /// Build a new container holding a single footprint — what the
@@ -619,9 +633,11 @@ impl FootprintFile {
             format: default_footprint_format(),
             file_uuid,
             display_name: footprint.name.clone(),
+            copied_from: None,
             footprints: vec![footprint],
             created: timestamp,
             updated: timestamp,
+            models: EmbeddedModels::default(),
         }
     }
 
@@ -634,133 +650,9 @@ impl FootprintFile {
         Self::from_toml_str(text)
     }
 
-    /// Parse the TOML+TSV wire format. The format-token check pins us
-    /// to [`FOOTPRINT_FILE_FORMAT_TOKEN`]; mismatched files surface
-    /// [`FootprintFileError::UnsupportedFormat`].
-    pub fn from_toml_str(text: &str) -> Result<Self, FootprintFileError> {
-        let wire: FootprintFileWire = signex_types::numeric::parse_toml_finite(text)?;
-        if wire.format != FOOTPRINT_FILE_FORMAT_TOKEN {
-            return Err(FootprintFileError::UnsupportedFormat { got: wire.format });
-        }
-        let mut footprints = Vec::with_capacity(wire.footprints.len());
-        for fw in wire.footprints {
-            let pads = pads_from_tsv(&fw.pads_tsv)?;
-            let mut footprint = Footprint {
-                uuid: fw.uuid,
-                name: fw.name,
-                anchor: fw.anchor,
-                pads,
-                courtyard: fw.courtyard,
-                silk_f: fw.silk_f,
-                silk_b: fw.silk_b,
-                fab_f: fw.fab_f,
-                fab_b: fw.fab_b,
-                body_3d: fw.body_3d,
-                step_attachment: fw.step_attachment,
-                pcb_params: fw.pcb_params,
-                version: fw.version,
-                released: fw.released,
-                created: fw.created,
-                updated: fw.updated,
-                schema_version: fw.schema_version,
-                sketch: fw.sketch,
-                load_repairs: Vec::new(),
-                pours: fw.pours,
-                keepouts: fw.keepouts,
-                cutouts: fw.cutouts,
-                v_scores: fw.v_scores,
-                mask_openings: fw.mask_openings,
-                mask_excludes: fw.mask_excludes,
-                paste_apertures: fw.paste_apertures,
-                description: fw.description,
-                default_designator: fw.default_designator,
-                component_type: fw.component_type,
-                height_mm: fw.height_mm,
-            };
-            footprint.repair_stored_sketch();
-            footprints.push(footprint);
-        }
-        Ok(FootprintFile {
-            format: wire.format,
-            file_uuid: wire.file_uuid,
-            display_name: wire.display_name,
-            created: wire.created,
-            updated: wire.updated,
-            footprints,
-        })
-    }
-
-    /// Serialise to canonical TOML+TSV. Pad lists become
-    /// `pads_tsv = '''\n<header>\n<rows>\n'''` literal multi-line
-    /// strings so the bulk data is line-diffable in git output.
-    pub fn to_toml_string(&self) -> Result<String, FootprintFileError> {
-        let mut tsv_payloads: Vec<String> = Vec::with_capacity(self.footprints.len());
-        let mut wire_footprints: Vec<FootprintWire> = Vec::with_capacity(self.footprints.len());
-        for (idx, fp) in self.footprints.iter().enumerate() {
-            tsv_payloads.push(pads_to_tsv(&fp.pads)?);
-            wire_footprints.push(FootprintWire {
-                uuid: fp.uuid,
-                name: fp.name.clone(),
-                anchor: fp.anchor,
-                pads_tsv: format!("{PADS_TSV_PLACEHOLDER_PREFIX}{idx}__"),
-                courtyard: fp.courtyard.clone(),
-                silk_f: fp.silk_f.clone(),
-                silk_b: fp.silk_b.clone(),
-                fab_f: fp.fab_f.clone(),
-                fab_b: fp.fab_b.clone(),
-                body_3d: fp.body_3d.clone(),
-                step_attachment: fp.step_attachment.clone(),
-                pcb_params: fp.pcb_params.clone(),
-                version: fp.version.clone(),
-                released: fp.released,
-                created: fp.created,
-                updated: fp.updated,
-                schema_version: fp.schema_version,
-                sketch: fp.sketch.clone(),
-                pours: fp.pours.clone(),
-                keepouts: fp.keepouts.clone(),
-                cutouts: fp.cutouts.clone(),
-                v_scores: fp.v_scores.clone(),
-                mask_openings: fp.mask_openings.clone(),
-                mask_excludes: fp.mask_excludes.clone(),
-                paste_apertures: fp.paste_apertures.clone(),
-                description: fp.description.clone(),
-                default_designator: fp.default_designator.clone(),
-                component_type: fp.component_type,
-                height_mm: fp.height_mm,
-            });
-        }
-        let wire = FootprintFileWire {
-            format: self.format.clone(),
-            file_uuid: self.file_uuid,
-            display_name: self.display_name.clone(),
-            created: self.created,
-            updated: self.updated,
-            footprints: wire_footprints,
-        };
-        // #828: graphics, pours and parameters are written by serde, and
-        // TOML spells NaN / infinity `nan` / `inf`; refuse them by key path.
-        if let Some(field) = signex_types::numeric::first_non_finite_path(&wire)
-            .map_err(FootprintFileError::TomlSerialize)?
-        {
-            return Err(FootprintFileError::NonFiniteField { field });
-        }
-        let mut out = toml::to_string_pretty(&wire).map_err(FootprintFileError::TomlSerialize)?;
-        for (idx, payload) in tsv_payloads.iter().enumerate() {
-            let needle = format!("\"{PADS_TSV_PLACEHOLDER_PREFIX}{idx}__\"");
-            let replacement = format!("'''\n{payload}'''");
-            out = out.replace(&needle, &replacement);
-        }
-        Ok(out)
-    }
-
     /// Locate a footprint by UUID within this file.
     pub fn get_footprint(&self, uuid: Uuid) -> Option<&Footprint> {
         self.footprints.iter().find(|f| f.uuid == uuid)
-    }
-
-    pub fn get_footprint_mut(&mut self, uuid: Uuid) -> Option<&mut Footprint> {
-        self.footprints.iter_mut().find(|f| f.uuid == uuid)
     }
 }
 
@@ -804,6 +696,7 @@ impl Footprint {
             default_designator: String::new(),
             component_type: ComponentType::Standard,
             height_mm: None,
+            generated: GeneratedFeatures::default(),
         }
     }
 }

@@ -346,6 +346,17 @@ pub enum Primitive {
     Region(Region),
 }
 
+/// A component body (record 12): a 3D model placement, from its text
+/// parameters (`MODELID`, `MODEL.NAME`, `MODEL.3D.ROTX`, ...). Layout
+/// observed in `tests/samples/Simple.PcbLib`: the common header, five
+/// bytes, then the parameter text as a length-prefixed block; the outline
+/// geometry after it is not read.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Body {
+    pub common: Common,
+    pub params: Params,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Primitives {
     pub arcs: Vec<Arc>,
@@ -355,6 +366,7 @@ pub struct Primitives {
     pub texts: Vec<Text>,
     pub fills: Vec<Fill>,
     pub regions: Vec<Region>,
+    pub bodies: Vec<Body>,
     /// Primitive type ids this model skips, with counts.
     pub skipped: HashMap<u8, usize>,
 }
@@ -447,6 +459,87 @@ pub struct PcbLib {
     /// The library header (`Library/Data`): layer names and stack.
     pub params: Params,
     pub layer_kinds: HashMap<u8, LayerKind>,
+    /// The container's root-entry modified time, if it records one.
+    pub modified: Option<std::time::SystemTime>,
+    /// The embedded model table (`Library/Models`), in stream order.
+    pub models: Vec<LibModel>,
+    /// The container's DIFAT had to be repaired to be read.
+    pub repaired: bool,
+    /// Root storages with a `Data` stream that are not footprints.
+    pub skipped: Vec<SkippedStorage>,
+}
+
+/// A root storage of a footprint library read as not a footprint.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SkippedStorage {
+    /// It is the library's `FileVersionInfo`.
+    pub version_info: bool,
+    /// Size of its `Data` stream.
+    pub data_len: usize,
+}
+
+/// The footprint directory after `Library/Data`'s header: a `u32` count and
+/// that many `[u32 len][length-prefixed name]` blocks.
+fn footprint_list(r: &mut Reader) -> Option<Vec<String>> {
+    let n = r.u32("footprint count").ok()? as usize;
+    if n > r.remaining() / 5 {
+        return None;
+    }
+    (0..n)
+        .map(|_| pascal(r.block("footprint entry").ok()?))
+        .collect::<Option<Vec<_>>>()
+        .filter(|l| !l.is_empty())
+}
+
+/// The length-prefixed string a block opens with.
+fn pascal(b: &[u8]) -> Option<String> {
+    let n = *b.first()? as usize;
+    Some(crate::params::decode_ansi(b.get(1..1 + n)?))
+}
+
+/// One entry of a library's model table: its record in `Library/Models/Data`
+/// and the inflated bytes of numbered stream `Library/Models/<index>`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LibModel {
+    /// The GUID a body's `MODELID` names, braces included.
+    pub id: String,
+    pub name: String,
+    pub embedded: bool,
+    /// The model file's bytes; `None` when not embedded or unreadable.
+    pub data: Option<Vec<u8>>,
+    /// Why `data` is absent although the model claims to be embedded.
+    pub problem: Option<String>,
+}
+
+fn read_models(c: &mut Container, budget: &mut crate::limits::Budget) -> Result<Vec<LibModel>> {
+    let Some(table) = c.stream_opt("Library/Models/Data")? else {
+        return Ok(Vec::new());
+    };
+    let records = text_records(Some(&table), "Library/Models/Data")?;
+    let mut out = Vec::new();
+    for (i, p) in records.iter().enumerate() {
+        let embedded = !p
+            .get("EMBED")
+            .is_some_and(|v| v.eq_ignore_ascii_case("FALSE"));
+        let mut m = LibModel {
+            id: p.string("ID"),
+            name: p.string("NAME"),
+            embedded,
+            ..Default::default()
+        };
+        if embedded {
+            match c.stream_opt(&format!("Library/Models/{i}")) {
+                Ok(Some(raw)) => match budget.inflate_zlib(&format!("Library/Models/{i}"), &raw) {
+                    Ok(buf) => m.data = Some(buf),
+                    Err(e) => m.problem = Some(e.to_string()),
+                },
+                Ok(None) => m.problem = Some(format!("model stream Library/Models/{i} is missing")),
+                Err(e) => m.problem = Some(e.to_string()),
+            }
+        }
+        out.push(m);
+    }
+    Ok(out)
 }
 
 impl PcbLib {
@@ -455,15 +548,41 @@ impl PcbLib {
         Self::from_container(&mut c)
     }
 
+    /// As [`PcbLib::open`], charging model inflation to a budget shared by
+    /// the run (`limits.rs`).
+    pub fn open_with(
+        path: impl AsRef<std::path::Path>,
+        budget: &mut crate::limits::Budget,
+    ) -> Result<Self> {
+        let mut c = Container::open(path)?;
+        Self::from_container_with(&mut c, budget)
+    }
+
     pub fn from_container(c: &mut Container) -> Result<Self> {
-        let mut lib = PcbLib::default();
+        Self::from_container_with(c, &mut crate::limits::Budget::default())
+    }
+
+    /// As [`PcbLib::from_container`], charging model inflation to a run-wide
+    /// budget (`limits.rs`).
+    pub fn from_container_with(
+        c: &mut Container,
+        budget: &mut crate::limits::Budget,
+    ) -> Result<Self> {
+        let mut lib = PcbLib {
+            modified: c.modified(),
+            repaired: c.repaired(),
+            ..PcbLib::default()
+        };
+        let mut listed = None;
         if let Some(data) = c.stream_opt("Library/Data")? {
-            // Only the leading text record; binary sections follow it.
+            // The header text record, then the footprint directory.
             let mut r = Reader::new(&data, "Library/Data");
             if let Ok(block) = r.block("library header") {
                 lib.params = Params::parse(block);
+                listed = footprint_list(&mut r);
             }
         }
+        lib.models = read_models(c, budget)?;
         lib.layer_kinds = layer_kinds(c.stream_opt("Library/LayerKindMapping/Data")?.as_deref());
         for storage in c.root_storages() {
             if storage == "Library" {
@@ -472,12 +591,26 @@ impl PcbLib {
             let Some(data) = c.stream_opt(&format!("{storage}/Data"))? else {
                 continue;
             };
-            let wide = wide_strings(c.stream_opt(&format!("{storage}/WideStrings"))?.as_deref());
+            // A footprint's Data opens with a block holding its name. The
+            // directory decides which storages are footprints; without one,
+            // the block must hold exactly one length-prefixed string.
             let mut r = Reader::new(&data, "footprint Data");
-            let name_block = r.block("footprint name")?;
-            let name = Reader::new(name_block, "footprint name")
-                .pascal_str("footprint name")
-                .unwrap_or_else(|_| storage.clone());
+            let name = r.block("footprint name").ok().and_then(|b| {
+                let exact = b.first().map(|&n| n as usize + 1) == Some(b.len());
+                let name = pascal(b)?;
+                match &listed {
+                    Some(list) => list.contains(&name).then_some(name),
+                    None => exact.then_some(name),
+                }
+            });
+            let Some(name) = name else {
+                lib.skipped.push(SkippedStorage {
+                    version_info: storage == "FileVersionInfo",
+                    data_len: data.len(),
+                });
+                continue;
+            };
+            let wide = wide_strings(c.stream_opt(&format!("{storage}/WideStrings"))?.as_deref());
             let mut primitives = Primitives::default();
             parse_primitives(&data[r.pos()..], &storage, &wide, &mut primitives)?;
             let params = c
@@ -569,7 +702,16 @@ pub fn parse_primitives(
             }
             6 => out.push(Primitive::Fill(fill(r.block("fill")?, stream)?)),
             11 => out.push(Primitive::Region(region(r.block("region")?, stream)?)),
-            // 12 component body, 16 dimension, ...: single-block records.
+            12 => {
+                let block = r.block("component body")?;
+                // Boards count bodies as skipped (the board converter reports
+                // them); libraries read them.
+                *out.skipped.entry(12).or_default() += 1;
+                if let Ok(b) = body(block, stream) {
+                    out.bodies.push(b);
+                }
+            }
+            // 16 dimension, ...: single-block records.
             0 => break,
             other => {
                 r.block("skipped primitive")?;
@@ -578,6 +720,17 @@ pub fn parse_primitives(
         }
     }
     Ok(())
+}
+
+fn body(b: &[u8], s: &str) -> Result<Body> {
+    let mut r = Reader::new(b, s);
+    let common = common(&mut r)?;
+    r.skip(5, "body reserved")?;
+    let text = r.block("body parameters")?;
+    Ok(Body {
+        common,
+        params: Params::parse(text),
+    })
 }
 
 fn track(b: &[u8], s: &str) -> Result<Track> {

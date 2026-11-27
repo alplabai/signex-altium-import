@@ -56,7 +56,7 @@ pub(crate) fn keepout_line(
     report: &mut Report,
 ) -> Vec<Zone> {
     if points.len() < 2 || !width.is_finite() || width <= 0.0 {
-        report.warn(KEEPOUT_LINE_NO_WIDTH);
+        report.warn("pcb.keepout_line_no_width", KEEPOUT_LINE_NO_WIDTH);
         return Vec::new();
     }
     let Some(layers) = keepout_layers(c, names, copper, report) else {
@@ -87,13 +87,13 @@ fn keepout_layers(
     } else if c.layer.is_copper() {
         vec![names.of(c.layer)]
     } else {
-        report.warn(KEEPOUT_NON_COPPER);
+        report.warn("pcb.keepout_non_copper", KEEPOUT_NON_COPPER);
         return None;
     };
     if c.component.is_some() {
-        report.warn(FOOTPRINT_KEEPOUT);
+        report.warn("pcb.footprint_keepout_moved", FOOTPRINT_KEEPOUT);
     }
-    report.warn(KEEPOUT_RESTRICTIONS);
+    report.warn("pcb.keepout_restrictions_merged", KEEPOUT_RESTRICTIONS);
     Some(layers)
 }
 
@@ -106,6 +106,10 @@ fn zones_on(layers: &[String], outline: &[Point]) -> Vec<Zone> {
 
 fn keepout_zone(layer: String, outline: Vec<Point>) -> Zone {
     Zone {
+        min_island_area: 0.0,
+        remove_dead_islands: false,
+        shelved: false,
+        unfilled: false,
         uuid: Uuid::new_v4(),
         net: 0,
         net_name: String::new(),

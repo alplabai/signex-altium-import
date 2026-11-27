@@ -35,6 +35,68 @@ pub fn symbol_file(lib: &SchLib, name: &str, report: &mut Report) -> SymbolFile 
     file
 }
 
+/// Every symbol of a schematic library with the ids the caller chose (one
+/// per component). Report items name `<library>:<symbol>` and carry the id.
+pub fn symbols_scoped(
+    lib: &SchLib,
+    library: &str,
+    ids: &[uuid::Uuid],
+    report: &mut Report,
+) -> Vec<Symbol> {
+    let out = lib
+        .components
+        .iter()
+        .zip(ids)
+        .map(|(c, id)| {
+            report.set_scope_with_id(format!("{library}:{}", c.lib_reference), id);
+            let mut s = symbol(c, report);
+            s.uuid = *id;
+            s
+        })
+        .collect();
+    report.set_scope("");
+    out
+}
+
+/// Pin and pad text goes into TSV cells; clean it (`text.rs`).
+fn sanitize_symbol(s: &mut Symbol, report: &mut Report) {
+    let mut changed = false;
+    let mut fix = |t: &mut String| {
+        let (c, ch) = crate::text::cell_safe(t);
+        *t = c;
+        changed |= ch;
+    };
+    for p in &mut s.pins {
+        fix(&mut p.number);
+        fix(&mut p.name);
+        fix(&mut p.description);
+        for f in &mut p.function {
+            fix(f);
+        }
+    }
+    if changed {
+        report.warn(
+            "symbol.text_sanitized",
+            "control characters or a triple apostrophe in a pin text replaced",
+        );
+    }
+}
+
+fn sanitize_footprint(fp: &mut Footprint, report: &mut Report) {
+    let mut changed = false;
+    for p in &mut fp.pads {
+        let (c, ch) = crate::text::cell_safe(&p.number);
+        p.number = c;
+        changed |= ch;
+    }
+    if changed {
+        report.warn(
+            "footprint.text_sanitized",
+            "control characters or a triple apostrophe in a pad number replaced",
+        );
+    }
+}
+
 fn symbol(c: &Component, report: &mut Report) -> Symbol {
     let mut s = Symbol::empty(c.lib_reference.clone());
     s.description = c.description.clone();
@@ -67,19 +129,52 @@ fn symbol(c: &Component, report: &mut Report) -> Symbol {
     }
     s.schematic_params = params;
 
-    let in_mode = |m: i32| m == c.display_mode;
-    s.pins = c
-        .pins
-        .iter()
-        .filter(|p| in_mode(p.display_mode))
-        .map(|p| pin(p, report))
-        .collect();
-    for (part, mode, shape) in &c.shapes {
-        if in_mode(*mode) {
-            s.graphics.extend(graphics(shape, part_of(*part), report));
+    // Display modes become body styles: mode 0 is the normal body, mode 1
+    // the alternate (De Morgan) body, an item for no particular mode (-1)
+    // belongs to both. Further modes have no Signex body.
+    for p in &c.pins {
+        match body_style(p.display_mode) {
+            Some(style) => {
+                let mut sp = pin(p, report);
+                sp.body_style = style;
+                s.pins.push(sp);
+            }
+            None => dropped_mode(p.display_mode, "pin", report),
         }
     }
+    for (part, mode, shape) in &c.shapes {
+        match body_style(*mode) {
+            Some(style) => {
+                let mut gs = graphics(shape, part_of(*part), report);
+                for g in &mut gs {
+                    g.body_style = style;
+                }
+                s.graphics.extend(gs);
+            }
+            None => dropped_mode(*mode, "graphic", report),
+        }
+    }
+    sanitize_symbol(&mut s, report);
     s
+}
+
+/// The Signex body style of an Altium display mode; `None` for a mode
+/// Signex has no body for.
+fn body_style(mode: i32) -> Option<u8> {
+    match mode {
+        m if m < 0 => Some(0),
+        0 => Some(1),
+        1 => Some(2),
+        _ => None,
+    }
+}
+
+fn dropped_mode(mode: i32, what: &str, report: &mut Report) {
+    report.warn_detail(
+        "symbol.display_mode_dropped",
+        format!("{what} of display mode {mode} not imported: Signex has two bodies"),
+        serde_json::json!({ "display_mode": mode }),
+    );
 }
 
 /// Altium part -1 / 0 (every part) -> Signex unit 0 (shared).
@@ -97,11 +192,11 @@ fn pin(p: &APin, report: &mut Report) -> SymbolPin {
         Electrical::Input => PinDirection::Input,
         Electrical::InputOutput => PinDirection::Bidirectional,
         Electrical::Output => PinDirection::Output,
-        Electrical::OpenCollector => PinDirection::OpenCollector,
+        Electrical::OpenCollector => PinDirection::OpenDrainLow,
         Electrical::Passive => PinDirection::Passive,
-        Electrical::HiZ => PinDirection::Tristate,
-        Electrical::OpenEmitter => PinDirection::OpenEmitter,
-        Electrical::Power => PinDirection::Power,
+        Electrical::HiZ => PinDirection::ThreeStatable,
+        Electrical::OpenEmitter => PinDirection::OpenDrainHigh,
+        Electrical::Power => PinDirection::PowerInput,
     };
     // Signex: position at the electrical end, orientation toward the body.
     pin.position = xy(p.hot_end());
@@ -117,24 +212,53 @@ fn pin(p: &APin, report: &mut Report) -> SymbolPin {
     pin.name_visible = p.show_name;
     pin.designator_visible = p.show_designator;
     pin.part_number = part_of(p.owner_part_id);
-    pin.inside_edge_symbol = edge_symbol(p.symbols.inner_edge, report);
-    pin.outside_edge_symbol = edge_symbol(p.symbols.outer_edge, report);
-    for code in [p.symbols.inside, p.symbols.outside] {
+    // Schematic placement reads only the outside-edge column. A dot takes
+    // it; a clock beside a dot goes to the inside-edge column, kept in the
+    // file though placement shows the dot. A clock alone is outside.
+    let inner = edge_symbol(p.symbols.inner_edge, "inner_edge", report);
+    let outer = edge_symbol(p.symbols.outer_edge, "outer_edge", report);
+    if outer != PinSymbolKind::None && inner != PinSymbolKind::None {
+        pin.outside_edge_symbol = outer;
+        pin.inside_edge_symbol = inner;
+        report.warn_detail(
+            "symbol.pin_decoration_merged",
+            format!(
+                "pin {} has an inner and an outer edge symbol; both are kept, placement shows the outer",
+                p.designator
+            ),
+            serde_json::json!({ "pin": p.designator }),
+        );
+    } else {
+        pin.outside_edge_symbol = if outer != PinSymbolKind::None {
+            outer
+        } else {
+            inner
+        };
+    }
+    for (code, slot) in [(p.symbols.inside, "inside"), (p.symbols.outside, "outside")] {
         if code != 0 {
-            report.warn(format!("pin IEEE symbol code {code} not mapped"));
+            report.warn_detail(
+                "symbol.pin_ieee_unmapped",
+                format!("pin IEEE symbol code {code} ({slot}) not mapped"),
+                serde_json::json!({ "ieee_code": code, "slot": slot }),
+            );
         }
     }
     pin
 }
 
 /// The edge codes the samples confirm; anything else is reported.
-fn edge_symbol(code: u8, report: &mut Report) -> PinSymbolKind {
+fn edge_symbol(code: u8, slot: &str, report: &mut Report) -> PinSymbolKind {
     match code {
         0 => PinSymbolKind::None,
         PinSymbols::DOT => PinSymbolKind::Dot,
         PinSymbols::CLOCK => PinSymbolKind::ClockEdge,
         other => {
-            report.warn(format!("pin IEEE symbol code {other} not mapped"));
+            report.warn_detail(
+                "symbol.pin_ieee_unmapped",
+                format!("pin IEEE symbol code {other} ({slot}) not mapped"),
+                serde_json::json!({ "ieee_code": other, "slot": slot }),
+            );
             PinSymbolKind::None
         }
     }
@@ -149,6 +273,7 @@ fn line(a: Pt, b: Pt) -> SymbolGraphicKind {
 
 fn graphics(shape: &Shape, part_number: u8, report: &mut Report) -> Vec<SymbolGraphic> {
     let g = |kind, width: f64, filled: bool| SymbolGraphic {
+        body_style: 1,
         kind,
         stroke_width: mm(width),
         fill: filled.then_some(BODY_FILL),
@@ -162,8 +287,28 @@ fn graphics(shape: &Shape, part_number: u8, report: &mut Report) -> Vec<SymbolGr
     match shape {
         Shape::Line { a, b, width } => vec![g(line(*a, *b), *width, false)],
         Shape::Polyline { points, width } => lines(points, *width),
+        // A cubic Bezier is four points; a longer run of 3n+1 points is n
+        // curves joined end to end.
+        Shape::Bezier { points, width } if points.len() >= 4 && (points.len() - 1) % 3 == 0 => {
+            points
+                .windows(4)
+                .step_by(3)
+                .map(|w| {
+                    g(
+                        SymbolGraphicKind::Bezier {
+                            points: [xy(w[0]), xy(w[1]), xy(w[2]), xy(w[3])],
+                        },
+                        *width,
+                        false,
+                    )
+                })
+                .collect()
+        }
         Shape::Bezier { points, width } => {
-            report.warn("symbol bezier imported as its control polygon");
+            report.warn(
+                "symbol.bezier_polygon",
+                "symbol bezier that is not a run of cubic curves imported as its control polygon",
+            );
             lines(points, *width)
         }
         Shape::Polygon {
@@ -193,15 +338,22 @@ fn graphics(shape: &Shape, part_number: u8, report: &mut Report) -> Vec<SymbolGr
         Shape::RoundRect {
             a,
             b,
+            rx,
+            ry,
             width,
             filled,
-            ..
         } => {
-            report.warn("rounded rectangle imported with square corners");
+            if (rx - ry).abs() > 1e-6 {
+                report.warn(
+                    "symbol.rounded_rect_radius",
+                    "rounded rectangle with different corner radii imported with the smaller one",
+                );
+            }
             vec![g(
-                SymbolGraphicKind::Rectangle {
+                SymbolGraphicKind::RoundRectangle {
                     from: xy(*a),
                     to: xy(*b),
+                    corner_radius: mm(rx.min(*ry)),
                 },
                 *width,
                 *filled,
@@ -293,6 +445,30 @@ pub fn footprint_file(lib: &PcbLib, name: &str, report: &mut Report) -> Footprin
     file
 }
 
+/// Every footprint of a PCB library with the ids the caller chose (one per
+/// footprint). Report items name `<library>:<footprint>` and carry the id.
+pub fn footprints_scoped(
+    lib: &PcbLib,
+    library: &str,
+    ids: &[uuid::Uuid],
+    report: &mut Report,
+) -> Vec<Footprint> {
+    let names = LayerNames::from_params(&lib.params, &lib.layer_kinds);
+    let out = lib
+        .footprints
+        .iter()
+        .zip(ids)
+        .map(|(f, id)| {
+            report.set_scope_with_id(format!("{library}:{}", f.name), id);
+            let mut fp = footprint(f, &names, report);
+            fp.uuid = *id;
+            fp
+        })
+        .collect();
+    report.set_scope("");
+    out
+}
+
 /// Footprint-local Altium (mils, Y up) -> editor mm, Y down.
 fn fxy(p: Pt) -> [f64; 2] {
     [mm(p.x), mm(-p.y)]
@@ -334,11 +510,18 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
             Some(Slot::FabBottom) => fp.fab_b.push(g),
             // Lines and arcs on a courtyard layer build the outline;
             // anything else there (text) has no place in it.
-            Some(Slot::Courtyard) => report.warn("text on a courtyard layer not imported"),
-            None => report.warn(format!(
-                "footprint graphic on {} not imported",
-                names.of(layer)
-            )),
+            Some(Slot::Courtyard) => report.warn(
+                "footprint.courtyard_text_dropped",
+                "text on a courtyard layer not imported",
+            ),
+            None => report.warn_detail(
+                "footprint.graphic_layer_unmapped",
+                format!(
+                    "graphic on {} dropped: Signex footprints have no such layer yet (signex #3133)",
+                    names.of(layer)
+                ),
+                serde_json::json!({ "layer": names.of(layer).to_string() }),
+            ),
         }
     };
 
@@ -348,10 +531,14 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
             continue;
         }
         if t.common.layer.is_copper() {
-            report.warn("copper track inside a library footprint not imported");
+            report.warn(
+                "footprint.copper_track_dropped",
+                "copper track inside a library footprint not imported",
+            );
             continue;
         }
         let g = FpGraphic {
+            sketch_entity: None,
             kind: FpGraphicKind::Line {
                 from: fxy(t.a),
                 to: fxy(t.b),
@@ -382,6 +569,7 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
             }
         };
         let g = FpGraphic {
+            sketch_entity: None,
             kind,
             stroke_width: mm(a.width),
             filled: false,
@@ -393,6 +581,7 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
             continue;
         }
         let g = FpGraphic {
+            sketch_entity: None,
             kind: FpGraphicKind::Text {
                 position: fxy(t.position),
                 content: t.text.clone(),
@@ -405,19 +594,39 @@ fn footprint(f: &apcb::Footprint, names: &LayerNames, report: &mut Report) -> Fo
         push(&mut fp, t.common.layer, g, report);
     }
     for _ in &p.fills {
-        report.warn("fill inside a library footprint not imported");
+        report.warn(
+            "footprint.fill_dropped",
+            "fill inside a library footprint not imported",
+        );
     }
     for _ in &p.regions {
-        report.warn("region inside a library footprint (custom pad shape) not imported");
+        report.warn(
+            "footprint.region_dropped",
+            "region inside a library footprint (custom pad shape) not imported",
+        );
     }
     if !courtyard.is_empty() {
         match chain(&courtyard) {
             Some(points) => fp.courtyard = Polygon::new(points),
             None => {
-                report.warn("open courtyard outline replaced by its bounding box");
+                report.warn(
+                    "footprint.courtyard_open_bbox",
+                    "open courtyard outline replaced by its bounding box",
+                );
                 fp.courtyard = Polygon::new(bounding_box(&courtyard));
             }
         }
+    }
+    sanitize_footprint(&mut fp, report);
+    if fp
+        .pads
+        .iter()
+        .any(|p| p.drill.as_ref().is_some_and(|d| d.slot_length.is_some()))
+    {
+        report.warn(
+            "pad.slot_not_placeable",
+            "Signex cannot place this footprint on a board until slotted drills are supported (signex #3128); the footprint is written exactly",
+        );
     }
     fp
 }
@@ -496,16 +705,41 @@ fn pad(p: &apcb::Pad, report: &mut Report) -> Pad {
         APadShape::RoundedRect => PadShape::RoundRect {
             radius_ratio: f64::from(p.corner_radius_pct.min(100)) / 200.0,
         },
+        // A regular octagon as a custom outline (the board refuses chamfered
+        // pads): each corner cut at 45 degrees by (1 - 1/sqrt(2)) / 2 of the
+        // shorter side. The cut is the regular one, not read from the file
+        // (no sample records it), so the shape is reported as approximated.
         APadShape::Octagonal => {
-            report.warn("octagonal pad imported as a rectangle");
-            PadShape::Rect
+            report.warn(
+                "footprint.pad_octagon_custom",
+                "octagonal pad written as a custom outline with regular-octagon corner cuts",
+            );
+            let (hw, hh) = (mm(size.x) / 2.0, mm(size.y) / 2.0);
+            let c = 0.292_893 * hw.min(hh) * 2.0;
+            let r = |v: f64| (v * 1e5).round() / 1e5;
+            PadShape::Custom(Polygon::new(
+                [
+                    [-hw + c, -hh],
+                    [hw - c, -hh],
+                    [hw, -hh + c],
+                    [hw, hh - c],
+                    [hw - c, hh],
+                    [-hw + c, hh],
+                    [-hw, hh - c],
+                    [-hw, -hh + c],
+                ]
+                .map(|[x, y]| [r(x), r(y)])
+                .to_vec(),
+            ))
         }
     };
-    // The footprint editor's own layer names for new pads.
+    // The named layer tokens of `LIBRARY_FORMAT.md` section 4.2, the sets
+    // the footprint editor writes; any other spelling is unplaceable.
     let layers = match kind {
-        PadKind::Tht | PadKind::NptHole => vec!["*.Cu", "F.Mask", "B.Mask"],
-        _ if bottom => vec!["B.Cu", "B.Mask", "B.Paste"],
-        _ => vec!["F.Cu", "F.Mask", "F.Paste"],
+        PadKind::Tht => vec!["Top Layer", "Bottom Layer", "Top Solder", "Bottom Solder"],
+        PadKind::NptHole => vec!["Top Solder", "Bottom Solder"],
+        _ if bottom => vec!["Bottom Layer", "Bottom Solder", "Bottom Paste"],
+        _ => vec!["Top Layer", "Top Solder", "Top Paste"],
     };
     let drill = drilled.then(|| Drill {
         diameter: mm(p.hole),

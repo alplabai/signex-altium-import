@@ -151,6 +151,62 @@ fn pcblib_lists_footprints_with_pads() {
     assert!(!cap.primitives.tracks.is_empty());
 }
 
+/// The library lists 13 footprints (the directory in `Library/Data`); the
+/// root storage `FileVersionInfo` also has a `Data` stream but is not one.
+#[test]
+fn pcblib_has_exactly_the_listed_footprints() {
+    let lib = PcbLib::open(sample("Simple.PcbLib")).unwrap();
+    let mut names: Vec<&str> = lib.footprints.iter().map(|f| f.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "CAPC1608X09L",
+            "Footprint 22",
+            "Four pads",
+            "Lines shifted",
+            "Pads Combined",
+            "SQFP50P800X800X300_HS-33T300X300",
+            "Single Pad (0,0)",
+            "Single Pad (0,0) Rotate 180",
+            "Single Pad (0,0) Rotate 270",
+            "Single Pad (0,0) Rotate 90",
+            "Single Pad (0,1)",
+            "Single Pad (1,0)",
+            "Strings on Layers",
+        ]
+    );
+    assert_eq!(lib.skipped.len(), 1);
+    assert!(lib.skipped[0].version_info);
+}
+
+/// A version record of 125 bytes opens with `|` (124), so its block looks
+/// like one length-prefixed string; the directory still rules it out.
+#[test]
+fn a_version_record_shaped_like_a_name_is_skipped_and_listed() {
+    use std::io::{Cursor, Write};
+    let bytes = std::fs::read(sample("Simple.PcbLib")).unwrap();
+    let mut cf = cfb::CompoundFile::open(Cursor::new(bytes)).unwrap();
+    let mut text = b"|COUNT=1|VER0=1".to_vec();
+    text.resize(125, b'0');
+    let mut data = 125u32.to_le_bytes().to_vec();
+    data.extend_from_slice(&text);
+    // Replaces the existing stream.
+    cf.create_stream("/FileVersionInfo/Data")
+        .unwrap()
+        .write_all(&data)
+        .unwrap();
+    cf.flush().unwrap();
+    let mut c =
+        altium_format::Container::from_bytes("x".into(), cf.into_inner().into_inner()).unwrap();
+    let lib = PcbLib::from_container(&mut c).unwrap();
+    assert_eq!(lib.footprints.len(), 13);
+    assert!(lib.footprints.iter().all(|f| !f.name.starts_with("COUNT=")));
+    assert_eq!(lib.skipped.len(), 1);
+    assert!(lib.skipped[0].version_info);
+    assert_eq!(lib.skipped[0].data_len, 129);
+}
+
 #[test]
 fn prjpcb_lists_documents() {
     let prj = Project::open(sample("simple-proj.prjpcb")).unwrap();

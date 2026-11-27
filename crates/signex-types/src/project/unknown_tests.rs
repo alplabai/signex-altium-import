@@ -82,18 +82,34 @@ fn newer_format_version_is_refused_and_file_left_untouched() {
     let body = r#"{"format":"snxprj/2","name":"Proj","dir":"","schematic_root":null,"pcb_file":null,"future":1}"#;
     let path = write_raw(dir.path(), body);
     let err = parse_project(&path).expect_err("newer format must be refused");
-    assert!(err.to_string().contains("snxprj/2"), "got {err}");
+    let message = err.to_string();
+    assert!(message.contains("snxprj/2"), "got {message}");
+    assert!(message.contains("newer Signex"), "got {message}");
+    assert!(
+        message.contains("Proj.snxprj"),
+        "the file is named: {message}"
+    );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
 }
 
 #[test]
 fn unrecognised_format_token_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_raw(
-        dir.path(),
-        r#"{"format":"something-else","name":"Proj","dir":"","schematic_root":null,"pcb_file":null}"#,
-    );
-    assert!(parse_project(&path).is_err());
+    for token in [r#""something-else""#, "2", "null"] {
+        let body = format!(
+            r#"{{"format":{token},"name":"Proj","dir":"","schematic_root":null,"pcb_file":null}}"#
+        );
+        let path = write_raw(dir.path(), &body);
+        match parse_project(&path) {
+            Err(ProjectError::UnsupportedFormat { source, .. }) => {
+                assert!(
+                    matches!(source, FormatVersionError::Unsupported { .. }),
+                    "{token}: {source:?}"
+                );
+            }
+            other => panic!("{token}: expected UnsupportedFormat, got {other:?}"),
+        }
+    }
 }
 
 fn retarget_fixture(dir: &Path, libraries: Value) -> PathBuf {
@@ -154,4 +170,19 @@ fn retarget_reports_a_shared_disk_entry_without_writing() {
 
     assert_eq!(out, LibraryRetarget::ListedAsDifferentKind);
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// #2172 guard: a project written without an id of its own stays without one
+/// on a load -> save cycle (no key appears, no key is lost).
+#[test]
+fn a_project_without_an_id_key_re_saves_without_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_raw(
+        dir.path(),
+        r#"{"name":"Proj","dir":"","schematic_root":null,"pcb_file":null}"#,
+    );
+    let data = parse_project(&path).unwrap();
+    write_project(&path, &data).unwrap();
+    let after = saved_json(&path);
+    assert!(!after.as_object().unwrap().contains_key("document_id"));
 }

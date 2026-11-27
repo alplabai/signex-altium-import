@@ -363,6 +363,18 @@ fn foreign_column_names<R: SnxTable>(rows: &[R]) -> Vec<String> {
     names
 }
 
+/// [`parse_tsv_block`] for a block the file may leave out: an absent block is
+/// no rows.
+pub(super) fn parse_optional_block<R: SnxTable>(
+    name: &str,
+    block: Option<TsvBody>,
+) -> Result<Vec<R>, FormatError> {
+    match block {
+        Some(b) => parse_tsv_block::<R>(name, &b.content),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// Parse a TSV block. Columns resolve by header name: every column in
 /// `R::columns()` must be present (any order); extra columns are
 /// captured per row as [`UnknownColumns`] instead of refusing the file.
@@ -482,6 +494,27 @@ impl HeaderLayout {
 // ---------------------------------------------------------------------------
 // Field-level parse helpers
 // ---------------------------------------------------------------------------
+
+/// Parse an integer-nanometre column, refusing a coordinate the writer
+/// could not save back: the file stores nm, the model holds f64 mm, and a
+/// value at the ends of the `i64` range fails the nm -> mm -> nm trip (#1830).
+pub(in crate::format) fn parse_nm(
+    value: &str,
+    block: &str,
+    row: usize,
+    field: &str,
+) -> Result<i64, FormatError> {
+    let nm = parse_i64(value, block, row, field)?;
+    if super::units::nm_survives_round_trip(nm) {
+        return Ok(nm);
+    }
+    Err(FormatError::CoordinateOutOfRange {
+        block: block.to_string(),
+        row,
+        field: field.to_string(),
+        nm,
+    })
+}
 
 pub(in crate::format) fn parse_i64(
     value: &str,

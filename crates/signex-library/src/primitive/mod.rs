@@ -15,23 +15,28 @@
 //! - [`PrimitiveRef`] in [`ref_`]
 
 pub mod container_merge;
+mod copy_for_library;
 pub mod footprint;
 pub mod ref_;
 pub mod sim;
 pub mod symbol;
+mod tsv_cell;
 
 pub use container_merge::{ContainerMerge, DuplicatedUuid};
+pub use copy_for_library::unique_copy_name;
 pub use footprint::{
-    Body3D, BodyShape, Drill, Footprint, FootprintFile, FootprintFileError, FpGraphic,
-    FpGraphicKind, LayerId, LoadRepair, Pad, PadKind, PadShape, Polygon, StepAttachment,
+    Body3D, BodyShape, Drill, EmbeddedModel, EmbeddedModels, Footprint, FootprintFile,
+    FootprintFileError, FpGraphic, FpGraphicKind, LayerId, LoadRepair, MODEL_DEFLATE_LEVEL,
+    MODEL_ENCODING, ModelError, ModelFault, MountStyle, Pad, PadKind, PadShape, Polygon,
+    StepAttachment, step_model_hash, textconv_footprint_text,
 };
 pub use ref_::PrimitiveRef;
 pub use sim::{SimFile, SimFileError, SimKind, SimModel};
 pub use symbol::{
-    CHAIN_ARC_SAMPLES, CHAIN_ENDPOINT_EPSILON_MM, ChainError, ChainSegment, ComponentType,
-    PinDirection, PinOrientation, PinSymbolKind, Symbol, SymbolFile, SymbolFileError,
-    SymbolGraphic, SymbolGraphicKind, SymbolPin, chain_into_closed_contour,
-    normalize_arc_endpoints_deg,
+    BODY_ALTERNATE, BODY_COMMON, BODY_NORMAL, CHAIN_ARC_SAMPLES, CHAIN_ENDPOINT_EPSILON_MM,
+    ChainError, ChainSegment, ComponentType, PinDirection, PinOrientation, PinSymbolKind, Symbol,
+    SymbolFile, SymbolFileError, SymbolGraphic, SymbolGraphicKind, SymbolPin,
+    chain_into_closed_contour, normalize_arc_endpoints_deg,
 };
 
 /// Discriminator surfaced on `PrimitiveSummary` so a single `list_*` API can

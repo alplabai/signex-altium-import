@@ -44,6 +44,11 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
     let names = LayerNames::for_doc(doc)?;
     let copper = names.copper_tokens();
     let mut board = PcbBoard {
+        free: Default::default(),
+        options: Default::default(),
+        rooms: Vec::new(),
+        sketch: None,
+        stackup: None,
         uuid: Uuid::new_v4(),
         version: 1,
         generator: crate::GENERATOR.into(),
@@ -57,6 +62,7 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             .iter()
             .enumerate()
             .map(|(i, (token, plane))| LayerDef {
+                display_name: String::new(),
                 id: i as u8,
                 name: token.clone(),
                 layer_type: if *plane { "plane" } else { "signal" }.into(),
@@ -94,7 +100,10 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
     // of `board.footprints` is Altium component i.
     for (i, c) in doc.components.iter().enumerate() {
         if !c.unique_id.is_empty() {
-            report.warn("source-tool component unique id dropped");
+            report.warn(
+                "pcb.component_uid_dropped",
+                "source-tool component unique id dropped",
+            );
         }
         board.footprints.push(footprint(i as u16, c, doc, &frame));
     }
@@ -111,7 +120,10 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
                 board.footprints[slot].pads.push(pad);
             }
             None => {
-                report.warn("free pad (not in a component) imported into its own footprint");
+                report.warn(
+                    "pcb.free_pad_holder",
+                    "free pad (not in a component) imported into its own footprint",
+                );
                 let mut fp = free_pad_holder(pad, &frame);
                 let pad = convert_pad(pad, &fp, 0.0, &frame, &names, net, report);
                 fp.pads.push(pad);
@@ -136,7 +148,7 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             continue;
         }
         if let Some(n) = t.common.layer.plane() {
-            report.warn(SPLIT_LINE_DROPPED);
+            report.warn("pcb.plane_split_line_dropped", SPLIT_LINE_DROPPED);
             split_planes.insert(n);
             continue;
         }
@@ -161,6 +173,9 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             });
         } else {
             board.graphics.push(BoardGraphic {
+                uuid: Uuid::new_v4(),
+                text: String::new(),
+                font_size: 0.0,
                 graphic_type: "line".into(),
                 layer,
                 width: mm(t.width),
@@ -190,13 +205,16 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             continue;
         }
         if let Some(n) = a.common.layer.plane() {
-            report.warn(SPLIT_LINE_DROPPED);
+            report.warn("pcb.plane_split_line_dropped", SPLIT_LINE_DROPPED);
             split_planes.insert(n);
             continue;
         }
         let layer = names.of(a.common.layer);
         if a.common.layer.is_copper() {
-            report.warn("copper arc imported as straight track segments");
+            report.warn(
+                "pcb.copper_arc_flattened",
+                "copper arc imported as straight track segments",
+            );
             let pts = arc_polyline(a.center, a.radius, a.start, a.end);
             for w in pts.windows(2) {
                 board.segments.push(segment(
@@ -235,6 +253,9 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             // around, so start and end swap.
             let (first, last) = if full { (s, e) } else { (e, s) };
             board.graphics.push(BoardGraphic {
+                uuid: Uuid::new_v4(),
+                text: String::new(),
+                font_size: 0.0,
                 graphic_type: kind.into(),
                 layer,
                 width: mm(a.width),
@@ -250,6 +271,9 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
     for v in &p.vias {
         let through = v.start_layer == Layer::TOP && v.end_layer == Layer::BOTTOM;
         board.vias.push(Via {
+            attributes: Default::default(),
+            layer_sizes: None,
+            locked: false,
             uuid: Uuid::new_v4(),
             position: frame.world(v.position),
             diameter: mm(v.diameter),
@@ -309,7 +333,7 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
                 .zones
                 .extend(keepout_area(&f.common, &pts, &names, &copper, report));
         } else if f.common.layer.plane().is_some() {
-            report.warn(PLANE_VOID);
+            report.warn("pcb.plane_void_keepout", PLANE_VOID);
             board.zones.push(plane_void(names.of(f.common.layer), pts));
         } else if f.common.layer.is_copper() {
             board
@@ -317,6 +341,9 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
                 .push(zone(doc, f.common.net, names.of(f.common.layer), pts));
         } else {
             board.graphics.push(BoardGraphic {
+                uuid: Uuid::new_v4(),
+                text: String::new(),
+                font_size: 0.0,
                 graphic_type: "poly".into(),
                 layer: names.of(f.common.layer),
                 width: 0.0,
@@ -346,7 +373,10 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
         }
         let hatch = poly.params.str("HATCHSTYLE");
         if !hatch.is_empty() && !hatch.eq_ignore_ascii_case("Solid") {
-            report.warn("hatched polygon pour imported as a solid pour");
+            report.warn(
+                "pcb.pour_hatch_solid",
+                "hatched polygon pour imported as a solid pour",
+            );
         }
         board
             .zones
@@ -368,7 +398,10 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
         }
         let pts: Vec<Point> = r.outline.iter().map(|p| frame.world(*p)).collect();
         if pts.len() < 3 {
-            report.warn("region with fewer than 3 points not imported");
+            report.warn(
+                "pcb.region_too_few_points",
+                "region with fewer than 3 points not imported",
+            );
             continue;
         }
         // A keepout region is a rule, also inside a footprint.
@@ -379,29 +412,39 @@ pub fn convert(doc: &PcbDoc, report: &mut Report) -> Result<PcbBoard, ConvertErr
             continue;
         }
         if r.common.component.is_some() {
-            report.warn("footprint region (custom pad shape or footprint copper) not imported");
+            report.warn(
+                "pcb.footprint_region_dropped",
+                "footprint region (custom pad shape or footprint copper) not imported",
+            );
             continue;
         }
         let solid = r.kind == 0 && !r.params.bool("ISBOARDCUTOUT");
         if solid && r.common.layer.plane().is_some() {
-            report.warn(PLANE_VOID);
+            report.warn("pcb.plane_void_keepout", PLANE_VOID);
             board.zones.push(plane_void(names.of(r.common.layer), pts));
         } else if solid && r.common.layer.is_copper() {
             board
                 .zones
                 .push(zone(doc, r.common.net, names.of(r.common.layer), pts));
         } else {
-            report.warn("cutout or non-copper region not imported");
+            report.warn(
+                "pcb.region_cutout_dropped",
+                "cutout or non-copper region not imported",
+            );
         }
     }
 
     for (ty, n) in &p.skipped {
-        let what = match ty {
-            12 => "3D component body".to_string(),
-            t => format!("PCB primitive type {t}"),
+        let (code, what) = match ty {
+            12 => ("pcb.body_dropped", "3D component body".to_string()),
+            t => ("pcb.primitive_dropped", format!("PCB primitive type {t}")),
         };
         for _ in 0..*n {
-            report.warn(format!("{what} not imported"));
+            report.warn_detail(
+                code,
+                format!("{what} not imported"),
+                serde_json::json!({ "primitive": ty }),
+            );
         }
     }
     names.report_unmapped(report);
@@ -444,11 +487,14 @@ fn plane_pours(
     let mut pours = Vec::new();
     for (n, token) in &names.planes {
         if outline.len() < 3 {
-            report.warn("plane not written: the board has no outline to pour it over");
+            report.warn(
+                "pcb.plane_no_outline",
+                "plane not written: the board has no outline to pour it over",
+            );
             continue;
         }
         if split_planes.contains(n) {
-            report.warn(SPLIT_PLANE_NETS_LOST);
+            report.warn("pcb.split_plane_nets_lost", SPLIT_PLANE_NETS_LOST);
         }
         let pullback = doc
             .board
@@ -462,7 +508,10 @@ fn plane_pours(
             .position(|name| *name == net_name)
             .and_then(|i| u16::try_from(i).ok());
         if net.is_none() {
-            report.warn("plane with no net written as a pour without a net");
+            report.warn(
+                "pcb.plane_no_net",
+                "plane with no net written as a pour without a net",
+            );
         }
         let area = pulled_back(outline, pullback, report);
         let mut z = zone(doc, net, token.clone(), area);
@@ -490,7 +539,7 @@ fn pulled_back(outline: &[Point], pullback: f64, report: &mut Report) -> Vec<Poi
     let inner = offset_polygon(&ring, -pullback, CornerStyle::Miter { miter_limit: 4.0 });
     let (before, after) = (signed_area(&ring), signed_area(&inner));
     if inner.len() < 3 || before * after <= 0.0 || after.abs() >= before.abs() {
-        report.warn(PULLBACK_NOT_APPLIED);
+        report.warn("pcb.pullback_not_applied", PULLBACK_NOT_APPLIED);
         return outline.to_vec();
     }
     inner.into_iter().map(|p| Point::new(p.x, p.y)).collect()
@@ -517,6 +566,8 @@ fn pad_net(doc: &PcbDoc, n: Option<u16>) -> Option<PadNet> {
 
 fn segment(frame: &Frame, a: Pt, b: Pt, width: f64, layer: String, net: Option<u16>) -> Segment {
     Segment {
+        attributes: Default::default(),
+        locked: false,
         uuid: Uuid::new_v4(),
         start: frame.world(a),
         end: frame.world(b),
@@ -634,9 +685,11 @@ impl LayerNames {
     /// One report line per source layer that had no Signex layer.
     pub(crate) fn report_unmapped(&self, report: &mut Report) {
         for n in self.unmapped.borrow().iter() {
-            report.warn(format!(
-                "source layer {n} has no Signex layer; its items are on Unmapped{n}"
-            ));
+            report.warn_detail(
+                "pcb.layer_unmapped",
+                format!("source layer {n} has no Signex layer; its items are on Unmapped{n}"),
+                serde_json::json!({ "layer": n }),
+            );
         }
     }
 
@@ -803,6 +856,10 @@ fn zone(doc: &PcbDoc, net: Option<u16>, layer: String, outline: Vec<Point>) -> Z
         .map(|n| (n.number, n.name))
         .unwrap_or_default();
     Zone {
+        min_island_area: 0.0,
+        remove_dead_islands: false,
+        shelved: false,
+        unfilled: false,
         uuid: Uuid::new_v4(),
         net,
         net_name,
@@ -899,6 +956,9 @@ fn footprint(index: u16, c: &apcb::Component, doc: &PcbDoc, frame: &Frame) -> Fo
     .map(|(k, v)| property(k, v))
     .collect();
     Footprint {
+        component: Default::default(),
+        library_ref: None,
+        schematic_link: None,
         uuid: Uuid::new_v4(),
         reference: designator,
         value: comment,
@@ -924,6 +984,9 @@ fn footprint(index: u16, c: &apcb::Component, doc: &PcbDoc, frame: &Frame) -> Fo
 
 fn free_pad_holder(pad: &apcb::Pad, frame: &Frame) -> Footprint {
     Footprint {
+        component: Default::default(),
+        library_ref: None,
+        schematic_link: None,
         uuid: Uuid::new_v4(),
         reference: String::new(),
         value: String::new(),
@@ -967,7 +1030,10 @@ fn convert_pad(
     let rel = deg(pad.rotation - comp_rotation) % 180.0;
     let swap = (rel - 90.0).abs() < 0.01;
     if !swap && rel > 0.01 && rel < 179.99 {
-        report.warn("pad rotated off a quarter turn from its footprint imported unrotated");
+        report.warn(
+            "pcb.pad_rotation_dropped",
+            "pad rotated off a quarter turn from its footprint imported unrotated",
+        );
     }
     let (sx, sy) = if swap {
         (size.y, size.x)
@@ -980,7 +1046,10 @@ fn convert_pad(
         APadShape::Rect => PadShape::Rect,
         APadShape::RoundedRect => PadShape::RoundRect,
         APadShape::Octagonal => {
-            report.warn("octagonal pad imported as a rectangle");
+            report.warn(
+                "pcb.pad_octagon_rect",
+                "octagonal pad imported as a rectangle",
+            );
             PadShape::Rect
         }
     };
@@ -1004,6 +1073,11 @@ fn convert_pad(
         },
     });
     Pad {
+        custom_outline: Vec::new(),
+        layer_sizes: None,
+        net_locked: false,
+        rotation: 0.0,
+        trapezoid_delta: Point::new(0.0, 0.0),
         uuid: Uuid::new_v4(),
         number: pad.name.clone(),
         pad_type,

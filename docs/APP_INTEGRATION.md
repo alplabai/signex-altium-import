@@ -45,3 +45,52 @@ input), `null` otherwise: `{ "total", "on_own_net_pad",
 "on_other_net_pad" }`, counting track ends that land on a netted pad with
 copper on the track's layer. Ends on another net's pad should be about
 zero; many mean pads were placed wrong.
+
+## Library converter contract
+
+Besides the single-file import above, the binary is a Signex *library
+converter*. The authoritative contract is
+`docs/LIBRARY_CONVERTER_CONTRACT.md` in the
+[Signex repository](https://github.com/alplabai/signex) (version `1.0`), with
+a JSON Schema beside it; this section only says how this binary meets it. The
+single-file contract above is unchanged.
+
+```text
+signex-altium-import describe --json
+signex-altium-import library <input>... --output <dir>
+    [--name <name>] [--library-id <uuid>] [--db <path>] [--search-path <dir>]...
+    [--map <mapping.toml>] [--models include|skip] [--models-dir <dir>]
+    [--dry-run] [--update] [--json] [--progress]
+```
+
+- `describe` lists the inputs: `schlib`, `pcblib`, `intlib` (kind `library`)
+  and `dblib` (kind `database`).
+- `library` runs read, convert and write phases. `--progress` streams NDJSON
+  events, flushed per line, with a heartbeat at least every 10 s; the
+  `summary` event is always last and implies `--json`.
+- Every run that read its inputs writes `import-report.json` and
+  `import-report.md` into `--output`; codes are catalogued in
+  `docs/CONVERSION.md` ("Report codes").
+- Exit codes: 0 `ok`, 2 `partial` (something was dropped or not written), 1
+  `failed`. An unknown option, a bad value or an unusable `--output` exits 1
+  with a failed summary on stdout, even without `--json`.
+
+Status: `.SchLib` and `.PcbLib` inputs convert into one library
+(`docs/CONVERSION.md`, "Library conversion"); `--update` refreshes a library
+this converter wrote and refuses one with another id. `.IntLib` inputs convert
+(parts released), and STEP models are embedded in footprint files
+(`--models skip` leaves them out; `--models-dir` supplies models a body
+names but the file does not hold). `.DbLib` inputs convert
+(`docs/CONVERSION.md`, "Database libraries"): `--db` overrides the stored
+database (a folder of per-table CSV files, an Access file, or a connection
+string naming one), `--search-path` adds folders the rows' library paths are
+looked up in (repeatable, searched in order), `--map` overrides the column
+mapping, and `import-mapping.toml` beside the report holds the mapping the run
+used. A database library is given on its own, and rows that cannot be
+resolved are `error` items (exit 2). Folder inputs are advertised by
+`describe` but refused until their readers land. `--help` and
+`--version` print no summary. A failed run removes the library files it
+wrote, keeps `import-report.*` once the source was read, and leaves a
+library that existed before `--update` as it was. A dry run writes only the
+report; its summary has empty `files` and its `counts` are what a real run
+would write.

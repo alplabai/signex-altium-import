@@ -9,6 +9,7 @@ One-way converter from Altium Designer files to Signex native files.
 | `.PcbDoc` | `.snxpcb` | supported |
 | `.SchLib` | `.snxsym` (every symbol in one file) | supported |
 | `.PcbLib` | `.snxfpt` (every footprint in one file) | supported |
+| `.SchLib`, `.PcbLib`, `.IntLib`, `.DbLib` (`library`) | one Signex library directory | supported |
 
 Source-available under **FSL-1.1-ALv2**, like
 [Signex](https://github.com/alplabai/signex); see [License](#license). The
@@ -37,6 +38,47 @@ before trusting an imported board for fabrication.
 --json                             machine-readable summary (used by Signex)
 ```
 
+### Library converter
+
+Signex also drives the binary as a library converter (contract in
+[docs/APP_INTEGRATION.md](docs/APP_INTEGRATION.md)):
+
+```bash
+signex-altium-import describe --json
+signex-altium-import library Passives.SchLib Passives.PcbLib --output out/Passives --dry-run --progress
+```
+
+`library` takes `.SchLib`, `.PcbLib` and `.IntLib` files (several go into one
+library) and writes the library (a `.snxlib`, its symbol and footprint files)
+plus `import-report.json` and `import-report.md` into `--output`. It exits 0
+(ok), 2 (partial: something was dropped or not written) or 1 (failed).
+
+| Option | Meaning |
+|---|---|
+| `--dry-run` | write only the report |
+| `--update` | refresh a library this tool wrote; deletes only what it wrote, keeps what you added |
+| `--name`, `--library-id` | library name; override the derived id |
+| `--models include\|skip` | embed STEP models (default) or leave them out |
+| `--db PATH` | database library: the database to read (CSV folder, Access file) instead of the stored one |
+| `--search-path DIR` | database library: extra folders to find the libraries rows name (repeatable) |
+| `--map FILE` | database library: column mapping overrides |
+| `--models-dir DIR` | where to find 3D models a body names but the file does not hold |
+| `--json` | a machine-readable summary on stdout ([contract](docs/APP_INTEGRATION.md)) |
+| `--progress` | NDJSON progress events on stdout (implies `--json`) |
+
+A `.DbLib` (database library) is converted on its own: its rows become parts
+and the libraries they name supply the symbols and footprints. Reading the
+Access database needs **mdbtools** on Linux (`mdb-tables` and `mdb-export` are
+run as separate programs; install the `mdbtools` package), or a folder of
+per-table `.csv` files given with `--db`. Direct connections through the
+Access driver on Windows are not implemented yet; use `--db <folder>` there.
+
+A repeated part number gets `~2`, `~3` in an order independent of the
+database's physical row order, so re-imports keep their identities.
+
+`docs/CONVERSION.md` lists what each Altium object becomes and every report
+code.
+
 ## Install
 
 Download the archive for your platform from
@@ -56,8 +98,9 @@ crates/
   signex-altium-convert/  mapping onto signex-types, with a loss report
   cli/                    the signex-altium-import binary
   signex-types/           vendored from alplabai/signex
-  signex-sketch/          (scripts/sync-signex-crates.sh; the last two
-  signex-library/          trimmed to their file formats)
+  signex-expr/            (scripts/sync-signex-crates.sh; the last three
+  signex-sketch/           trimmed to their file formats)
+  signex-library/
 tests/samples/            Altium sample files (see tests/samples/NOTICE.md)
 docs/                     format notes, conversion rules, app contract
 ```
@@ -75,8 +118,8 @@ for c in &doc.components {
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --exclude signex-library --exclude signex-sketch --all-targets -- -D warnings
-cargo test --workspace --exclude signex-library --exclude signex-sketch
+cargo clippy --workspace --exclude signex-library --exclude signex-sketch --exclude signex-expr --all-targets -- -D warnings
+cargo test --workspace --exclude signex-library --exclude signex-sketch --exclude signex-expr
 cargo run -p altium-format --example dump -- file.SchDoc [stream] [sch|pcbbin|pcbtext|hex]
 ```
 

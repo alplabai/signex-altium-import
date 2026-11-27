@@ -57,6 +57,7 @@ fn every_field_is_accounted_for() {
         generator: _,
         generator_version: _,
         paper_size: _,
+        font_family: _,
         root_sheet_page: _,
         symbols: _,
         wires: _,
@@ -69,14 +70,24 @@ fn every_field_is_accounted_for() {
         bus_entries: _,
         drawings: _,
         no_erc_directives: _,
+        directives: _,
+        harness: _,
+        unions: _,
         title_block: _,
+        variables: _,
         lib_symbols: _,
+        text_widths: _,
+        text_extents: _,
         net_colors: _,
+        drawing_placements: _,
+        frame: _,
+        page: _,
         unknown: _,
     } = SchematicSheet::default();
     let Symbol {
         uuid: _,
         lib_id: _,
+        body_ref: _,
         reference: _,
         value: _,
         footprint: _,
@@ -86,6 +97,7 @@ fn every_field_is_accounted_for() {
         mirror_x: _,
         mirror_y: _,
         unit: _,
+        body_style: _,
         is_power: _,
         ref_text: _,
         val_text: _,
@@ -96,6 +108,7 @@ fn every_field_is_accounted_for() {
         on_board: _,
         exclude_from_sim: _,
         locked: _,
+        net_tie: _,
         fields: _,
         custom_properties: _,
         pin_uuids: _,
@@ -103,6 +116,7 @@ fn every_field_is_accounted_for() {
         library_id: _,
         row_id: _,
         library_version: _,
+        library_stamp: _,
         unknown: _,
         unknown_columns: _,
     } = Symbol::default();
@@ -111,13 +125,44 @@ fn every_field_is_accounted_for() {
         start: _,
         end: _,
         stroke_width: _,
+        locked: _,
         unknown_columns: _,
+        color: _,
     } = Wire::default();
     let Junction {
         uuid: _,
         position: _,
         diameter: _,
         minted: _,
+        unknown: _,
         unknown_columns: _,
     } = Junction::default();
+}
+
+#[test]
+fn a_copied_lib_symbol_table_is_shared_until_one_side_is_edited() {
+    let lib: LibSymbol = serde_json::from_value(json!({ "id": "L:A" })).expect("lib symbol");
+    let mut original = SchematicSheet::default();
+    original.lib_symbols.insert("L:A".into(), lib);
+
+    let mut copy = original.clone();
+    assert!(copy.lib_symbols.shares_storage_with(&original.lib_symbols));
+
+    copy.lib_symbols.remove("L:A");
+    assert!(!copy.lib_symbols.shares_storage_with(&original.lib_symbols));
+    assert!(copy.lib_symbols.is_empty());
+    assert!(
+        original.lib_symbols.contains_key("L:A"),
+        "the original keeps its entry"
+    );
+}
+
+#[test]
+fn the_lib_symbol_table_serialises_as_a_plain_map() {
+    let lib: LibSymbol = serde_json::from_value(json!({ "id": "L:A" })).expect("lib symbol");
+    let table: LibSymbolTable = [("L:A".to_string(), lib)].into_iter().collect();
+    let value = serde_json::to_value(&table).expect("serialise");
+    assert!(value.get("L:A").is_some(), "{value}");
+    let back: LibSymbolTable = serde_json::from_value(value).expect("deserialise");
+    assert_eq!(back.len(), 1);
 }

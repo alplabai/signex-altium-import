@@ -43,13 +43,53 @@ fn snxpcb_older_minor_saves_as_current_newer_minor_is_read_only() {
         "{out}"
     );
 
-    let newer = SnxPcb::parse(&format!("format = \"snxpcb/1.9\"\n{PCB_ID}")).unwrap();
+    let newer = SnxPcb::parse(&format!("format = \"snxpcb/1.13\"\n{PCB_ID}")).unwrap();
     assert!(newer.is_from_newer_minor());
     let err = newer.write_string().unwrap_err();
-    assert!(err.to_string().contains("snxpcb/1.9"), "{err}");
+    assert!(err.to_string().contains("snxpcb/1.13"), "{err}");
     assert!(SnxPcb::new(newer.board.clone()).write_string().is_err());
 
     assert!(SnxPcb::parse(&format!("format = \"snxpcb/2.0\"\n{PCB_ID}")).is_err());
+}
+
+/// Mockup rows 176 and 177: `snxpcb/1.10` (stack materials) is one of this
+/// build's own tokens: it opens for editing, and it ranks above 1.9.
+#[test]
+fn snxpcb_1_10_is_readable_and_opens_for_editing() {
+    assert!(SNXPCB_VERSION.readable.contains(&SNXPCB_FORMAT_V1_10));
+    assert!(SNXPCB_VERSION.readable.contains(&SNXPCB_FORMAT_V1_9));
+    let file = SnxPcb::parse(&format!("format = \"{SNXPCB_FORMAT_V1_10}\"\n{PCB_ID}")).unwrap();
+    assert!(!file.is_from_newer_minor());
+    assert!(snxpcb_opens_read_only("snxpcb/1.13"));
+    assert!(!snxpcb_opens_read_only(SNXPCB_FORMAT_V1_9));
+}
+
+/// #2871 / #2868 (DECISIONS 2026-11-24): `snxpcb/1.11` (pour cutouts, a
+/// dimension look) is one of this build's own tokens: it opens for editing,
+/// and it ranks above 1.10.
+#[test]
+fn snxpcb_1_11_is_readable_and_opens_for_editing() {
+    assert!(SNXPCB_VERSION.readable.contains(&SNXPCB_FORMAT_V1_11));
+    let file = SnxPcb::parse(&format!("format = \"{SNXPCB_FORMAT_V1_11}\"\n{PCB_ID}")).unwrap();
+    assert!(!file.is_from_newer_minor());
+    assert!(file.write_string().is_ok(), "this build saves 1.11");
+    assert!(!snxpcb_opens_read_only(SNXPCB_FORMAT_V1_11));
+    assert!(!snxpcb_opens_read_only(SNXPCB_FORMAT_V1_10));
+    assert!(snxpcb_opens_read_only("snxpcb/1.13"));
+}
+
+/// #2942: `snxpcb/1.12` (a layout plan) is this build's current token: it
+/// opens for editing, and it ranks above 1.11.
+#[test]
+fn snxpcb_1_12_is_current_and_opens_for_editing() {
+    assert_eq!(SNXPCB_VERSION.current, SNXPCB_FORMAT_V1_12);
+    assert!(SNXPCB_VERSION.readable.contains(&SNXPCB_FORMAT_V1_12));
+    let file = SnxPcb::parse(&format!("format = \"{SNXPCB_FORMAT_V1_12}\"\n{PCB_ID}")).unwrap();
+    assert!(!file.is_from_newer_minor());
+    assert!(file.write_string().is_ok(), "this build saves 1.12");
+    assert!(!snxpcb_opens_read_only(SNXPCB_FORMAT_V1_12));
+    assert!(!snxpcb_opens_read_only(SNXPCB_FORMAT_V1_11));
+    assert!(snxpcb_opens_read_only("snxpcb/1.13"));
 }
 
 fn pad(uuid: &str, number: &str) -> Pad {
@@ -66,11 +106,19 @@ fn pad(uuid: &str, number: &str) -> Pad {
         layers: vec!["TopCopper".into()],
         net: None,
         roundrect_ratio: 0.0,
+        trapezoid_delta: Default::default(),
+        custom_outline: Vec::new(),
+        rotation: 0.0,
+        layer_sizes: None,
+        net_locked: false,
     }
 }
 
 fn footprint(uuid: &str, reference: &str, pad: Pad) -> Footprint {
     Footprint {
+        schematic_link: None,
+        library_ref: None,
+        component: Default::default(),
         unknown_columns: Default::default(),
         unknown: Default::default(),
         uuid: Uuid::parse_str(uuid).unwrap(),
@@ -105,11 +153,13 @@ fn snxpcb_shared_designator_keeps_pads_apart_and_layer_types_round_trip() {
             id: 0,
             name: "Top".into(),
             layer_type: "signal".into(),
+            display_name: String::new(),
         },
         LayerDef {
             id: 1,
             name: "Core".into(),
             layer_type: "dielectric".into(),
+            display_name: String::new(),
         },
     ];
     let text = SnxPcb::new(board).write_string().unwrap();
@@ -137,4 +187,164 @@ uuid footprint_ref pin pos_x pos_y size_x size_y pad_type shape layers drill net
     let back = SnxPcb::parse(&text).unwrap().board;
     assert_eq!(back.footprints.len(), 1, "no synthetic orphan footprint");
     assert_eq!(back.footprints[0].pads.len(), 1);
+}
+
+#[test]
+fn snxpcb_non_contiguous_layer_ids_round_trip() {
+    let mut board = empty_board();
+    board.layers = vec![
+        LayerDef {
+            id: 0,
+            name: "Top".into(),
+            layer_type: String::new(),
+            display_name: String::new(),
+        },
+        LayerDef {
+            id: 31,
+            name: "Bottom".into(),
+            layer_type: "signal".into(),
+            display_name: String::new(),
+        },
+    ];
+    let text = SnxPcb::new(board).write_string().unwrap();
+    let back = SnxPcb::parse(&text).unwrap().board;
+    assert_eq!(back.layers[0].id, 0);
+    assert_eq!(back.layers[1].id, 31);
+    assert_eq!(back.layers[1].layer_type, "signal");
+}
+
+#[test]
+fn newer_minor_sheet_is_read_only() {
+    let cur = SnxSchematic::parse(&format!("format = \"snxsch/1\"\n{SCH_ID}")).unwrap();
+    assert!(!cur.sheet.is_read_only());
+    let newer = SnxSchematic::parse(&format!("format = \"snxsch/1.7\"\n{SCH_ID}")).unwrap();
+    assert!(newer.sheet.is_read_only());
+    // Re-wrapped (as the engine does), the sheet still says read-only.
+    assert!(SnxSchematic::new(newer.sheet).is_from_newer_minor());
+}
+
+/// #2209: the re-keyed `lib_symbols` table is `snxsch/1.1`. A file at the old
+/// `snxsch/1` loads and saves as 1.1; a 1.1 file loads; a build that only
+/// knows `snxsch/1` sees 1.1 as a newer minor, so it opens it read-only
+/// instead of finding no bodies.
+#[test]
+fn snxsch_1_1_loads_and_the_old_token_upgrades_on_save() {
+    assert_eq!(SNXSCH_FORMAT_V1, "snxsch/1.1");
+    let new = SnxSchematic::parse(&format!("format = \"snxsch/1.1\"\n{SCH_ID}")).unwrap();
+    assert!(!new.is_from_newer_minor());
+    let old = SnxSchematic::parse(&format!("format = \"snxsch/1\"\n{SCH_ID}")).unwrap();
+    assert!(!old.is_from_newer_minor());
+    let out = old.write_string().unwrap();
+    assert!(out.starts_with("format = \"snxsch/1.1\""), "{out}");
+    let one_zero = FormatVersion {
+        current: "snxsch/1",
+        readable: &["snxsch/1"],
+        ..SNXSCH_VERSION
+    };
+    assert!(one_zero.is_newer_minor("snxsch/1.1"));
+    assert!(one_zero.refuse_save("snxsch/1.1").is_err());
+}
+
+/// #2207: every `.snxsch` / `.snxpcb` token this build reads loads, a save
+/// writes the current one (`snxsch/1.1` for a sheet without No-ERC rule
+/// lists, `snxsch/1.2` and `1.3` included), a newer major is refused naming it, and a
+/// file with no token is refused.
+#[test]
+fn every_readable_token_loads_and_saves_as_current() {
+    for token in SNXSCH_VERSION.readable {
+        let file = SnxSchematic::parse(&format!("format = \"{token}\"\n{SCH_ID}")).unwrap();
+        assert!(!file.is_from_newer_minor(), "{token}");
+        let out = file.write_string().unwrap();
+        assert!(
+            out.starts_with(&format!("format = \"{SNXSCH_FORMAT_V1}\"")),
+            "{out}"
+        );
+    }
+    for token in SNXPCB_VERSION.readable {
+        let file = SnxPcb::parse(&format!("format = \"{token}\"\n{PCB_ID}")).unwrap();
+        assert!(!file.is_from_newer_minor(), "{token}");
+        let out = file.write_string().unwrap();
+        assert!(
+            out.starts_with(&format!("format = \"{SNXPCB_FORMAT_V1}\"")),
+            "{out}"
+        );
+    }
+    let err = SnxPcb::parse(&format!("format = \"snxpcb/2\"\n{PCB_ID}")).unwrap_err();
+    assert!(err.to_string().contains("snxpcb/2"), "{err}");
+    assert!(err.to_string().contains("newer Signex"), "{err}");
+    let err = SnxSchematic::parse(SCH_ID).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            FormatError::Version(FormatVersionError::Missing { .. })
+        ),
+        "{err:?}"
+    );
+    let err = SnxPcb::parse(PCB_ID).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            FormatError::Version(FormatVersionError::Missing { .. })
+        ),
+        "{err:?}"
+    );
+}
+
+/// #2172 guard: the sheet's and the board's own uuid is the first stored key
+/// after the token and comes back unchanged, so it can serve as the
+/// document's id.
+#[test]
+fn a_sheet_and_a_board_keep_their_uuid_across_write_and_parse() {
+    let sheet_id = uuid::Uuid::parse_str("0193a2f0-7b1c-7cde-8123-456789abcdef").unwrap();
+    let mut sheet = super::tests::empty_sheet();
+    sheet.uuid = sheet_id;
+    let text = SnxSchematic::new(sheet).write_string().unwrap();
+    assert!(text.contains(&format!("schematic_id = \"{sheet_id}\"")));
+    assert_eq!(SnxSchematic::parse(&text).unwrap().sheet.uuid, sheet_id);
+
+    let board_id = uuid::Uuid::parse_str("0193a2f0-7b1c-7cde-8123-456789abcd00").unwrap();
+    let mut board = super::tests::empty_board();
+    board.uuid = board_id;
+    let text = SnxPcb::new(board).write_string().unwrap();
+    assert!(text.contains(&format!("pcb_id = \"{board_id}\"")));
+    assert_eq!(SnxPcb::parse(&text).unwrap().board.uuid, board_id);
+}
+
+/// Schematic Refinement content writes `snxsch/1.3`: this build reads and
+/// edits a 1.3 file, a 1.5 file opens read-only and every save of it is
+/// refused, and a build that knew only 1.2 sees 1.3 as a newer minor.
+#[test]
+fn snxsch_1_3_is_read_and_1_5_opens_read_only() {
+    assert_eq!(SNXSCH_VERSION.current, SNXSCH_FORMAT_BUS_STYLE);
+    assert!(SNXSCH_VERSION.readable.contains(&"snxsch/1.3"));
+    let file = SnxSchematic::parse(&format!("format = \"snxsch/1.3\"\n{SCH_ID}")).unwrap();
+    assert!(!file.is_from_newer_minor());
+    assert!(!file.sheet.is_read_only());
+    // Nothing of 1.3 in it, so a save writes the lowest token again.
+    let out = file.write_string().unwrap();
+    assert!(out.starts_with("format = \"snxsch/1.1\""), "{out}");
+
+    let newer = SnxSchematic::parse(&format!("format = \"snxsch/1.5\"\n{SCH_ID}")).unwrap();
+    assert!(newer.is_from_newer_minor());
+    assert!(newer.sheet.is_read_only());
+    let err = newer.write_string().unwrap_err();
+    assert!(err.to_string().contains("snxsch/1.5"), "{err}");
+    assert!(
+        SnxSchematic::new(newer.sheet.clone())
+            .write_string()
+            .is_err(),
+        "re-wrapped, the source is remembered"
+    );
+
+    let one_two = FormatVersion {
+        current: SNXSCH_FORMAT_NO_ERC_RULES,
+        readable: &["snxsch/1", SNXSCH_FORMAT_V1, SNXSCH_FORMAT_NO_ERC_RULES],
+        ..SNXSCH_VERSION
+    };
+    assert_eq!(
+        one_two.read(Some(SNXSCH_FORMAT_REFINEMENT)).as_deref(),
+        Ok(SNXSCH_FORMAT_REFINEMENT)
+    );
+    assert!(one_two.is_newer_minor(SNXSCH_FORMAT_REFINEMENT));
+    assert!(one_two.refuse_save(SNXSCH_FORMAT_REFINEMENT).is_err());
 }

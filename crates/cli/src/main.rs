@@ -10,6 +10,16 @@
 //! Signex's File > Import > Altium Project runs this binary and reads the
 //! `--json` summary; `docs/APP_INTEGRATION.md` is that contract.
 
+mod contract;
+mod ledger;
+mod library_cmd;
+mod library_db;
+mod library_run;
+mod output_guard;
+mod progress;
+mod report_doc;
+mod update_merge;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -28,7 +38,8 @@ use signex_types::project::{ProjectData, SheetEntry};
 #[command(
     name = "signex-altium-import",
     version,
-    about = "Convert Altium Designer files (.PrjPcb / .SchDoc / .PcbDoc / .SchLib / .PcbLib) to Signex native files"
+    about = "Convert Altium Designer files (.PrjPcb / .SchDoc / .PcbDoc / .SchLib / .PcbLib) to Signex native files",
+    after_help = "Library converter commands (see docs/APP_INTEGRATION.md):\n  describe --json                         describe this converter\n  library <input>... --output <dir> ...   convert libraries into one Signex library"
 )]
 struct Cli {
     /// A .PrjPcb, .SchDoc, .PcbDoc, .SchLib or .PcbLib file.
@@ -70,6 +81,16 @@ struct Summary {
 }
 
 fn main() {
+    // `describe` and `library` are the library converter contract
+    // (docs/APP_INTEGRATION.md); anything else is the single-file importer.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // An existing file or folder of that name is an input, not a command.
+    let is_path = args.get(1).is_some_and(|a| Path::new(a).exists());
+    match args.get(1).and_then(|a| a.to_str()).filter(|_| !is_path) {
+        Some("describe") => std::process::exit(contract::describe_main(&args[2..])),
+        Some("library") => std::process::exit(library_cmd::main(&args[2..])),
+        _ => {}
+    }
     let cli = Cli::parse();
     match run(&cli) {
         Ok(summary) if cli.json => println!("{}", summary_json(&summary, None)),
@@ -89,15 +110,13 @@ fn main() {
 }
 
 fn run(cli: &Cli) -> Result<Summary> {
-    let input = cli
-        .input
-        .canonicalize()
+    let input = signex_altium_convert::paths::canonical(&cli.input)
         .with_context(|| format!("input not found: {}", cli.input.display()))?;
     let dir = match &cli.output {
         Some(o) => {
             std::fs::create_dir_all(o)
                 .with_context(|| format!("creating output directory {}", o.display()))?;
-            o.canonicalize()?
+            signex_altium_convert::paths::canonical(o)?
         }
         None => input.parent().map(Path::to_path_buf).unwrap_or_default(),
     };
@@ -334,7 +353,10 @@ fn convert_project(
         texts.push((name, SnxSchematic::new(sheet).write_string()?));
     }
     if boards.len() > 1 {
-        report.warn("project has several PCB documents; the first is the project's board");
+        report.warn(
+            "project.several_boards",
+            "project has several PCB documents; the first is the project's board",
+        );
     }
     for ((path, doc), name) in boards.iter().zip(&board_names) {
         let board = signex_altium_convert::pcb::convert(doc, report)
@@ -364,6 +386,21 @@ fn convert_project(
         libraries: Vec::new(),
         enable_git: false,
         unknown: Default::default(),
+        document_id: None,
+        description: None,
+        variant_settings: Default::default(),
+        net_classes: Vec::new(),
+        rules: None,
+        annotation: None,
+        parameters: Default::default(),
+        schematic_defaults: Default::default(),
+        project_defaults: Default::default(),
+        agent_journal: Default::default(),
+        schematic_design: Default::default(),
+        fab_outputs: None,
+        requirements: Vec::new(),
+        bom_alternates: Default::default(),
+        router_tool_diameter: None,
     };
     let path = out.dir.join(&project_name);
     signex_types::project::write_project(&path, &data)

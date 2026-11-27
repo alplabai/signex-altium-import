@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -27,33 +27,8 @@ pub const PIN_LENGTH_MM: f64 = GRID_MM;
 /// Default offset from pin body-end to pin name text anchor.
 pub const PIN_NAME_OFFSET_MM: f64 = 0.508;
 
-/// Default screen-space stroke width for schematic pin lines (px).
-/// Shared across symbol/schematic canvas paths to avoid drift.
-pub const PIN_STROKE_PX: f32 = 3.0;
-
-/// Stroke width for selected schematic pin lines (px).
-pub const PIN_STROKE_SELECTED_PX: f32 = 5.0;
-
 /// Camera scale value that maps to 100% zoom in schematic canvases.
 pub const SCHEMATIC_ZOOM_100_SCALE: f32 = 3.0;
-
-/// Shared minimum stroke width for world-space schematic primitives (mm).
-pub const SCHEMATIC_RENDER_MIN_STROKE_MM: f64 = 0.15;
-
-/// Shared minimum visible stroke width after world->screen scaling (px).
-pub const SCHEMATIC_RENDER_MIN_STROKE_PX: f32 = 0.6;
-
-/// Maximum multiplier applied to 100% stroke widths at high zoom.
-///
-/// This keeps stroke growth monotonic with zoom while avoiding blocky,
-/// over-thick lines at very high zoom levels.
-pub const SCHEMATIC_RENDER_STROKE_MAX_SCALE_MULTIPLIER: f32 = 2.0;
-
-/// Bus stroke width in world-space mm.
-pub const SCHEMATIC_RENDER_BUS_STROKE_MM: f64 = 0.45;
-
-/// Power-port preview body outline stroke at 100% zoom (px).
-pub const SCHEMATIC_RENDER_POWER_PORT_STROKE_PX: f32 = 1.2;
 
 /// Selection overlay threshold under which we render a dot marker (px).
 pub const SCHEMATIC_RENDER_SELECTION_MARKER_THRESHOLD_PX: f32 = 2.0;
@@ -61,11 +36,11 @@ pub const SCHEMATIC_RENDER_SELECTION_MARKER_THRESHOLD_PX: f32 = 2.0;
 /// Selection overlay dot marker radius (px).
 pub const SCHEMATIC_RENDER_SELECTION_MARKER_RADIUS_PX: f32 = 5.5;
 
-/// Selection overlay marker stroke at 100% zoom (px).
-pub const SCHEMATIC_RENDER_SELECTION_MARKER_STROKE_PX: f32 = 1.4;
+/// Selection overlay dot marker outline, screen-constant chrome (px).
+pub const SCHEMATIC_SELECTION_MARKER_OUTLINE_PX: f32 = 1.4;
 
-/// Selection overlay rectangle stroke at 100% zoom (px).
-pub const SCHEMATIC_RENDER_SELECTION_RECT_STROKE_PX: f32 = 1.2;
+/// Selection overlay rectangle outline, screen-constant chrome (px).
+pub const SCHEMATIC_SELECTION_RECT_OUTLINE_PX: f32 = 1.2;
 
 /// Wire hit-test absolute minimum tolerance (mm).
 pub const SCHEMATIC_HIT_WIRE_TOLERANCE_MM: f64 = 0.25;
@@ -82,15 +57,6 @@ pub const SCHEMATIC_RENDER_NO_CONNECT_HALF_LEN_MM: f64 = 0.7;
 /// No-connect marker minimum half arm length after scaling (px).
 pub const SCHEMATIC_RENDER_NO_CONNECT_MIN_HALF_LEN_PX: f32 = 3.0;
 
-/// No-connect marker stroke width at 100% zoom (px).
-pub const SCHEMATIC_RENDER_NO_CONNECT_STROKE_PX: f32 = 1.2;
-
-/// Symbol body rectangle stroke width at 100% zoom (px).
-pub const SCHEMATIC_RENDER_SYMBOL_BODY_STROKE_PX: f32 = 1.1;
-
-/// Child sheet rectangle stroke width at 100% zoom (px).
-pub const SCHEMATIC_RENDER_CHILD_SHEET_STROKE_PX: f32 = 1.0;
-
 /// Child sheet pin marker radius (px).
 pub const SCHEMATIC_RENDER_CHILD_SHEET_PIN_RADIUS_PX: f32 = 3.0;
 
@@ -99,9 +65,6 @@ pub const SCHEMATIC_RENDER_DRAWING_MIN_CIRCLE_RADIUS_PX: f32 = 0.7;
 
 /// Drawing arc primitive minimum visible radius (px).
 pub const SCHEMATIC_RENDER_DRAWING_MIN_ARC_RADIUS_PX: f32 = 0.8;
-
-/// Label glyph (global/hierarchical marker) outline stroke width at 100% zoom (px).
-pub const SCHEMATIC_RENDER_LABEL_GLYPH_STROKE_PX: f32 = 1.0;
 
 // ---------------------------------------------------------------------------
 // Point — schematic mm-space coordinate (f64). Copy-friendly.
@@ -118,6 +81,16 @@ impl Point {
 
     pub const fn new(x: f64, y: f64) -> Self {
         Point { x, y }
+    }
+
+    /// The point in the netlist's 1 µm integer key space: the one definition
+    /// of "the same point" (`signex_net::pt_key` reads it; #388).
+    #[must_use]
+    pub fn um_key(&self) -> (i64, i64) {
+        (
+            (self.x * 1000.0).round() as i64,
+            (self.y * 1000.0).round() as i64,
+        )
     }
 }
 
@@ -343,7 +316,7 @@ pub enum FillType {
 /// open-drain polarity-tagged outputs, plus Signex-original additions
 /// (`GroundReference`, `Differential`, `Clock`) that don't appear in
 /// other EDA tools' enums.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PinDirection {
     /// Drives signal in.
@@ -375,7 +348,31 @@ pub enum PinDirection {
     /// Author has not classified the pin yet (default for new pins);
     /// collapses what other EDA tools sometimes split into "free" vs
     /// "unspecified".
+    #[default]
     Unclassified,
+}
+
+impl PinDirection {
+    /// The electrical type as shown to the user.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Input => "Input",
+            Self::Output => "Output",
+            Self::Bidirectional => "Bidirectional",
+            Self::ThreeStatable => "Tri-state",
+            Self::Passive => "Passive",
+            Self::PowerInput => "Power input",
+            Self::PowerOutput => "Power output",
+            Self::GroundReference => "Ground",
+            Self::OpenDrainLow => "Open drain (low)",
+            Self::OpenDrainHigh => "Open drain (high)",
+            Self::Differential => "Differential",
+            Self::Clock => "Clock",
+            Self::DoNotConnect => "Do not connect",
+            Self::Unclassified => "Unclassified",
+        }
+    }
 }
 
 /// Pin graphic decoration on the symbol pin tip.
@@ -413,11 +410,16 @@ pub enum LabelType {
 // Text property (for reference/value fields)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TextProp {
     pub position: Point,
     pub rotation: f64,
     pub font_size: f64,
+    /// Font family the author chose for this text, `None` to inherit the
+    /// sheet default (see [`crate::font`]). Never rewritten when the family
+    /// is not installed: resolution happens at render time only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_family: Option<String>,
     #[serde(default)]
     pub justify_h: HAlign,
     #[serde(default)]
@@ -426,7 +428,7 @@ pub struct TextProp {
     pub hidden: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct SymbolInstance {
     #[serde(default)]
     pub project: String,
@@ -438,7 +440,7 @@ pub struct SymbolInstance {
     pub unit: u32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct SheetInstance {
     #[serde(default)]
     pub project: String,
@@ -460,7 +462,7 @@ pub struct SheetInstance {
 /// - `body_style == 0` → common to all body styles (normal + De Morgan)
 /// - `body_style == 1` → normal body style (default)
 /// - `body_style == 2` → De Morgan body style
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LibGraphic {
     #[serde(default)]
     pub unit: u32,
@@ -470,7 +472,7 @@ pub struct LibGraphic {
 }
 
 /// A pin inside a library symbol, tagged with unit and body-style.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LibPin {
     #[serde(default)]
     pub unit: u32,
@@ -483,7 +485,7 @@ fn default_body_style() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LibSymbol {
     pub id: String,
     #[serde(default)]
@@ -520,11 +522,24 @@ pub struct LibSymbol {
     pub pin_name_offset: f64,
 }
 
+impl LibSymbol {
+    /// Distance from a pin's body end to its name text, mm. A library that
+    /// stores none (`pin_name_offset` of 0) gets [`PIN_NAME_OFFSET_MM`], so
+    /// the name never lands on the pin's own wire.
+    pub fn name_offset_mm(&self) -> f64 {
+        if self.pin_name_offset > 0.01 {
+            self.pin_name_offset
+        } else {
+            PIN_NAME_OFFSET_MM
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Graphic {
     Polyline {
@@ -607,7 +622,7 @@ pub enum Graphic {
 // Pin
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pin {
     pub direction: PinDirection,
     pub shape_style: PinShapeStyle,
@@ -632,10 +647,15 @@ pub struct Pin {
 // Symbol instance
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Symbol {
     pub uuid: Uuid,
     pub lib_id: String,
+    /// Key of the embedded body this symbol draws with (`lib_symbols`), a
+    /// version of the library symbol `lib_id` names. Empty: drawn by
+    /// `lib_id`. See `lib_symbol_version`.
+    #[serde(default)]
+    pub body_ref: String,
     #[serde(default)]
     pub reference: String,
     #[serde(default)]
@@ -653,6 +673,11 @@ pub struct Symbol {
     pub mirror_y: bool,
     #[serde(default = "default_unit")]
     pub unit: u32,
+    /// Which body of the library symbol this instance shows. `Alternate`
+    /// (De Morgan) only takes effect when the library symbol has one for
+    /// `unit`; otherwise the normal body is drawn and wired.
+    #[serde(default)]
+    pub body_style: BodyStyle,
     #[serde(default)]
     pub is_power: bool,
     pub ref_text: Option<TextProp>,
@@ -676,6 +701,11 @@ pub struct Symbol {
     pub exclude_from_sim: bool,
     #[serde(default)]
     pub locked: bool,
+    /// A net tie (#1277): the part joins two named nets on purpose, which
+    /// stay two nets, and its board footprint is a copper bridge that DRC
+    /// allows. See `docs/NET_TIES.md`.
+    #[serde(default)]
+    pub net_tie: bool,
     #[serde(default)]
     pub fields: HashMap<String, String>,
     #[serde(default)]
@@ -712,6 +742,10 @@ pub struct Symbol {
     /// current `ComponentRow.version` on schematic open.
     #[serde(default)]
     pub library_version: String,
+    /// The row values this part last agreed with (see [`RowStamp`]); `None`
+    /// for a part that predates the stamp or has no row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_stamp: Option<RowStamp>,
     /// Keys in this symbol's `[extras.symbols.<uuid>]` table that this
     /// build does not recognise, kept so a save re-emits them. Empty for
     /// every file written by this build.
@@ -735,6 +769,7 @@ impl Default for Symbol {
         Self {
             uuid: Uuid::nil(),
             lib_id: String::new(),
+            body_ref: String::new(),
             reference: String::new(),
             value: String::new(),
             footprint: String::new(),
@@ -744,6 +779,7 @@ impl Default for Symbol {
             mirror_x: false,
             mirror_y: false,
             unit: default_unit(),
+            body_style: BodyStyle::Normal,
             is_power: false,
             ref_text: None,
             val_text: None,
@@ -754,6 +790,7 @@ impl Default for Symbol {
             on_board: true,
             exclude_from_sim: false,
             locked: false,
+            net_tie: false,
             fields: HashMap::new(),
             custom_properties: Vec::new(),
             pin_uuids: HashMap::new(),
@@ -761,6 +798,7 @@ impl Default for Symbol {
             library_id: None,
             row_id: None,
             library_version: String::new(),
+            library_stamp: None,
             unknown: UnknownFields::default(),
             unknown_columns: UnknownColumns::default(),
         }
@@ -769,12 +807,147 @@ impl Default for Symbol {
 
 // ---------------------------------------------------------------------------
 // Wiring primitives
+mod body_fill;
+pub use body_fill::{BodyFillShape, default_body_fill_shapes};
+mod body_style;
+pub use body_style::{BODY_ALTERNATE, BODY_COMMON, BODY_NORMAL, BodyStyle, item_shown, shown_on};
+mod bus_entry;
+pub use bus_entry::*;
+mod bus_name;
+pub use bus_name::*;
+mod bus_style;
 mod field_style;
-pub use field_style::field_effective_style;
+mod instance_path;
+pub use field_style::{field_effective_style, readable_text_style};
+pub use instance_path::InstancePath;
+
+mod lib_symbol_version;
+pub use lib_symbol_version::{BodyRefCollision, lib_id_of_body_ref};
 mod parts;
 pub use parts::*;
+#[cfg(test)]
+mod item_anchor_tests;
+#[cfg(test)]
+mod lib_symbol_version_tests;
+mod row_stamp;
+#[cfg(test)]
+mod row_stamp_tests;
+pub use row_stamp::{
+    LinkStamp, RowStamp, StampField, StampValues, Theirs, Verdict, base_of, resolve,
+};
+mod pin_map;
+mod pin_token;
+pub use pin_map::{PinMapping, PinMatchedBy, PinPair, map_pins, pin_key};
+mod directive;
+#[cfg(test)]
+mod directive_tests;
+pub use directive::{
+    ALL_ERC_RULES, DIFF_PAIR_SUFFIXES, DirectiveKind, SchDirective, diff_pair_base,
+    parse_erc_exclusions,
+};
+pub use directive::{
+    BlanketPour, DIFF_PAIR_SUFFIX_PAIRS, DiffPairHalves, NetRules, diff_pair_halves,
+};
+mod directive_flag;
+pub use directive_flag::{
+    DIRECTIVE_FLAG_LINE_MM, DIRECTIVE_FLAG_PAD_MM, DIRECTIVE_FLAG_TEXT_MM, DirectiveFlag,
+    directive_flag, directive_flag_line_origin, directive_flag_lines,
+};
+mod no_erc;
+pub use no_erc::{NoErcDirective, canonical_no_erc_rules, no_erc_rules_suppress};
+mod not_fitted;
+pub use not_fitted::{
+    NOT_FITTED_CROSS_WIDTH_SCALE, NOT_FITTED_PAPER_SHARE, greyed_ink, not_fitted_cross,
+};
 mod sheet;
 pub use sheet::*;
+mod sheet_frame;
+pub use sheet_frame::{MAX_ZONES, SheetFrameSettings};
+mod sheet_page;
+pub use sheet_page::{PageOrigin, SheetPageSettings, paper_height_mm};
+mod defaults;
+mod sheet_size;
+mod stroke;
+mod wire_width;
+pub use defaults::{
+    SCHEMATIC_DEFAULT_FONT, SCHEMATIC_DEFAULT_TEXT_SIZE_PT, SchematicDefaults, is_set_width,
+};
+pub use sheet_size::{MAX_PAGE_EDGE_MM, MIN_CUSTOM_EDGE_MM, SheetOrientation, SheetSize};
+pub use stroke::*;
+pub use wire_width::WireWidthPreset;
+mod hotspot;
+pub use hotspot::{
+    MoveHotspots, SCHEMATIC_HOTSPOT_RADIUS_MM, hotspot_capture_radius, snap_move_to_hotspot,
+    snap_to_hotspot,
+};
+mod junction_color;
+pub use junction_color::junction_wire_colors;
+mod power_port_symbol;
+pub use power_port_symbol::{
+    PowerPortStyle, power_port_graphics, power_port_lib_symbol, power_port_value_field,
+    power_port_value_field_for,
+};
+mod power_port_text;
+pub use power_port_text::power_port_value_text;
+mod pin_pick;
+pub use pin_pick::{
+    PickedPin, PinLine, SCHEMATIC_PIN_PICK_TOLERANCE_MM, SCHEMATIC_PIN_PICK_TOLERANCE_PX,
+    pin_pick_tolerance_mm, symbol_pin_at, symbol_pin_line,
+};
+mod pin_labels;
+pub use pin_labels::{
+    PIN_NUMBER_ALONG_RATIO, PIN_NUMBER_OFFSET_MM, PinLabel, PinLabelKind, PinTextLayout,
+    lower_pin_labels, pin_text_layout,
+};
+mod symbol_geometry;
+mod text_extents;
+mod text_widths;
+pub use symbol_geometry::{
+    SymbolPrimitive, arc_polyline, body_bounds, instance_pins, lower_placed_symbol, lower_symbol,
+    pin_direction, pin_tips, primitives_bounds, primitives_bounds_in, segment_crosses_interior,
+    symbol_crossed_by, text_aabb, text_aabb_lines, text_aabb_with_width, text_height_mm,
+};
+pub use text_extents::{
+    StoredTextExtent, TextExtents, TextProbe, decide_width_mm, face_is_available, probes, text_hash,
+};
+pub use text_widths::{MeasuredText, TextField, TextWidths};
+mod harness;
+#[cfg(test)]
+mod harness_tests;
+pub use harness::{
+    DEFAULT_HARNESS_ENTRY_PITCH_MM, HARNESS_TIP_MM, HarnessConnector, HarnessDefinition,
+    HarnessDefinitionEntry, HarnessEntry, HarnessWire, SheetHarness,
+};
+mod union;
+pub use union::{SchUnion, union_member_kinds};
+mod drawing_bezier;
+mod drawing_dimension;
+mod sch_table;
+pub use drawing_bezier::{
+    BEZIER_FLATTEN_SEGMENTS, LINE_END_ARROW_HALF_WIDTH_MM, LINE_END_ARROW_LENGTH_MM, LineEnds,
+    SchBezier,
+};
+pub use drawing_dimension::{
+    DIMENSION_MAX_PRECISION, DIMENSION_TEXT_MM, DimensionArrows, DimensionDirection,
+    DimensionGeometry, DimensionUnits, SchDimension,
+};
+pub use sch_table::{
+    PinSort, SchTable, TABLE_ADVANCE_EM, TABLE_HEADER_TINT_SHARE, TABLE_TITLE_GAP_EM, TableBorders,
+    TableCell, TableColumn, TableLayout, TableRefresh, TableSource, TableStyle, pin_columns,
+    power_net_names, sheet_columns, table_header_fill,
+};
+#[cfg(test)]
+mod drawing_kinds_tests;
+mod repeat;
+#[cfg(test)]
+mod repeat_tests;
+pub use repeat::{
+    ChannelFormatError, ChannelOccurrence, ChannelRepeat, MAX_CHANNELS, RepeatStack, StackLayer,
+    channel_alpha, check_format, entry_port_name, renamed_entry, repeated_entry_name,
+    sheet_entry_port, sheet_entry_renamed,
+};
+mod harness_ops;
+pub use harness_ops::*;
 
 #[cfg(test)]
 mod default_tests;

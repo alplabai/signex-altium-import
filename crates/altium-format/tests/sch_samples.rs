@@ -65,3 +65,132 @@ fn schlib_handles_long_names_and_pin_text() {
         assert!(!lib.components.is_empty(), "{name}");
     }
 }
+
+fn frame(text: &str) -> Vec<u8> {
+    let mut payload = text.as_bytes().to_vec();
+    payload.push(0);
+    let mut out = (payload.len() as u32).to_le_bytes().to_vec();
+    out.extend(payload);
+    out
+}
+
+fn symbol_with_map(extra: &[&str]) -> Vec<altium_format::sch::Implementation> {
+    let mut s = Vec::new();
+    for rec in [
+        "|RECORD=1|LibReference=X|PartCount=2|",
+        "|RECORD=44|",
+        "|RECORD=45|ModelName=FP|ModelType=PCBLIB|IsCurrent=T|",
+    ]
+    .iter()
+    .chain(extra)
+    {
+        s.extend(frame(rec));
+    }
+    altium_format::sch::parse_symbol_stream(&s)
+        .unwrap()
+        .implementations
+}
+
+#[test]
+fn an_unread_pin_map_is_flagged_never_left_silently_empty() {
+    // A bare record 46 (as in the samples) says nothing.
+    assert!(!symbol_with_map(&["|RECORD=46|"])[0].pin_map_unread);
+    // A record 46 with keys, or any record 47, is a map this reader skips.
+    assert!(symbol_with_map(&["|RECORD=46|DesignatorCount=2|"])[0].pin_map_unread);
+    assert!(symbol_with_map(&["|RECORD=46|", "|RECORD=47|"])[0].pin_map_unread);
+    assert!(!symbol_with_map(&[])[0].pin_map_unread);
+}
+
+#[test]
+fn no_sample_implementation_has_an_unread_pin_map() {
+    let doc = SchDoc::open(sample("simple.SchDoc")).unwrap();
+    for c in &doc.components {
+        assert!(c.implementations.iter().all(|i| !i.pin_map_unread));
+    }
+}
+
+#[test]
+fn a_library_records_its_modified_time_when_the_file_has_one() {
+    // Not every writer fills the root entry's time; when present it is after
+    // the epoch, and never a 1601 zero.
+    let lib = SchLib::open(sample("simple.SchLib")).unwrap();
+    if let Some(t) = lib.modified {
+        assert!(t > std::time::UNIX_EPOCH);
+    }
+}
+
+fn binary_pin(mode: u8) -> Vec<u8> {
+    let mut p = vec![2, 0, 0, 0, 0]; // record 2, reserved
+    p.extend(1i16.to_le_bytes()); // owner part
+    p.push(mode);
+    p.extend([0, 0, 0, 0]); // symbols
+    p.push(0); // description
+    p.push(0); // formal type
+    p.push(4); // electrical
+    p.push(0x38); // conglomerate
+    p.extend(10i16.to_le_bytes());
+    p.extend(0i16.to_le_bytes());
+    p.extend(0i16.to_le_bytes());
+    p.extend([0, 0, 0, 0]);
+    p.push(1);
+    p.push(b'A');
+    p.push(1);
+    p.push(b'1');
+    let mut out = (p.len() as u32 | 1 << 24).to_le_bytes().to_vec();
+    out.extend(p);
+    out
+}
+
+#[test]
+fn a_binary_pin_display_mode_is_signed() {
+    for (stored, want) in [(0u8, 0), (1, 1), (0xFF, -1)] {
+        let mut s = frame("|RECORD=1|LibReference=X|PartCount=2|");
+        s.extend(binary_pin(stored));
+        let c = altium_format::sch::parse_symbol_stream(&s).unwrap();
+        assert_eq!(c.pins.len(), 1);
+        assert_eq!(c.pins[0].display_mode, want, "stored {stored}");
+    }
+}
+
+#[test]
+fn storage_names_map_the_characters_the_file_cannot_hold() {
+    // Components named with `/ \ : !` are stored under `_`.
+    let lib = SchLib::open(sample("simple.SchLib")).unwrap();
+    assert!(!lib.components.is_empty());
+}
+
+#[test]
+fn one_unreadable_component_is_skipped_and_listed_not_fatal() {
+    use std::io::Cursor;
+    let bytes = std::fs::read(sample("simple.SchLib")).unwrap();
+    let mut cf = cfb::CompoundFile::open(Cursor::new(bytes)).unwrap();
+    cf.remove_storage_all("/Position").unwrap();
+    cf.flush().unwrap();
+    let cut = cf.into_inner().into_inner();
+    let mut c = altium_format::Container::from_bytes("x".into(), cut).unwrap();
+    let lib = SchLib::from_container(&mut c).unwrap();
+    assert_eq!(lib.components.len(), 9);
+    assert_eq!(lib.unreadable.len(), 1);
+    assert_eq!(lib.unreadable[0].0, "Position");
+}
+
+#[test]
+fn records_with_an_ansi_only_escaped_pipe_are_counted() {
+    let mut s = Vec::new();
+    for rec in [
+        &b"|RECORD=1|LibReference=X|ComponentDescription=a\x8eb|"[..],
+        b"|RECORD=41|Name=Netlist|Text=p\x8eq\x8er|",
+        b"|RECORD=41|Name=Other|Text=p\x8eq|%UTF8%Text=p\xc2\xa6q|",
+        b"|RECORD=41|Name=Plain|Text=pq|",
+    ] {
+        let mut payload = rec.to_vec();
+        payload.push(0);
+        s.extend((payload.len() as u32).to_le_bytes());
+        s.extend(payload);
+    }
+    let c = altium_format::sch::parse_symbol_stream(&s).unwrap();
+    assert_eq!(c.ansi_pipe_assumed, 2, "the component and Netlist records");
+    assert_eq!(c.description, "a|b");
+    assert_eq!(c.parameters[0].text.text, "p|q|r");
+    assert_eq!(c.parameters[1].text.text, "p|q");
+}

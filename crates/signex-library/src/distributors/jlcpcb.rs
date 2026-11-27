@@ -15,7 +15,7 @@ use url::Url;
 use crate::distributor::{
     DistributorAdapter, DistributorError, DistributorPart, DistributorSource,
 };
-use crate::distributors::cache::{DEFAULT_TTL, DistributorCache};
+use crate::distributors::cache::DistributorCache;
 use crate::param::ParamMap;
 
 const JLCPCB_PROVIDER_KEY: &str = "jlcpcb";
@@ -28,7 +28,7 @@ pub struct JlcpcbAdapter {
     base_url: String,
     cache: Option<DistributorCache>,
     throttle: Mutex<Option<Instant>>,
-    http: reqwest::blocking::Client,
+    http: super::http::LazyClient,
 }
 
 impl JlcpcbAdapter {
@@ -37,7 +37,7 @@ impl JlcpcbAdapter {
             base_url: JLCPCB_DEFAULT_BASE.into(),
             cache,
             throttle: Mutex::new(None),
-            http: super::http::build_client(),
+            http: super::http::LazyClient::standard(),
         }
     }
 
@@ -46,7 +46,7 @@ impl JlcpcbAdapter {
             base_url: base_url.into(),
             cache,
             throttle: Mutex::new(None),
-            http: super::http::build_client(),
+            http: super::http::LazyClient::standard(),
         }
     }
 
@@ -62,27 +62,12 @@ impl JlcpcbAdapter {
         self.polite_wait();
         let resp = self
             .http
+            .get()?
             .post(url)
             .json(body)
             .send()
             .map_err(|e| DistributorError::Network(e.to_string()))?;
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after_seconds = resp
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(60);
-            return Err(DistributorError::RateLimited {
-                retry_after_seconds,
-            });
-        }
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(DistributorError::NotFound);
-        }
-        if !resp.status().is_success() {
-            return Err(DistributorError::Backend(format!("HTTP {}", resp.status())));
-        }
+        let resp = super::http::check_response(resp, None)?;
         resp.json::<T>()
             .map_err(|e| DistributorError::Backend(format!("decode: {e}")))
     }
@@ -119,7 +104,7 @@ impl DistributorAdapter for JlcpcbAdapter {
             .find(|(k, _)| k == "partno" || k == "componentCode")
             .map(|(_, v)| v.to_string());
         let from_path = url.path().split('/').rev().find_map(|seg| {
-            if seg.starts_with('C') && seg[1..].chars().all(|c| c.is_ascii_digit()) {
+            if super::lcsc::is_lcsc_code(seg) {
                 Some(seg.to_string())
             } else {
                 None
@@ -129,37 +114,31 @@ impl DistributorAdapter for JlcpcbAdapter {
         if token.is_empty() {
             return Ok(None);
         }
-        let mut hits = self.search_by_keyword(&token)?;
-        Ok(hits.pop())
+        let hits = self.search_by_keyword(&token)?;
+        Ok(super::price::pick_url_hit(
+            hits,
+            &token,
+            &["jlcpcb_component_code"],
+        ))
     }
 
     fn lookup_by_mpn(&self, mpn: &str) -> Result<Vec<DistributorPart>, DistributorError> {
-        if let Some(cache) = &self.cache
-            && let Some(hit) = cache.get_or_warn(JLCPCB_PROVIDER_KEY, mpn, DEFAULT_TTL)
-        {
-            return Ok(vec![hit]);
-        }
-        let hits = self.search_by_keyword(mpn)?;
-        if let (Some(cache), Some(first)) = (&self.cache, hits.first()) {
-            // H4: silenced cache writes hide disk-full / permission failures.
-            if let Err(e) = cache.put(JLCPCB_PROVIDER_KEY, first) {
-                tracing::warn!(
-                    error = %e,
-                    mpn = %mpn,
-                    "JLCPCB cache write failed; live result returned but not persisted",
-                );
-            }
-        }
-        Ok(hits)
+        super::http::cached_lookup(
+            self.cache.as_ref(),
+            JLCPCB_PROVIDER_KEY,
+            JLCPCB_NAME,
+            mpn,
+            || self.search_by_keyword(mpn),
+        )
     }
 
     fn refresh_pricing(
         &self,
-        part: &DistributorPart,
+        _part: &DistributorPart,
     ) -> Result<crate::distributor::PricingSnapshot, DistributorError> {
-        let mut hits = self.search_by_keyword(&part.mpn)?;
-        let fresh = hits.pop().ok_or(DistributorError::NotFound)?;
-        fresh.pricing.ok_or(DistributorError::NotFound)
+        // The search response has no price fields, so there is nothing to
+        // refresh from; say so instead of reporting "not found".
+        Err(super::price::pricing_unavailable(JLCPCB_NAME))
     }
 }
 

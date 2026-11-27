@@ -15,9 +15,17 @@ path = "src/main.rs"
 altium-format = { workspace = true }
 signex-altium-convert = { workspace = true }
 signex-types = { workspace = true }
+signex-library = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
+encoding_rs = { workspace = true }
+sha2 = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+jsonschema = { version = "0.30", default-features = false }
 
 [lints]
 workspace = true

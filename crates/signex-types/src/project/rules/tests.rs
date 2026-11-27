@@ -1,0 +1,407 @@
+use crate::project::{ProjectData, parse_project, write_project};
+
+const WITH_RULES: &str = r#"{
+  "name": "p",
+  "dir": "",
+  "schematic_root": null,
+  "pcb_file": null,
+  "rules": {
+    "schema": 1,
+    "profile": {"name": "Signex Default", "source": "builtin", "version": "1.0", "sha256": "abc"},
+    "erc": {
+      "severity": {"pin_type_conflict": "error", "future_rule": "warning"},
+      "pin_matrix": {"output/output": "error"},
+      "future_erc_key": [1, 2]
+    },
+    "drc": {"clearance_nm": 150000}
+  }
+}"#;
+
+#[test]
+fn rules_round_trip_with_unknown_ids_and_sections() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.snxprj");
+    std::fs::write(&path, WITH_RULES).unwrap();
+    let data = parse_project(&path).unwrap();
+    let rules = data.rules.as_ref().expect("rules section");
+    assert_eq!(rules.erc.severity["pin_type_conflict"], "error");
+    assert_eq!(rules.erc.severity["future_rule"], "warning");
+    assert_eq!(rules.profile.as_ref().unwrap().name, "Signex Default");
+
+    write_project(&path, &data).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["rules"]["drc"]["clearance_nm"], 150000);
+    assert_eq!(json["rules"]["erc"]["future_erc_key"][1], 2);
+    assert_eq!(json["rules"]["erc"]["severity"]["future_rule"], "warning");
+    assert_eq!(parse_project(&path).unwrap().rules, data.rules);
+}
+
+#[test]
+fn project_without_rules_resaves_without_a_rules_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.snxprj");
+    let data: ProjectData =
+        serde_json::from_str(r#"{"name":"p","dir":"","schematic_root":null,"pcb_file":null}"#)
+            .unwrap();
+    assert!(data.rules.is_none());
+    write_project(&path, &data).unwrap();
+    let first = std::fs::read(&path).unwrap();
+    assert!(!String::from_utf8_lossy(&first).contains("rules"));
+    // `dir` is re-derived on load, so compare two load -> save cycles: the
+    // file is byte-stable and never grows a `rules` key.
+    write_project(&path, &parse_project(&path).unwrap()).unwrap();
+    let second = std::fs::read(&path).unwrap();
+    write_project(&path, &parse_project(&path).unwrap()).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), second);
+    assert!(!String::from_utf8_lossy(&second).contains("rules"));
+}
+
+#[test]
+fn rules_serialize_in_deterministic_key_order() {
+    let mut rules = crate::project::ProjectRules::default();
+    rules.erc.severity.insert("z_rule".into(), "off".into());
+    rules.erc.severity.insert("a_rule".into(), "error".into());
+    let text = serde_json::to_string(&rules).unwrap();
+    assert!(text.find("a_rule").unwrap() < text.find("z_rule").unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Forward compatibility (#1180): a section this build cannot interpret never
+// stops the project from opening, is not applied, and re-saves untouched.
+// ---------------------------------------------------------------------------
+
+fn project_with_rules(rules: &str) -> String {
+    format!(r#"{{"name":"p","dir":"","schematic_root":null,"pcb_file":null,"rules":{rules}}}"#)
+}
+
+/// Open `text`, save it, and return the parsed project and the saved JSON.
+fn open_and_resave(text: &str) -> (ProjectData, serde_json::Value) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.snxprj");
+    std::fs::write(&path, text).unwrap();
+    let data = parse_project(&path).expect("the project opens");
+    write_project(&path, &data).unwrap();
+    let saved = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    (data, saved)
+}
+
+fn rules_of(text: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(text).unwrap()["rules"].clone()
+}
+
+#[test]
+fn a_changed_value_shape_is_kept_not_applied() {
+    let text =
+        project_with_rules(r#"{"schema":2,"erc":{"severity":{"unused_pin":{"level":"error"}}}}"#);
+    let (data, saved) = open_and_resave(&text);
+    assert!(data.rules.is_none());
+    assert!(data.has_unreadable_rules());
+    assert_eq!(saved["rules"], rules_of(&text));
+}
+
+#[test]
+fn a_shape_change_without_a_schema_bump_is_kept_not_applied() {
+    let text = project_with_rules(r#"{"erc":{"severity":{"unused_pin":["error"]}}}"#);
+    let (data, saved) = open_and_resave(&text);
+    assert!(data.has_unreadable_rules());
+    assert_eq!(saved["rules"], rules_of(&text));
+}
+
+#[test]
+fn a_newer_schema_is_kept_not_applied_even_when_its_values_parse() {
+    let text = project_with_rules(r#"{"schema":3,"erc":{"severity":{"unused_pin":"error"}}}"#);
+    let (data, saved) = open_and_resave(&text);
+    assert!(data.rules.is_none(), "v3 meaning must not be read as v2");
+    assert_eq!(saved["rules"], rules_of(&text));
+}
+
+#[test]
+fn a_profile_without_a_name_opens_and_round_trips() {
+    let text = project_with_rules(r#"{"schema":1,"profile":{"source":"user"}}"#);
+    let (data, saved) = open_and_resave(&text);
+    let profile = data.rules.as_ref().unwrap().profile.as_ref().unwrap();
+    assert_eq!(profile.source, "user");
+    assert_eq!(saved["rules"], rules_of(&text));
+}
+
+#[test]
+fn a_section_this_build_does_not_own_resaves_unchanged() {
+    let text = project_with_rules(r#"{"drc":{"x":1}}"#);
+    let (data, saved) = open_and_resave(&text);
+    assert!(data.rules.is_some());
+    assert_eq!(saved["rules"], rules_of(&text), "no schema or erc added");
+}
+
+#[test]
+fn a_rule_set_stored_over_a_kept_section_replaces_it() {
+    let text = project_with_rules(r#"{"schema":2,"erc":{"severity":{"x":{"level":"off"}}}}"#);
+    let (mut data, _) = open_and_resave(&text);
+    let mut stored = crate::project::ProjectRules::default();
+    stored
+        .erc
+        .severity
+        .insert("unused_pin".into(), "error".into());
+    data.rules = Some(stored.clone());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.snxprj");
+    write_project(&path, &data).unwrap();
+    let back = parse_project(&path).unwrap();
+    assert_eq!(back.rules, Some(stored));
+    assert!(!back.has_unreadable_rules());
+}
+
+#[test]
+fn net_waivers_round_trip_through_the_project_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.snxprj");
+    let mut data: ProjectData =
+        serde_json::from_str(r#"{"name":"p","dir":"","schematic_root":null,"pcb_file":null}"#)
+            .unwrap();
+    let mut rules = crate::project::ProjectRules::default();
+    rules
+        .erc_net_waivers
+        .entry("user::single_driver".into())
+        .or_default()
+        .extend(["VBUS".to_string(), "3V3".to_string()]);
+    data.rules = Some(rules);
+
+    write_project(&path, &data).unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        json["rules"]["erc_net_waivers"]["user::single_driver"],
+        serde_json::json!(["3V3", "VBUS"])
+    );
+    assert_eq!(parse_project(&path).unwrap().rules, data.rules);
+}
+
+const WITH_NET_WAIVERS_ONLY: &str = r#"{
+  "name": "p",
+  "dir": "",
+  "schematic_root": null,
+  "pcb_file": null,
+  "rules": {
+    "schema": 1,
+    "erc_net_waivers": {"user::single_driver": ["VBUS"]}
+  }
+}"#;
+
+#[test]
+fn a_file_without_violation_waivers_loads_and_resaves_without_the_key() {
+    let (data, saved) = open_and_resave(WITH_NET_WAIVERS_ONLY);
+    let rules = data.rules.as_ref().expect("rules");
+    assert!(rules.erc_waivers.is_empty());
+    assert!(rules.erc_net_waivers["user::single_driver"].contains("VBUS"));
+    assert_eq!(saved["rules"], rules_of(WITH_NET_WAIVERS_ONLY));
+}
+
+#[test]
+fn violation_waivers_round_trip_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.snxprj");
+    let mut data: ProjectData = serde_json::from_str(WITH_NET_WAIVERS_ONLY).unwrap();
+    let waiver = crate::project::ErcWaiver {
+        rule_id: "builtin::unused_pin".into(),
+        objects: vec!["00000000-0000-4000-8000-000000000001".into()],
+        fingerprint: "ab".repeat(32),
+        reason: "Test point, left open on purpose".into(),
+        author: "A. Designer".into(),
+        date: "2026-10-29".into(),
+        message: "Pin on TP1 is not connected".into(),
+        unknown: Default::default(),
+    };
+    data.rules
+        .as_mut()
+        .unwrap()
+        .erc_waivers
+        .push(waiver.clone());
+    write_project(&path, &data).unwrap();
+    let back = parse_project(&path).unwrap();
+    assert_eq!(back.rules.as_ref().unwrap().erc_waivers, vec![waiver]);
+    assert_eq!(back.rules, data.rules);
+    // `dir` is re-derived on load, so compare two load -> save cycles.
+    write_project(&path, &back).unwrap();
+    let second = std::fs::read(&path).unwrap();
+    write_project(&path, &parse_project(&path).unwrap()).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), second, "save is byte-stable");
+}
+
+#[test]
+fn a_waiver_from_a_newer_build_keeps_its_unknown_keys() {
+    let text = project_with_rules(
+        r#"{"schema":1,"erc_waivers":[{"rule_id":"builtin::orphan_label","objects":["u"],"fingerprint":"f","reason":"r","author":"a","scope":"sheet"}]}"#,
+    );
+    let (data, saved) = open_and_resave(&text);
+    let w = &data.rules.as_ref().unwrap().erc_waivers[0];
+    assert!(w.is_complete());
+    assert_eq!(saved["rules"], rules_of(&text));
+}
+
+// ---------------------------------------------------------------------------
+// The `drc` section (#2307 step 2a).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_drc_section_is_read_and_round_trips_with_unknown_keys() {
+    let text = project_with_rules(
+        r#"{"schema":1,"drc":{"severity":{"builtin::unconnected":"error","user::future":"info"},"dsl":"rule a on net","future_key":{"a":[1,2]}}}"#,
+    );
+    let (data, saved) = open_and_resave(&text);
+    let drc = &data.rules.as_ref().expect("rules").drc;
+    assert_eq!(drc.severity["builtin::unconnected"], "error");
+    assert_eq!(drc.severity["user::future"], "info");
+    assert_eq!(drc.dsl.as_deref(), Some("rule a on net"));
+    assert_eq!(drc.unknown.get("future_key").unwrap()["a"][1], 2);
+    assert_eq!(saved["rules"], rules_of(&text));
+}
+
+#[test]
+fn a_drc_key_from_before_the_section_existed_is_kept() {
+    let (data, saved) = open_and_resave(WITH_RULES);
+    let drc = &data.rules.as_ref().unwrap().drc;
+    assert!(drc.severity.is_empty() && drc.dsl.is_none());
+    assert_eq!(drc.unknown.get("clearance_nm").unwrap(), 150000);
+    assert_eq!(saved["rules"]["drc"], rules_of(WITH_RULES)["drc"]);
+}
+
+#[test]
+fn a_rule_set_without_drc_loads_empty_and_resaves_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.snxprj");
+    std::fs::write(&path, WITH_NET_WAIVERS_ONLY).unwrap();
+    let data = parse_project(&path).unwrap();
+    assert!(data.rules.as_ref().unwrap().drc.is_empty());
+    // `dir` is re-derived on load, so compare two load -> save cycles.
+    write_project(&path, &data).unwrap();
+    let first = std::fs::read(&path).unwrap();
+    write_project(&path, &parse_project(&path).unwrap()).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), first);
+    assert!(!String::from_utf8_lossy(&first).contains("drc"));
+}
+
+#[test]
+fn an_empty_drc_section_is_never_written() {
+    let rules = crate::project::ProjectRules::default();
+    assert!(rules.drc.is_empty());
+    assert!(!serde_json::to_string(&rules).unwrap().contains("drc"));
+}
+
+#[test]
+fn a_drc_section_holding_only_rule_text_is_kept() {
+    let text = project_with_rules(r#"{"schema":1,"drc":{"dsl":""}}"#);
+    let (data, saved) = open_and_resave(&text);
+    assert_eq!(data.rules.unwrap().drc.dsl.as_deref(), Some(""));
+    assert_eq!(saved["rules"], rules_of(&text));
+}
+
+/// #2307 step 2b reads the text; it is still written back exactly as read:
+/// several lines, quotes, tabs, comment-like text and a micro sign.
+#[test]
+fn multi_line_rule_text_round_trips_unchanged() {
+    let dsl = "rule hv on clearance when class == \"HV\"\n\trequire clearance >= 800\u{b5}m\n  then error \"HV # spacing\"\r\n";
+    let rules = serde_json::json!({"schema": 1, "drc": {"dsl": dsl}});
+    let text = project_with_rules(&rules.to_string());
+    let (data, saved) = open_and_resave(&text);
+    assert_eq!(data.rules.unwrap().drc.dsl.as_deref(), Some(dsl));
+    assert_eq!(saved["rules"]["drc"]["dsl"], dsl);
+}
+
+/// A `drc` of another shape makes the whole section unreadable (#1180), as
+/// any other shape change does: kept byte for byte, not applied.
+#[test]
+fn a_malformed_drc_section_is_kept_and_marks_the_rules_unreadable() {
+    for drc in [
+        r#""legacy""#,
+        "null",
+        "[1]",
+        r#"{"severity":{"builtin::short":1}}"#,
+        r#"{"dsl":5}"#,
+    ] {
+        let text = project_with_rules(&format!(
+            r#"{{"schema":1,"erc":{{"severity":{{"unused_pin":"error"}}}},"drc":{drc}}}"#
+        ));
+        let (data, saved) = open_and_resave(&text);
+        assert!(data.rules.is_none(), "{drc}");
+        assert!(data.has_unreadable_rules(), "{drc}");
+        assert_eq!(saved["rules"], rules_of(&text), "{drc}");
+    }
+}
+
+/// #2398: named rule sets ride in `drc.sets`, keep keys a newer build
+/// added, and leave a `drc` without sets byte-stable (no `sets` key).
+#[test]
+fn named_rule_sets_round_trip_and_stay_absent_when_empty() {
+    use crate::project::DrcRuleSet;
+    let text = r#"{"dsl":"rule a on via require drill >= 0.2mm then error",
+        "sets":{"HV_08":{"limits":{"min_clearance":"0.8mm"},"severity":"warning",
+        "uses":[{"scope":"class == \"HV\"","rules":["HV_08_HV_clearance"],"later":1}],
+        "future":true}}}"#;
+    let drc: DrcRuleSet = serde_json::from_str(text).unwrap();
+    let set = &drc.sets["HV_08"];
+    assert_eq!(set.limits["min_clearance"], "0.8mm");
+    assert_eq!(set.severity.as_deref(), Some("warning"));
+    assert_eq!(set.uses[0].rules, ["HV_08_HV_clearance"]);
+    let back: DrcRuleSet = serde_json::from_str(&serde_json::to_string(&drc).unwrap()).unwrap();
+    assert_eq!(back, drc);
+    assert!(
+        serde_json::to_string(&back)
+            .unwrap()
+            .contains("\"future\":true")
+    );
+    let plain = DrcRuleSet {
+        dsl: Some("x".into()),
+        ..DrcRuleSet::default()
+    };
+    assert!(!serde_json::to_string(&plain).unwrap().contains("sets"));
+    assert!(!drc.is_empty());
+}
+
+/// #1489: the names of the rules Update PCB wrote from the schematic ride
+/// in `drc.from_schematic`, are left out while empty, and survive a build
+/// that does not know the key (it lands in that build's `unknown` bag).
+#[test]
+fn schematic_rule_sources_round_trip_and_an_older_build_keeps_them() {
+    use crate::project::{DrcRuleSet, UnknownJson};
+    let text = r#"{"dsl":"rule Width_PWR on track when class == \"PWR\" require width >= 0.8mm then error",
+        "from_schematic":["Width_PWR"]}"#;
+    let drc: DrcRuleSet = serde_json::from_str(text).unwrap();
+    assert_eq!(drc.from_schematic, ["Width_PWR"]);
+    assert!(drc.is_from_schematic("Width_PWR"));
+    assert!(!drc.is_from_schematic("Clearance_PWR"));
+    assert!(drc.unknown.is_empty());
+    assert!(!drc.is_empty());
+    let back: DrcRuleSet = serde_json::from_str(&serde_json::to_string(&drc).unwrap()).unwrap();
+    assert_eq!(back, drc);
+
+    let plain = DrcRuleSet {
+        dsl: Some("x".into()),
+        ..DrcRuleSet::default()
+    };
+    assert!(
+        !serde_json::to_string(&plain)
+            .unwrap()
+            .contains("from_schematic")
+    );
+    let only_sources = DrcRuleSet {
+        from_schematic: vec!["Width_PWR".into()],
+        ..DrcRuleSet::default()
+    };
+    assert!(!only_sources.is_empty());
+
+    // The `drc` section as a build before the key reads it: every known
+    // field, and the rest flattened into `unknown`.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct OlderDrc {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dsl: Option<String>,
+        #[serde(default, flatten, skip_serializing_if = "UnknownJson::is_empty")]
+        unknown: UnknownJson,
+    }
+    let older: OlderDrc = serde_json::from_str(text).unwrap();
+    assert!(!older.unknown.is_empty());
+    let resaved = serde_json::to_string(&older).unwrap();
+    let again: DrcRuleSet = serde_json::from_str(&resaved).unwrap();
+    assert_eq!(again, drc);
+}

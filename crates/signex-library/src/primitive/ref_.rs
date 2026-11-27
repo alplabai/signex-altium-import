@@ -2,7 +2,7 @@
 //!
 //! Every primitive lives inside a single library and is identified
 //! by its UUID *within that library*. Cross-library references
-//! compose the library UUID (from `library.toml::library_id`) with
+//! compose the library UUID (the `library_id` at the root of the `.snxlib` document) with
 //! the primitive UUID. [`crate::adapters::library_set::LibrarySet`]
 //! resolves these tuples back to the actual primitive struct.
 
@@ -15,7 +15,7 @@ use uuid::Uuid;
 /// which `WhereUsedIndex` and the resolver both need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PrimitiveRef {
-    /// Stable UUID from the source library's `library.toml::id`.
+    /// Stable UUID from the source library's `.snxlib` manifest's `library_id`.
     pub library_id: Uuid,
     /// Primitive UUID within that library.
     pub uuid: Uuid,
@@ -24,6 +24,17 @@ pub struct PrimitiveRef {
 impl PrimitiveRef {
     pub fn new(library_id: Uuid, uuid: Uuid) -> Self {
         Self { library_id, uuid }
+    }
+
+    /// Parse the `<library uuid>:<primitive uuid>` key a schematic stores
+    /// (a symbol's `lib_id`, a part's footprint, a stamp's footprint
+    /// binding). `None` for anything else.
+    pub fn parse_key(key: &str) -> Option<Self> {
+        let (library, primitive) = key.split_once(':')?;
+        Some(Self::new(
+            Uuid::parse_str(library).ok()?,
+            Uuid::parse_str(primitive).ok()?,
+        ))
     }
 }
 
@@ -51,6 +62,16 @@ mod tests {
         let u = Uuid::nil();
         let r = PrimitiveRef::new(lib, u);
         assert_eq!(r.to_string(), format!("{lib}/{u}"));
+    }
+
+    #[test]
+    fn parse_key_reads_the_colon_key_and_refuses_anything_else() {
+        let r = PrimitiveRef::new(Uuid::now_v7(), Uuid::now_v7());
+        let key = format!("{}:{}", r.library_id, r.uuid);
+        assert_eq!(PrimitiveRef::parse_key(&key), Some(r));
+        assert_eq!(PrimitiveRef::parse_key(&r.to_string()), None);
+        assert_eq!(PrimitiveRef::parse_key("R0805"), None);
+        assert_eq!(PrimitiveRef::parse_key(""), None);
     }
 
     #[test]

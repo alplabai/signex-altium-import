@@ -82,7 +82,7 @@ fn converted_sheet_round_trips_and_keeps_connectivity() {
         .collect();
     let mut touching = 0;
     for sym in sheet.symbols.iter().filter(|s| !s.is_power) {
-        let lib = &sheet.lib_symbols[&sym.lib_id];
+        let lib = sheet.body_of(sym).expect("symbol body");
         let t = SymbolTransform::from_symbol(sym);
         for lp in lib
             .pins

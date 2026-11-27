@@ -1,53 +1,26 @@
 //! Pad TSV codec + token conversions for the footprint wire format.
 
+use super::pad_columns::{self, ExtendedColumn};
 use super::*;
+use crate::primitive::tsv_cell::{fmt_f64, parse_finite_cell};
 use signex_types::numeric::parse_finite_f64;
 
 // ---- Pad TSV codec --------------------------------------------------
 
-pub(super) fn pad_kind_token(k: PadKind) -> &'static str {
-    match k {
-        PadKind::Smd => "Smd",
-        PadKind::Tht => "Tht",
-        PadKind::NptHole => "NptHole",
-        PadKind::ConnectorPad => "ConnectorPad",
-        PadKind::Castellated => "Castellated",
-        PadKind::Fiducial => "Fiducial",
-    }
-}
-
-pub(super) fn pad_kind_from_token(s: &str) -> Result<PadKind, FootprintFileError> {
-    Ok(match s {
-        "Smd" => PadKind::Smd,
-        "Tht" => PadKind::Tht,
-        "NptHole" => PadKind::NptHole,
-        "ConnectorPad" => PadKind::ConnectorPad,
-        "Castellated" => PadKind::Castellated,
-        "Fiducial" => PadKind::Fiducial,
-        other => {
-            return Err(FootprintFileError::UnknownEnumToken {
-                kind: "PadKind",
-                got: other.to_string(),
-            });
-        }
-    })
-}
-
-/// Format an `f64` for a TSV cell (see the symbol codec's `fmt_f64`).
-/// `None` for NaN / ±Inf; the caller reports it as a save error naming
-/// the pad and column (#828).
-fn fmt_f64_fp(v: f64) -> Option<String> {
-    if v == 0.0 {
-        Some("0".to_string())
-    } else if !v.is_finite() {
-        None
-    } else {
-        Some(format!("{v}"))
+signex_types::token_enum! {
+    pub(super) fn pad_kind_token / pad_kind_from_token for PadKind,
+    error FootprintFileError {
+        Smd => "Smd",
+        Tht => "Tht",
+        NptHole => "NptHole",
+        ConnectorPad => "ConnectorPad",
+        Castellated => "Castellated",
+        Fiducial => "Fiducial",
     }
 }
 
 /// The error for a non-finite number in a pad's `column`.
-fn non_finite_pad(pad: &str, column: &str) -> FootprintFileError {
+pub(super) fn non_finite_pad(pad: &str, column: &str) -> FootprintFileError {
     FootprintFileError::NonFiniteField {
         field: format!("pad {pad:?} {column}"),
     }
@@ -57,7 +30,7 @@ pub(super) fn pad_shape_to_token(
     shape: &PadShape,
     pad: &str,
 ) -> Result<String, FootprintFileError> {
-    let num = |v: f64| fmt_f64_fp(v).ok_or_else(|| non_finite_pad(pad, "shape"));
+    let num = |v: f64| fmt_f64(v).ok_or_else(|| non_finite_pad(pad, "shape"));
     Ok(match shape {
         PadShape::Round => "round".to_string(),
         PadShape::Rect => "rect".to_string(),
@@ -84,6 +57,9 @@ pub(super) fn pad_shape_to_token(
                 parts.push(format!("{},{}", num(p[0])?, num(p[1])?));
             }
             format!("custom:{}", parts.join("|"))
+        }
+        PadShape::Trapezoid { delta } => {
+            format!("trapezoid:{},{}", num(delta[0])?, num(delta[1])?)
         }
     })
 }
@@ -128,6 +104,12 @@ pub(super) fn pad_shape_from_token(s: &str) -> Result<PadShape, FootprintFileErr
         return Ok(PadShape::Chamfered {
             chamfer_ratio,
             corners,
+        });
+    }
+    if let Some(rest) = s.strip_prefix("trapezoid:") {
+        let (x, y) = rest.split_once(',').ok_or_else(invalid)?;
+        return Ok(PadShape::Trapezoid {
+            delta: [finite(x)?, finite(y)?],
         });
     }
     if let Some(rest) = s.strip_prefix("custom:") {
@@ -178,17 +160,16 @@ fn layers_from_token(s: &str) -> Vec<LayerId> {
 }
 
 fn parse_f64_cell_fp(col: &'static str, s: &str) -> Result<f64, FootprintFileError> {
-    // #678: reject `NaN` / `inf` (and `1e999`, which overflows to inf).
-    s.parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite())
-        .ok_or_else(|| FootprintFileError::InvalidNumericCell {
-            column: col,
-            value: s.to_string(),
-        })
+    parse_finite_cell(s).ok_or_else(|| FootprintFileError::InvalidNumericCell {
+        column: col,
+        value: s.to_string(),
+    })
 }
 
-fn parse_opt_f64_cell_fp(col: &'static str, s: &str) -> Result<Option<f64>, FootprintFileError> {
+pub(super) fn parse_opt_f64_cell_fp(
+    col: &'static str,
+    s: &str,
+) -> Result<Option<f64>, FootprintFileError> {
     if s.is_empty() {
         Ok(None)
     } else {
@@ -196,9 +177,8 @@ fn parse_opt_f64_cell_fp(col: &'static str, s: &str) -> Result<Option<f64>, Foot
     }
 }
 
-fn pad_to_tsv_row(pad: &Pad) -> Result<String, FootprintFileError> {
-    let num =
-        |v: f64, column: &str| fmt_f64_fp(v).ok_or_else(|| non_finite_pad(&pad.number, column));
+fn pad_to_tsv_row(pad: &Pad, extra: &[&ExtendedColumn]) -> Result<String, FootprintFileError> {
+    let num = |v: f64, column: &str| fmt_f64(v).ok_or_else(|| non_finite_pad(&pad.number, column));
     let opt = |v: Option<f64>, column: &str| match v {
         None => Ok(String::new()),
         Some(v) => num(v, column),
@@ -213,7 +193,7 @@ fn pad_to_tsv_row(pad: &Pad) -> Result<String, FootprintFileError> {
         pad.drill.as_ref().and_then(|d| d.slot_length),
         "drill_slot_length",
     )?;
-    let cells: [String; 13] = [
+    let mut cells: Vec<String> = vec![
         pad.number.clone(),
         pad_kind_token(pad.kind).to_string(),
         shape_cell,
@@ -228,8 +208,17 @@ fn pad_to_tsv_row(pad: &Pad) -> Result<String, FootprintFileError> {
         opt(pad.solder_mask_margin, "solder_mask_margin")?,
         opt(pad.paste_margin, "paste_margin")?,
     ];
-    for (col, cell) in PAD_TSV_COLUMNS.iter().zip(cells.iter()) {
-        if cell.contains('\t') || cell.contains('\n') || cell.contains("'''") {
+    for col in extra {
+        cells.push((col.encode)(pad)?);
+    }
+    let names = PAD_TSV_COLUMNS
+        .iter()
+        .copied()
+        .chain(extra.iter().map(|c| c.name));
+    for (col, cell) in names.zip(cells.iter()) {
+        // Any control char (tab, LF, CR, ...) would corrupt the row or
+        // the TOML literal block it is embedded in.
+        if cell.chars().any(char::is_control) || cell.contains("'''") {
             return Err(FootprintFileError::InvalidTsvCell {
                 column: col,
                 value: cell.clone(),
@@ -242,19 +231,26 @@ fn pad_to_tsv_row(pad: &Pad) -> Result<String, FootprintFileError> {
 /// Encode a slice of pads as TSV — header row first, then one row
 /// per pad. Empty slice still emits the header row.
 pub(crate) fn pads_to_tsv(pads: &[Pad]) -> Result<String, FootprintFileError> {
+    let extra = pad_columns::columns_needed(pads)?;
     let mut out = String::new();
     out.push_str(&PAD_TSV_COLUMNS.join("\t"));
+    for col in &extra {
+        out.push('\t');
+        out.push_str(col.name);
+    }
     out.push('\n');
     for pad in pads {
-        out.push_str(&pad_to_tsv_row(pad)?);
+        out.push_str(&pad_to_tsv_row(pad, &extra)?);
         out.push('\n');
     }
     Ok(out)
 }
 
 /// Parse a `pads_tsv` payload back into `Vec<Pad>`. The first non-
-/// empty line is the header and must equal [`PAD_TSV_COLUMNS`]; each
-/// subsequent line is a pad row.
+/// empty line is the header: it must start with the base
+/// [`PAD_TSV_COLUMNS`], followed by zero or more known, non-repeated
+/// extended columns (see `pad_columns`) in any order; each subsequent
+/// line is a pad row with one cell per header column.
 pub(crate) fn pads_from_tsv(tsv: &str) -> Result<Vec<Pad>, FootprintFileError> {
     let trimmed = tsv.trim_matches('\n');
     if trimmed.is_empty() {
@@ -263,27 +259,45 @@ pub(crate) fn pads_from_tsv(tsv: &str) -> Result<Vec<Pad>, FootprintFileError> {
     let mut lines = trimmed.split('\n');
     let header = lines.next().ok_or(FootprintFileError::EmptyPadsTsv)?;
     let header_cols: Vec<&str> = header.split('\t').collect();
-    if header_cols.len() != PAD_TSV_COLUMNS.len()
+    let base = PAD_TSV_COLUMNS.len();
+    let mismatch = || FootprintFileError::PadsTsvSchemaMismatch {
+        got: header_cols.iter().map(|s| (*s).to_string()).collect(),
+    };
+    // The 13 base columns lead, in order. Anything after them must be
+    // a known extended column (any order, no repeats); a file written
+    // before #960 simply has none, and its pads take `Pad::default()`
+    // for those fields.
+    if header_cols.len() < base
         || header_cols
             .iter()
             .zip(PAD_TSV_COLUMNS.iter())
             .any(|(g, e)| g != e)
     {
-        return Err(FootprintFileError::PadsTsvSchemaMismatch {
-            got: header_cols.iter().map(|s| (*s).to_string()).collect(),
-        });
+        return Err(mismatch());
     }
+    let mut extra: Vec<&ExtendedColumn> = Vec::new();
+    for name in &header_cols[base..] {
+        match pad_columns::column_by_name(name) {
+            Some(col) if !extra.iter().any(|c| c.name == col.name) => extra.push(col),
+            _ => return Err(mismatch()),
+        }
+    }
+    let expected_cells = base + extra.len();
     let mut pads = Vec::new();
     for (row_idx, line) in lines.enumerate() {
         let cells: Vec<&str> = line.split('\t').collect();
-        if cells.len() != PAD_TSV_COLUMNS.len() {
+        if cells.len() != expected_cells {
             return Err(FootprintFileError::PadsTsvCellCountMismatch {
                 row_index: row_idx,
                 got: cells.len(),
-                expected: PAD_TSV_COLUMNS.len(),
+                expected: expected_cells,
             });
         }
-        pads.push(pad_from_tsv_row(&cells)?);
+        let mut pad = pad_from_tsv_row(&cells)?;
+        for (col, cell) in extra.iter().zip(&cells[base..]) {
+            (col.decode)(&mut pad, cell)?;
+        }
+        pads.push(pad);
     }
     Ok(pads)
 }
@@ -340,8 +354,8 @@ pub enum FootprintFileError {
     NonFiniteNumber { path: String },
     #[error("TOML serialise failed: {0}")]
     TomlSerialize(toml::ser::Error),
-    #[error("unsupported .snxfpt format token {got:?}; this build supports \"snxfpt/1\"")]
-    UnsupportedFormat { got: String },
+    #[error(".snxfpt {0}")]
+    UnsupportedFormat(#[from] signex_types::format_version::FormatVersionError),
     #[error(
         "TSV cell in column {column:?} contains a tab, newline, or triple-quote: \
          {value:?}; cells must be free of \\t, \\n, and the literal \"'''\""
@@ -368,6 +382,18 @@ pub enum FootprintFileError {
     /// save fails loudly instead of writing an empty cell or panicking.
     #[error("{field} holds a non-finite number (NaN or infinity); it cannot be saved")]
     NonFiniteField { field: String },
+    /// A `[[models]]` entry this build cannot read (#3107); `users` names
+    /// the footprints that attach it.
+    #[error("embedded 3D model {hash:?} of {users}: {reason}")]
+    InvalidModelEntry {
+        hash: String,
+        users: String,
+        reason: String,
+    },
+    /// The writer could not find the one `data` line of embedded model
+    /// `index` (another string spells its placeholder); nothing is written.
+    #[error("embedded 3D model {index}: its data could not be placed; nothing was saved")]
+    ModelDataPlacement { index: usize },
 }
 
 impl From<signex_types::numeric::TomlFiniteError> for FootprintFileError {

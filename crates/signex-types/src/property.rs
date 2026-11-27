@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::schematic::{Point, TextProp};
+use crate::schematic::{HAlign, Point, TextProp};
 
 /// Captures Standard property metadata without forcing all callers off the legacy
 /// key/value field map at once.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SchematicProperty {
     #[serde(default)]
     pub key: String,
@@ -26,7 +26,7 @@ pub struct SchematicProperty {
 
 /// Captures Standard footprint property metadata while preserving the legacy
 /// footprint `reference` and `value` compatibility fields.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct PcbProperty {
     #[serde(default)]
     pub key: String,
@@ -42,4 +42,12 @@ pub struct PcbProperty {
     pub font_size: Option<f64>,
     #[serde(default)]
     pub hidden: bool,
+    /// Where the text's anchor sits along its line (#2368); centred when
+    /// not saved.
+    #[serde(default, skip_serializing_if = "is_centred")]
+    pub justify: HAlign,
+}
+
+fn is_centred(justify: &HAlign) -> bool {
+    *justify == HAlign::Center
 }

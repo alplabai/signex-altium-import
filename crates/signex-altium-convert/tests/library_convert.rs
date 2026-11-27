@@ -87,3 +87,317 @@ fn pcblib_round_trips_through_snxfpt() {
         "{report}"
     );
 }
+
+// --- display modes -----------------------------------------------------------
+
+fn symbols_of(lib: &SchLib, report: &mut Report) -> Vec<signex_library::primitive::symbol::Symbol> {
+    let text = symbol_file(lib, "t", report).to_toml_string().unwrap();
+    SymbolFile::from_toml_str(&text).unwrap().symbols
+}
+
+#[test]
+fn the_sample_multimode_symbol_keeps_both_bodies() {
+    let lib = SchLib::open(sample("simple.SchLib")).unwrap();
+    let src = lib
+        .components
+        .iter()
+        .find(|c| c.lib_reference == "Multimode 1")
+        .unwrap();
+    let modes: std::collections::BTreeSet<i32> = src.pins.iter().map(|p| p.display_mode).collect();
+    assert!(modes.contains(&0) && modes.contains(&1), "{modes:?}");
+    let mut report = Report::default();
+    let syms = symbols_of(&lib, &mut report);
+    let s = syms.iter().find(|s| s.name == "Multimode 1").unwrap();
+    let count = |style: u8| s.pins.iter().filter(|p| p.body_style == style).count();
+    assert_eq!(
+        count(1),
+        src.pins.iter().filter(|p| p.display_mode == 0).count()
+    );
+    assert_eq!(
+        count(2),
+        src.pins.iter().filter(|p| p.display_mode == 1).count()
+    );
+    assert!(
+        s.graphics.iter().any(|g| g.body_style == 2)
+            || s.graphics.iter().all(|g| g.body_style != 2)
+    );
+    assert!(
+        !report.entries().any(|(m, _)| m.contains("display mode")),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_third_display_mode_is_reported_and_dropped() {
+    let mut lib = SchLib::open(sample("simple.SchLib")).unwrap();
+    let c = lib
+        .components
+        .iter_mut()
+        .find(|c| c.lib_reference == "Multimode 1")
+        .unwrap();
+    let mut extra = c.pins[0].clone();
+    extra.display_mode = 2;
+    extra.designator = "X3".into();
+    c.pins.push(extra);
+    let before = c.pins.len() - 1;
+    let mut report = Report::default();
+    let syms = symbols_of(&lib, &mut report);
+    let s = syms.iter().find(|s| s.name == "Multimode 1").unwrap();
+    assert_eq!(s.pins.len(), before);
+    assert!(s.pins.iter().all(|p| p.number != "X3"));
+    let item = report
+        .items()
+        .iter()
+        .find(|i| i.code == "symbol.display_mode_dropped")
+        .unwrap();
+    assert_eq!(
+        item.severity,
+        signex_altium_convert::report::Severity::Dropped
+    );
+}
+
+#[test]
+fn an_item_for_no_particular_mode_belongs_to_both_bodies() {
+    let mut lib = SchLib::open(sample("simple.SchLib")).unwrap();
+    let c = lib
+        .components
+        .iter_mut()
+        .find(|c| c.lib_reference == "Multimode 1")
+        .unwrap();
+    c.pins[0].display_mode = -1;
+    let n = c.pins[0].designator.clone();
+    let mut report = Report::default();
+    let syms = symbols_of(&lib, &mut report);
+    let s = syms.iter().find(|s| s.name == "Multimode 1").unwrap();
+    assert_eq!(s.pins.iter().find(|p| p.number == n).unwrap().body_style, 0);
+}
+
+fn pin_with_edges(inner: u8, outer: u8) -> (SymbolFile, Report) {
+    let mut lib = SchLib::open(sample("simple.SchLib")).unwrap();
+    lib.components.truncate(1);
+    let pin = &mut lib.components[0].pins[0];
+    pin.display_mode = 0;
+    pin.symbols.inner_edge = inner;
+    pin.symbols.outer_edge = outer;
+    let mut report = Report::default();
+    (symbol_file(&lib, "t", &mut report), report)
+}
+
+#[test]
+fn clock_and_inversion_land_in_the_outside_edge_column() {
+    use signex_library::primitive::symbol::PinSymbolKind;
+    let (f, r) = pin_with_edges(3, 0);
+    let p = &f.symbols[0].pins[0];
+    assert_eq!(p.outside_edge_symbol, PinSymbolKind::ClockEdge);
+    assert_eq!(p.inside_edge_symbol, PinSymbolKind::None);
+    assert!(r.is_empty());
+    let (f, _) = pin_with_edges(0, 1);
+    assert_eq!(f.symbols[0].pins[0].outside_edge_symbol, PinSymbolKind::Dot);
+}
+
+#[test]
+fn a_pin_with_both_edge_symbols_keeps_the_dot_and_reports_the_loss() {
+    use signex_library::primitive::symbol::PinSymbolKind;
+    let (f, r) = pin_with_edges(3, 1);
+    assert_eq!(f.symbols[0].pins[0].outside_edge_symbol, PinSymbolKind::Dot);
+    let i = r
+        .items()
+        .iter()
+        .find(|i| i.code == "symbol.pin_decoration_merged")
+        .unwrap();
+    assert_eq!(
+        i.severity,
+        signex_altium_convert::report::Severity::Approximated
+    );
+}
+
+#[test]
+fn a_clock_beside_a_dot_is_kept_in_the_inside_edge_column() {
+    use signex_library::primitive::symbol::PinSymbolKind;
+    let (f, r) = pin_with_edges(3, 1);
+    let p = &f.symbols[0].pins[0];
+    assert_eq!(p.outside_edge_symbol, PinSymbolKind::Dot);
+    assert_eq!(p.inside_edge_symbol, PinSymbolKind::ClockEdge);
+    assert!(
+        r.items()
+            .iter()
+            .any(|i| i.code == "symbol.pin_decoration_merged")
+    );
+}
+
+#[test]
+fn hostile_pin_text_is_cleaned_and_the_file_still_round_trips() {
+    let mut lib = SchLib::open(sample("simple.SchLib")).unwrap();
+    lib.components.truncate(1);
+    let pin = &mut lib.components[0].pins[0];
+    pin.name = "A\tB'''C\n".into();
+    pin.designator = "1\r".into();
+    pin.description = "x\u{1}y".into();
+    let mut report = Report::default();
+    let f = symbol_file(&lib, "t", &mut report);
+    let text = f.to_toml_string().unwrap();
+    let back = SymbolFile::from_toml_str(&text).unwrap();
+    assert_eq!(
+        back.symbols[0].pins[0].name,
+        "A B\u{2019}\u{2019}\u{2019}C "
+    );
+    assert!(
+        report
+            .items()
+            .iter()
+            .any(|i| i.code == "symbol.text_sanitized")
+    );
+}
+
+#[test]
+fn a_slotted_pad_is_written_exactly_and_reported_once_per_footprint() {
+    let mut lib = PcbLib::open(sample("Simple.PcbLib")).unwrap();
+    let fp = lib
+        .footprints
+        .iter_mut()
+        .find(|f| f.name == "Four pads")
+        .unwrap();
+    for pad in fp.primitives.pads.iter_mut().take(2) {
+        pad.hole = 40.0;
+        pad.plated = true;
+        pad.hole_shape = altium_format::pcb::HoleShape::Slot;
+        pad.slot_length = 80.0;
+    }
+    let mut report = Report::default();
+    let file = footprint_file(&lib, "Simple", &mut report);
+    let back = FootprintFile::from_toml_str(&file.to_toml_string().unwrap()).unwrap();
+    let four = back
+        .footprints
+        .iter()
+        .find(|f| f.name == "Four pads")
+        .unwrap();
+    let slotted: Vec<_> = four
+        .pads
+        .iter()
+        .filter_map(|p| p.drill.clone())
+        .filter(|d| d.slot_length.is_some())
+        .collect();
+    assert_eq!(slotted.len(), 2);
+    assert!((slotted[0].diameter - 1.016).abs() < 1e-6);
+    assert!((slotted[0].slot_length.unwrap() - 2.032).abs() < 1e-6);
+    let items: Vec<_> = report
+        .items()
+        .iter()
+        .filter(|i| i.code == "pad.slot_not_placeable")
+        .collect();
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].severity,
+        signex_altium_convert::report::Severity::Approximated
+    );
+    assert!(items[0].message.contains("#3128"));
+}
+
+#[test]
+fn an_octagonal_pad_is_a_placeable_custom_outline() {
+    let mut lib = PcbLib::open(sample("Simple.PcbLib")).unwrap();
+    let fp = lib
+        .footprints
+        .iter_mut()
+        .find(|f| f.name == "Four pads")
+        .unwrap();
+    fp.primitives.pads[0].shape_top = altium_format::pcb::PadShape::Octagonal;
+    let mut report = Report::default();
+    let file = footprint_file(&lib, "Simple", &mut report);
+    let back = FootprintFile::from_toml_str(&file.to_toml_string().unwrap()).unwrap();
+    let four = back
+        .footprints
+        .iter()
+        .find(|f| f.name == "Four pads")
+        .unwrap();
+    let PadShape::Custom(poly) = &four.pads[0].shape else {
+        panic!("{:?}", four.pads[0].shape)
+    };
+    assert_eq!(poly.points.len(), 8);
+    let held = signex_library::drawn_board_footprint(four);
+    assert!(held.unheld_pads.is_empty(), "{:?}", held.unheld_pads);
+    assert!(
+        report
+            .items()
+            .iter()
+            .any(|i| i.code == "footprint.pad_octagon_custom")
+    );
+}
+
+#[test]
+fn symbol_beziers_and_rounded_rectangles_keep_their_shape() {
+    use altium_format::sch::Shape;
+    use signex_library::primitive::symbol::SymbolGraphicKind;
+    let mut lib = SchLib::open(sample("simple.SchLib")).unwrap();
+    lib.components.truncate(1);
+    let pts = |n: usize| {
+        (0..n)
+            .map(|i| altium_format::sch::Pt::new(i as f64 * 10.0, (i % 2) as f64 * 10.0))
+            .collect::<Vec<_>>()
+    };
+    let c = &mut lib.components[0];
+    c.shapes.clear();
+    c.shapes.push((
+        -1,
+        0,
+        Shape::Bezier {
+            points: pts(4),
+            width: 10.0,
+        },
+    ));
+    c.shapes.push((
+        -1,
+        0,
+        Shape::Bezier {
+            points: pts(7),
+            width: 10.0,
+        },
+    ));
+    c.shapes.push((
+        -1,
+        0,
+        Shape::Bezier {
+            points: pts(5),
+            width: 10.0,
+        },
+    ));
+    c.shapes.push((
+        -1,
+        0,
+        Shape::RoundRect {
+            a: altium_format::sch::Pt::new(0.0, 0.0),
+            b: altium_format::sch::Pt::new(100.0, 50.0),
+            rx: 10.0,
+            ry: 10.0,
+            width: 10.0,
+            filled: false,
+        },
+    ));
+    let mut report = Report::default();
+    let syms = symbols_of(&lib, &mut report);
+    let g = &syms[0].graphics;
+    let beziers = g
+        .iter()
+        .filter(|x| matches!(x.kind, SymbolGraphicKind::Bezier { .. }))
+        .count();
+    assert_eq!(
+        beziers, 3,
+        "one curve, two joined curves, and not the 5-point run"
+    );
+    assert!(g.iter().any(|x| matches!(x.kind, SymbolGraphicKind::RoundRectangle { corner_radius, .. } if (corner_radius - 0.254).abs() < 1e-9)));
+    // Only the 5-point run falls back, once, with its own code.
+    assert_eq!(
+        report
+            .items()
+            .iter()
+            .filter(|i| i.code == "symbol.bezier_polygon")
+            .count(),
+        1
+    );
+    assert!(
+        !report
+            .items()
+            .iter()
+            .any(|i| i.code == "symbol.rounded_rect_radius")
+    );
+}

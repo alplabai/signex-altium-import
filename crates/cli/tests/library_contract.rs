@@ -1,0 +1,870 @@
+//! `describe` and `library` against the Signex library converter schema.
+
+mod common;
+use common::{Tmp, run, sample, schema};
+use serde_json::Value;
+use signex_altium_convert::paths::canonical;
+use std::ffi::OsStr;
+
+fn lines(stdout: &[u8]) -> Vec<Value> {
+    String::from_utf8(stdout.to_vec())
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON: {l}: {e}")))
+        .collect()
+}
+
+fn os(s: &str) -> &OsStr {
+    OsStr::new(s)
+}
+
+#[test]
+fn describe_validates_against_the_schema() {
+    let o = run(&[os("describe"), os("--json")]);
+    assert_eq!(o.status.code(), Some(0));
+    let v = lines(&o.stdout);
+    assert_eq!(v.len(), 1);
+    let d = &v[0];
+    schema().validate(d).expect("describe matches schema");
+    assert_eq!(d["contract"], "1.0");
+    assert_eq!(d["converter"], "signex-altium-import");
+    let kind = |ext: &str| {
+        d["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["extensions"][0] == ext)
+            .unwrap_or_else(|| panic!("no {ext}"))["kind"]
+            .clone()
+    };
+    for ext in ["schlib", "pcblib", "intlib"] {
+        assert_eq!(kind(ext), "library");
+    }
+    assert_eq!(kind("dblib"), "database");
+}
+
+#[test]
+fn dry_run_streams_valid_events_and_writes_only_the_report() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    let o = run(&[
+        os("library"),
+        sample("simple.SchLib").as_os_str(),
+        sample("Simple.PcbLib").as_os_str(),
+        os("--output"),
+        dir.as_os_str(),
+        os("--dry-run"),
+        os("--progress"),
+    ]);
+    let ev = lines(&o.stdout);
+    let v = schema();
+    for e in &ev {
+        v.validate(e).unwrap_or_else(|er| panic!("{e}: {er}"));
+    }
+    assert_eq!(ev[0]["event"], "phase");
+    assert_eq!(ev[0]["phase"], "read");
+    let phases: Vec<_> = ev
+        .iter()
+        .filter(|e| e["event"] == "phase")
+        .map(|e| e["phase"].as_str().unwrap())
+        .collect();
+    assert_eq!(phases, ["read", "convert"]);
+    let s = ev.last().unwrap();
+    assert_eq!(s["event"], "summary");
+    assert_eq!(s["ok"], true);
+    assert!(["ok", "partial"].contains(&s["exit"].as_str().unwrap()));
+    let want = if s["exit"] == "ok" { 0 } else { 2 };
+    assert_eq!(o.status.code(), Some(want));
+    assert_eq!(s["files"], serde_json::json!([]));
+
+    // Only the report is written, and the summary points inside --output.
+    let mut names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["import-report.json", "import-report.md"]);
+    // The converter reports plain paths (no `\\?\` prefix on Windows);
+    // compare against the same form.
+    let canon = canonical(&dir).unwrap();
+    assert!(std::path::Path::new(s["report"].as_str().unwrap()).starts_with(&canon));
+
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("import-report.json")).unwrap()).unwrap();
+    v.validate(&report).expect("report matches schema");
+    assert_eq!(report["sources"].as_array().unwrap().len(), 2);
+    assert!(report["counts"]["source"]["symbols"].as_u64().unwrap() > 0);
+    assert!(report["counts"]["source"]["footprints"].as_u64().unwrap() > 0);
+    // Every item carries a catalogued, well-formed code.
+    for i in report["items"].as_array().unwrap() {
+        assert!(i["code"].as_str().unwrap().contains('.'));
+        assert!(i["source"].as_str().is_some());
+    }
+}
+
+/// `f` has a directory named `dir` among its components.
+fn in_dir(f: &str, dir: &str) -> bool {
+    let p = std::path::Path::new(f);
+    p.parent()
+        .is_some_and(|parent| parent.components().any(|c| c.as_os_str() == dir))
+}
+
+fn library_run(dir: &std::path::Path, extra: &[&str]) -> (std::process::Output, Value) {
+    let (sch, pcb) = (sample("simple.SchLib"), sample("Simple.PcbLib"));
+    let mut args = vec![
+        os("library"),
+        sch.as_os_str(),
+        pcb.as_os_str(),
+        os("--output"),
+        dir.as_os_str(),
+        os("--json"),
+    ];
+    args.extend(extra.iter().map(|a| os(a)));
+    let o = run(&args);
+    let s = lines(&o.stdout).pop().expect("a summary");
+    schema().validate(&s).expect("summary matches schema");
+    (o, s)
+}
+
+fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(
+        root: &std::path::Path,
+        d: &std::path::Path,
+        out: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
+        for e in std::fs::read_dir(d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else {
+                out.insert(
+                    p.strip_prefix(root).unwrap().display().to_string(),
+                    std::fs::read(&p).unwrap(),
+                );
+            }
+        }
+    }
+    let mut out = Default::default();
+    walk(dir, dir, &mut out);
+    out
+}
+
+#[test]
+fn a_real_run_writes_a_library_report_and_summary() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    let (o, s) = library_run(&dir, &["--name", "Samples"]);
+    assert_eq!(s["ok"], true);
+    assert!([0, 2].contains(&o.status.code().unwrap()));
+    assert_eq!(
+        s["exit"],
+        if o.status.code() == Some(0) {
+            "ok"
+        } else {
+            "partial"
+        }
+    );
+    // The converter reports plain paths (no `\\?\` prefix on Windows);
+    // compare against the same form.
+    let canon = canonical(&dir).unwrap();
+    let files: Vec<String> = s["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap().to_string())
+        .collect();
+    assert!(files.iter().any(|f| f.ends_with("samples.snxlib")));
+    assert!(
+        files
+            .iter()
+            .any(|f| in_dir(f, "symbols") && f.ends_with(".snxsym"))
+    );
+    assert!(
+        files
+            .iter()
+            .any(|f| in_dir(f, "footprints") && f.ends_with(".snxfpt"))
+    );
+    for f in &files {
+        assert!(
+            std::path::Path::new(f).starts_with(&canon) && std::path::Path::new(f).is_file(),
+            "{f}"
+        );
+        // A written path is in the platform's own separators, never a
+        // `/`-separated library path joined onto a Windows folder.
+        assert!(!cfg!(windows) || !f.contains('/'), "{f}");
+    }
+    assert!(s["counts"]["parts"].as_u64().unwrap() > 0);
+    assert_eq!(
+        s["counts"]["parts"].as_u64().unwrap() + s["counts"]["skipped"].as_u64().unwrap(),
+        serde_json::from_slice::<Value>(&std::fs::read(dir.join("import-report.json")).unwrap())
+            .unwrap()["counts"]["source"]["parts"]
+            .as_u64()
+            .unwrap()
+    );
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("import-report.json")).unwrap()).unwrap();
+    schema().validate(&report).unwrap();
+    assert!(report["library_id"].as_str().is_some());
+    assert!(dir.join("import-report.md").is_file());
+}
+
+#[test]
+fn a_second_run_into_a_fresh_directory_is_byte_identical() {
+    let out = Tmp::new();
+    let (a, b) = (out.0.join("a"), out.0.join("b"));
+    library_run(&a, &[]);
+    library_run(&b, &[]);
+    let (mut ta, mut tb) = (tree(&a), tree(&b));
+    // The report names its sources and start time; the library is the contract.
+    for t in [&mut ta, &mut tb] {
+        t.remove("import-report.json");
+        t.remove("import-report.md");
+    }
+    assert_eq!(ta, tb);
+}
+
+#[test]
+fn update_over_the_same_source_changes_nothing() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    library_run(&dir, &[]);
+    let before = tree(&dir);
+    let (_, s) = library_run(&dir, &["--update"]);
+    assert_eq!(s["ok"], true);
+    let mut after = tree(&dir);
+    let mut before = before;
+    for t in [&mut before, &mut after] {
+        t.remove("import-report.json");
+        t.remove("import-report.md");
+    }
+    assert_eq!(before, after);
+}
+
+#[test]
+fn update_refuses_a_different_library_and_leaves_it_alone() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    library_run(
+        &dir,
+        &["--library-id", "5b0f3b0e-0000-4000-8000-000000000001"],
+    );
+    let before = tree(&dir);
+    let (o, s) = library_run(
+        &dir,
+        &[
+            "--update",
+            "--library-id",
+            "5b0f3b0e-0000-4000-8000-000000000002",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(s["ok"], false);
+    assert!(s["error"].as_str().unwrap().contains("id"));
+    let mut after = tree(&dir);
+    let mut before = before;
+    for t in [&mut before, &mut after] {
+        t.remove("import-report.json");
+        t.remove("import-report.md");
+    }
+    assert_eq!(before, after, "the library on disk is untouched");
+}
+
+const ID: &str = "5b0f3b0e-0000-4000-8000-0000000000aa";
+
+fn snxlib_path(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "snxlib"))
+        .unwrap()
+}
+
+#[test]
+fn an_update_keeps_a_row_and_a_footprint_file_a_user_added() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    library_run(&dir, &["--library-id", ID]);
+    // A user adds a part row (a copy of ours under a new id and number) and a
+    // footprint file of their own.
+    let lib = snxlib_path(&dir);
+    let text = std::fs::read_to_string(&lib).unwrap();
+    let row = text
+        .lines()
+        .find(|l| l.len() > 40 && l.as_bytes()[8] == b'-' && l.split('\t').count() > 20)
+        .unwrap()
+        .to_string();
+    let cells: Vec<&str> = row.split('\t').collect();
+    let mut mine = cells.clone();
+    let user_id = "ffffffff-0000-4000-8000-000000000001";
+    mine[0] = user_id;
+    mine[1] = "USER-PART";
+    let user_row = mine.join("\t");
+    std::fs::write(&lib, text.replacen(&row, &format!("{row}\n{user_row}"), 1)).unwrap();
+    let fps = dir.join("footprints");
+    let real = std::fs::read_dir(&fps)
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    let user_fp = fps.join("ffffffff-0000-4000-8000-000000000002.snxfpt");
+    std::fs::copy(&real, &user_fp).unwrap();
+    let user_fp_bytes = std::fs::read(&user_fp).unwrap();
+
+    let (_, s) = library_run(&dir, &["--update", "--library-id", ID]);
+    assert_eq!(s["ok"], true, "{s}");
+    let after = std::fs::read_to_string(snxlib_path(&dir)).unwrap();
+    assert!(
+        after.contains(user_id) && after.contains("USER-PART"),
+        "user row kept"
+    );
+    assert_eq!(
+        std::fs::read(&user_fp).unwrap(),
+        user_fp_bytes,
+        "user file untouched"
+    );
+    // Our own rows are still there once each.
+    assert_eq!(after.matches(cells[0]).count(), 1);
+    // The record names only what we wrote.
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("import-report.json")).unwrap()).unwrap();
+    assert!(!report["ledger"]["rows"].to_string().contains(user_id));
+    assert!(!report["ledger"]["files"].to_string().contains("ffffffff"));
+}
+
+fn run_with(
+    dir: &std::path::Path,
+    inputs: &[&str],
+    extra: &[&str],
+) -> (std::process::Output, Value) {
+    let paths: Vec<_> = inputs.iter().map(|i| sample(i)).collect();
+    let mut args: Vec<&OsStr> = vec![os("library")];
+    args.extend(paths.iter().map(|p| p.as_os_str()));
+    args.extend([
+        os("--output"),
+        dir.as_os_str(),
+        os("--json"),
+        os("--library-id"),
+        os(ID),
+    ]);
+    args.extend(extra.iter().map(|a| os(a)));
+    let o = run(&args);
+    let s = lines(&o.stdout).pop().expect("a summary");
+    (o, s)
+}
+
+#[test]
+fn an_update_deletes_what_left_the_source_but_only_by_a_valid_record() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib", "Simple.PcbLib"], &[]);
+    let count = || std::fs::read_dir(dir.join("footprints")).unwrap().count();
+    let with_fp = count();
+    assert!(with_fp > 0);
+
+    // A tampered record deletes nothing.
+    let rp = dir.join("import-report.json");
+    let mut report: Value = serde_json::from_slice(&std::fs::read(&rp).unwrap()).unwrap();
+    report["ledger"]["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(Value::String("../victim.snxlib".into()));
+    std::fs::write(&rp, report.to_string()).unwrap();
+    let victim = out.0.join("victim.snxlib");
+    std::fs::write(&victim, "keep").unwrap();
+    let (_, s) = run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(count(), with_fp, "no valid record, nothing deleted");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+}
+
+#[test]
+fn an_update_deletes_what_it_wrote_that_left_the_source() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib", "Simple.PcbLib"], &[]);
+    let count = || std::fs::read_dir(dir.join("footprints")).unwrap().count();
+    assert!(count() > 0);
+    let user = dir.join("footprints/ffffffff-0000-4000-8000-000000000002.snxfpt");
+    let real = std::fs::read_dir(dir.join("footprints"))
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path();
+    std::fs::copy(real, &user).unwrap();
+    let (_, s) = run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(count(), 1, "ours are gone, the user's stays");
+    assert!(user.exists());
+}
+
+#[test]
+fn update_needs_a_library_in_the_directory() {
+    let out = Tmp::new();
+    let (o, s) = library_run(&out.0, &["--update"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(s["error"].as_str().unwrap().contains(".snxlib"));
+}
+
+#[test]
+fn bad_input_fails_with_a_summary() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    #[allow(clippy::single_element_loop)]
+    for input in ["x.txt"] {
+        let o = run(&[
+            os("library"),
+            os(input),
+            os("--output"),
+            dir.as_os_str(),
+            os("--json"),
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{input}");
+        let s = lines(&o.stdout).pop().unwrap();
+        schema().validate(&s).unwrap();
+        assert_eq!(s["ok"], false, "{input}");
+    }
+    assert!(!dir.exists(), "nothing is written for rejected inputs");
+}
+
+#[test]
+fn unknown_option_exits_1_with_a_failed_summary() {
+    let o = run(&[
+        os("library"),
+        sample("simple.SchLib").as_os_str(),
+        os("--output"),
+        os("/nonexistent/out"),
+        os("--frobnicate"),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let s = lines(&o.stdout).pop().unwrap();
+    schema().validate(&s).unwrap();
+    assert_eq!(s["ok"], false);
+    assert_eq!(s["exit"], "failed");
+    assert!(s["error"].as_str().unwrap().contains("--frobnicate"));
+}
+
+#[test]
+fn a_non_empty_output_is_refused_without_update() {
+    let out = Tmp::new();
+    std::fs::write(out.0.join("keep.txt"), "x").unwrap();
+    let o = run(&[
+        os("library"),
+        sample("simple.SchLib").as_os_str(),
+        os("--output"),
+        out.0.as_os_str(),
+        os("--dry-run"),
+        os("--json"),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(out.0.join("keep.txt").is_file());
+    assert!(!out.0.join("import-report.json").exists());
+}
+
+#[test]
+fn bad_library_id_is_refused() {
+    let out = Tmp::new();
+    let o = run(&[
+        os("library"),
+        sample("simple.SchLib").as_os_str(),
+        os("--output"),
+        out.0.join("o").as_os_str(),
+        os("--library-id"),
+        os("nope"),
+        os("--json"),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let s = lines(&o.stdout).pop().unwrap();
+    assert!(s["error"].as_str().unwrap().contains("UUID"));
+}
+
+#[test]
+fn an_unreadable_input_fails_and_is_reported() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    let o = run(&[
+        os("library"),
+        os("nonexistent.SchLib"),
+        os("--output"),
+        dir.as_os_str(),
+        os("--json"),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let s = lines(&o.stdout).pop().unwrap();
+    schema().validate(&s).unwrap();
+    assert_eq!(s["ok"], false);
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("import-report.json")).unwrap()).unwrap();
+    schema().validate(&report).unwrap();
+    assert_eq!(report["items"][0]["code"], "library.input_unreadable");
+    assert_eq!(report["items"][0]["severity"], "error");
+}
+
+fn broken_input(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let p = dir.join(name);
+    std::fs::write(&p, bytes).unwrap();
+    p
+}
+
+#[test]
+fn damaged_inputs_fail_with_a_summary_not_a_crash() {
+    let out = Tmp::new();
+    let whole = std::fs::read(sample("simple.SchLib")).unwrap();
+    let cases = [
+        ("truncated.SchLib", whole[..whole.len() / 3].to_vec()),
+        (
+            "garbage.SchLib",
+            (0..4096u32).map(|i| (i * 31 % 251) as u8).collect(),
+        ),
+        ("empty.PcbLib", Vec::new()),
+    ];
+    for (name, bytes) in cases {
+        let input = broken_input(&out.0, name, &bytes);
+        let dir = out.0.join(format!("out-{name}"));
+        let o = run(&[
+            os("library"),
+            input.as_os_str(),
+            os("--output"),
+            dir.as_os_str(),
+            os("--json"),
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{name}");
+        let s = lines(&o.stdout).pop().unwrap();
+        schema().validate(&s).unwrap();
+        assert_eq!(s["ok"], false, "{name}");
+        assert_eq!(s["exit"], "failed", "{name}");
+        assert!(dir.join("import-report.json").is_file(), "{name}");
+    }
+}
+
+#[test]
+fn update_needs_an_existing_directory() {
+    let out = Tmp::new();
+    let file = out.0.join("a-file");
+    std::fs::write(&file, "x").unwrap();
+    for target in [out.0.join("missing"), file] {
+        let o = run(&[
+            os("library"),
+            sample("simple.SchLib").as_os_str(),
+            os("--output"),
+            target.as_os_str(),
+            os("--update"),
+            os("--json"),
+        ]);
+        assert_eq!(o.status.code(), Some(1));
+        let s = lines(&o.stdout).pop().unwrap();
+        assert!(s["error"].as_str().unwrap().contains("--update"));
+    }
+}
+
+#[test]
+fn a_path_named_like_a_command_is_an_input() {
+    let out = Tmp::new();
+    std::fs::write(out.0.join("describe"), "x").unwrap();
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_signex-altium-import"))
+        .current_dir(&out.0)
+        .args(["describe", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let s = lines(&o.stdout).pop().unwrap();
+    // The single-file summary, not a describe object.
+    assert!(s.get("project").is_some() && s.get("contract").is_none());
+}
+
+#[test]
+fn update_fails_on_a_part_row_it_cannot_read_back() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    library_run(&dir, &[]);
+    let lib = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "snxlib"))
+        .unwrap();
+    let text = std::fs::read_to_string(&lib).unwrap();
+    assert!(text.contains("\tDraft\t"));
+    std::fs::write(&lib, text.replacen("\tDraft\t", "\tBogus\t", 1)).unwrap();
+    let before = tree(&dir);
+    let (o, s) = library_run(&dir, &["--update"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(s["error"].as_str().unwrap().contains("unreadable state"));
+    let (mut a, mut b) = (before, tree(&dir));
+    for t in [&mut a, &mut b] {
+        t.remove("import-report.json");
+        t.remove("import-report.md");
+    }
+    assert_eq!(a, b);
+}
+
+#[test]
+fn two_inputs_with_one_file_name_are_refused() {
+    let out = Tmp::new();
+    let one = sample("simple.SchLib");
+    let o = run(&[
+        os("library"),
+        one.as_os_str(),
+        one.as_os_str(),
+        os("--output"),
+        out.0.join("o").as_os_str(),
+        os("--json"),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let s = lines(&o.stdout).pop().unwrap();
+    assert!(s["error"].as_str().unwrap().contains("same kind"));
+}
+
+#[cfg(unix)]
+#[test]
+fn update_never_deletes_or_reads_through_symlinks() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    library_run(&dir, &[]);
+    let victim = out.0.join("victim.txt");
+    std::fs::write(&victim, "keep").unwrap();
+    let outside_dir = out.0.join("outside");
+    std::fs::create_dir(&outside_dir).unwrap();
+    let outside_fp = outside_dir.join("00000000-0000-0000-0000-0000000000aa.snxfpt");
+    std::fs::write(&outside_fp, "keep").unwrap();
+    // A symlinked envelope, a symlinked folder entry, and odd names that are
+    // not of the expected forms.
+    let fps = dir.join("footprints");
+    std::os::unix::fs::symlink(
+        &victim,
+        fps.join("00000000-0000-0000-0000-0000000000bb.snxfpt"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&victim, dir.join("symbols/evil.snxsym")).unwrap();
+    std::fs::write(fps.join("not-a-uuid.snxfpt"), "keep").unwrap();
+    std::fs::write(dir.join("symbols/notes.txt"), "keep").unwrap();
+    let (_, s) = library_run(&dir, &["--update"]);
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+    assert!(outside_fp.exists());
+    // Not of the expected form: not ours to delete.
+    assert!(fps.join("not-a-uuid.snxfpt").exists());
+    assert!(dir.join("symbols/notes.txt").exists());
+    // The symlinks themselves are left alone too.
+    assert!(
+        std::fs::symlink_metadata(dir.join("symbols/evil.snxsym"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn update_with_a_symlinked_folder_does_not_walk_it() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    library_run(&dir, &[]);
+    let elsewhere = out.0.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let stale = elsewhere.join("00000000-0000-0000-0000-0000000000cc.snxfpt");
+    std::fs::write(&stale, "keep").unwrap();
+    std::fs::remove_dir_all(dir.join("footprints")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, dir.join("footprints")).unwrap();
+    let (o, _) = library_run(&dir, &["--update"]);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "writing through a symlinked folder is refused"
+    );
+    assert!(stale.exists());
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1);
+}
+
+#[test]
+fn an_intlib_input_converts_with_released_parts_and_models() {
+    let out = Tmp::new();
+    let packed = altium_format::intlib::pack(
+        Some(&std::fs::read(sample("simple.SchLib")).unwrap()),
+        Some(&std::fs::read(sample("Simple.PcbLib")).unwrap()),
+        None,
+    )
+    .unwrap();
+    let input = out.0.join("Packed.IntLib");
+    std::fs::write(&input, packed).unwrap();
+    let dir = out.0.join("lib");
+    let o = run(&[
+        os("library"),
+        input.as_os_str(),
+        os("--output"),
+        dir.as_os_str(),
+        os("--json"),
+    ]);
+    let s = lines(&o.stdout).pop().unwrap();
+    schema().validate(&s).unwrap();
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(s["counts"]["models"], 2);
+    assert!(
+        std::fs::read_to_string(snxlib_path(&dir))
+            .unwrap()
+            .contains("\tReleased\t")
+    );
+    // Without models, none are written.
+    let dir2 = out.0.join("lib2");
+    let o = run(&[
+        os("library"),
+        input.as_os_str(),
+        os("--output"),
+        dir2.as_os_str(),
+        os("--models"),
+        os("skip"),
+        os("--json"),
+    ]);
+    let s = lines(&o.stdout).pop().unwrap();
+    assert_eq!(s["counts"]["models"], 0);
+}
+
+fn first_row(text: &str) -> String {
+    text.lines()
+        .find(|l| l.len() > 40 && l.as_bytes()[8] == b'-' && l.split('\t').count() > 20)
+        .unwrap()
+        .to_string()
+}
+
+fn footprint_stems(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir.join("footprints"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path().file_stem().unwrap().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn an_update_does_not_overwrite_a_symbol_file_the_user_put_there() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib"], &[]);
+    let user = dir.join("symbols/simple.snxsym");
+    let mine = std::fs::read_to_string(&user).unwrap();
+    let theirs = mine.replacen("display_name = \"simple\"", "display_name = \"theirs\"", 1);
+    assert_ne!(mine, theirs);
+    std::fs::write(&user, &theirs).unwrap();
+    // No record of what was written: the file is not ours.
+    std::fs::remove_file(dir.join("import-report.json")).unwrap();
+    let (_, s) = run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(std::fs::read_to_string(&user).unwrap(), theirs);
+    let names: Vec<String> = std::fs::read_dir(dir.join("symbols"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}: ours went to a uuid name");
+}
+
+#[test]
+fn an_update_keeps_a_ledgered_footprint_a_kept_row_still_uses() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib", "Simple.PcbLib"], &[]);
+    let stems = footprint_stems(&dir);
+    let used = stems[0].clone();
+    let lib = snxlib_path(&dir);
+    let text = std::fs::read_to_string(&lib).unwrap();
+    let row = first_row(&text);
+    let mut c: Vec<String> = row.split('\t').map(str::to_string).collect();
+    c[0] = "ffffffff-0000-4000-8000-000000000001".into();
+    c[1] = "USER-USES-FP".into();
+    c[6] = format!(r#"{{"library_id":"{ID}","uuid":"{used}"}}"#);
+    std::fs::write(
+        &lib,
+        text.replacen(&row, &format!("{row}\n{}", c.join("\t")), 1),
+    )
+    .unwrap();
+    let (_, s) = run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(
+        footprint_stems(&dir),
+        vec![used.clone()],
+        "only the used one stays"
+    );
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("import-report.json")).unwrap()).unwrap();
+    assert!(
+        report["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "library.kept_referenced")
+    );
+    assert!(
+        report["ledger"]["files"].to_string().contains(&used),
+        "still ours"
+    );
+}
+
+#[test]
+fn an_update_refuses_a_part_number_a_user_row_already_holds() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib"], &[]);
+    let lib = snxlib_path(&dir);
+    let text = std::fs::read_to_string(&lib).unwrap();
+    let row = first_row(&text);
+    let mut c: Vec<String> = row.split('\t').map(str::to_string).collect();
+    c[0] = "ffffffff-0000-4000-8000-000000000001".into(); // same part number as ours
+    std::fs::write(
+        &lib,
+        text.replacen(&row, &format!("{row}\n{}", c.join("\t")), 1),
+    )
+    .unwrap();
+    let before = std::fs::read(&lib).unwrap();
+    let (o, s) = run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(s["error"].as_str().unwrap().contains("part number"), "{s}");
+    assert_eq!(std::fs::read(&lib).unwrap(), before);
+}
+
+#[test]
+fn an_update_deletes_a_ledgered_file_only_while_its_bytes_still_match() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib", "Simple.PcbLib"], &[]);
+    let stems = footprint_stems(&dir);
+    let edited = dir.join(format!("footprints/{}.snxfpt", stems[0]));
+    let mut t = std::fs::read_to_string(&edited).unwrap();
+    t.push('\n');
+    std::fs::write(&edited, &t).unwrap();
+    let (_, s) = run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(s["ok"], true, "{s}");
+    assert_eq!(footprint_stems(&dir), vec![stems[0].clone()]);
+    assert_eq!(std::fs::read_to_string(&edited).unwrap(), t);
+    let report: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("import-report.json")).unwrap()).unwrap();
+    assert!(
+        report["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["code"] == "library.kept_edited")
+    );
+}
+
+#[test]
+fn an_update_keeps_the_library_name_unless_asked() {
+    let out = Tmp::new();
+    let dir = out.0.join("lib");
+    run_with(&dir, &["simple.SchLib"], &["--name", "First"]);
+    let name = |d: &std::path::Path| {
+        std::fs::read_to_string(snxlib_path(d))
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with("name = "))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(name(&dir), "name = \"First\"");
+    run_with(&dir, &["simple.SchLib"], &["--update"]);
+    assert_eq!(name(&dir), "name = \"First\"", "no --name: kept");
+    run_with(&dir, &["simple.SchLib"], &["--update", "--name", "Second"]);
+    assert_eq!(name(&dir), "name = \"Second\"");
+}
