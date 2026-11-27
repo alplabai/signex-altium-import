@@ -3,6 +3,7 @@
 mod common;
 use common::{Tmp, run, sample, schema};
 use serde_json::Value;
+use signex_altium_convert::paths::canonical;
 use std::ffi::OsStr;
 
 fn lines(stdout: &[u8]) -> Vec<Value> {
@@ -83,7 +84,9 @@ fn dry_run_streams_valid_events_and_writes_only_the_report() {
         .collect();
     names.sort();
     assert_eq!(names, ["import-report.json", "import-report.md"]);
-    let canon = dir.canonicalize().unwrap();
+    // The converter reports plain paths (no `\\?\` prefix on Windows);
+    // compare against the same form.
+    let canon = canonical(&dir).unwrap();
     assert!(std::path::Path::new(s["report"].as_str().unwrap()).starts_with(&canon));
 
     let report: Value =
@@ -161,7 +164,9 @@ fn a_real_run_writes_a_library_report_and_summary() {
             "partial"
         }
     );
-    let canon = dir.canonicalize().unwrap();
+    // The converter reports plain paths (no `\\?\` prefix on Windows);
+    // compare against the same form.
+    let canon = canonical(&dir).unwrap();
     let files: Vec<String> = s["files"]
         .as_array()
         .unwrap()
@@ -184,6 +189,9 @@ fn a_real_run_writes_a_library_report_and_summary() {
             std::path::Path::new(f).starts_with(&canon) && std::path::Path::new(f).is_file(),
             "{f}"
         );
+        // A written path is in the platform's own separators, never a
+        // `/`-separated library path joined onto a Windows folder.
+        assert!(!cfg!(windows) || !f.contains('/'), "{f}");
     }
     assert!(s["counts"]["parts"].as_u64().unwrap() > 0);
     assert_eq!(
