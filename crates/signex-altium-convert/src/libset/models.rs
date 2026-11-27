@@ -253,7 +253,7 @@ fn from_dir(
         format!("{base}.step"),
         format!("{base}.stp"),
     ];
-    let dir = dir.canonicalize().ok()?;
+    let dir = crate::paths::canonical(dir).ok()?;
     let mut hits: Vec<(usize, std::path::PathBuf)> = std::fs::read_dir(&dir)
         .ok()?
         .flatten()
@@ -265,7 +265,7 @@ fn from_dir(
         .collect();
     hits.sort();
     let (_, path) = hits.into_iter().next()?;
-    if !path.canonicalize().ok()?.starts_with(&dir) {
+    if !crate::paths::canonical(&path).ok()?.starts_with(&dir) {
         return None;
     }
     let len = std::fs::metadata(&path).ok()?.len();

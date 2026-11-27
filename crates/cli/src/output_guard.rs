@@ -19,7 +19,8 @@ pub struct Guard {
 impl Guard {
     pub fn new(root: &Path) -> Self {
         Guard {
-            root: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+            root: signex_altium_convert::paths::canonical(root)
+                .unwrap_or_else(|_| root.to_path_buf()),
             undo: Vec::new(),
             committed: false,
         }

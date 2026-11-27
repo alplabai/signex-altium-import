@@ -243,7 +243,7 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
     // The previous run's record of what it wrote. It stays in the report of a
     // run that fails or writes nothing, so a retry still knows what is ours.
     if args.update
-        && let Ok(canon) = args.output.canonicalize()
+        && let Ok(canon) = signex_altium_convert::paths::canonical(&args.output)
     {
         doc.ledger = Ledger::read(&canon);
     }
@@ -258,7 +258,7 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
     for (i, (path, kind)) in args.inputs.iter().zip(&kinds).enumerate() {
         let name = stem(path);
         progress.progress(i, Some(args.inputs.len()), Some(&name));
-        let abs = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let abs = signex_altium_convert::paths::canonical(path).unwrap_or_else(|_| path.clone());
         if *kind == Source::DbLib {
             match crate::library_db::read_database(
                 args,
@@ -381,9 +381,7 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
     let mut existing = None;
     let mut usable: Option<Ledger> = None;
     if args.update {
-        let canon = args
-            .output
-            .canonicalize()
+        let canon = signex_altium_convert::paths::canonical(&args.output)
             .unwrap_or_else(|_| args.output.clone());
         match existing_library(&canon) {
             Ok((path, lib)) => {
@@ -482,9 +480,7 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
             }
             Err(e) => return write_report(args, &doc, Some(format!("--update: {e}")), Vec::new()),
         }
-        let canon = args
-            .output
-            .canonicalize()
+        let canon = signex_altium_convert::paths::canonical(&args.output)
             .unwrap_or_else(|_| args.output.clone());
         if let Err(e) = avoid_user_files(&mut files, &canon, usable.as_ref()) {
             return write_report(args, &doc, Some(format!("--update: {e}")), Vec::new());
@@ -497,7 +493,8 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
         return write_report(args, &doc, None, Vec::new());
     }
     progress.phase("write", Some(files.len()));
-    let dir = match std::fs::create_dir_all(&args.output).and_then(|()| args.output.canonicalize())
+    let dir = match std::fs::create_dir_all(&args.output)
+        .and_then(|()| signex_altium_convert::paths::canonical(&args.output))
     {
         Ok(d) => d,
         Err(e) => {
@@ -719,7 +716,7 @@ fn write_report(
     if let Err(e) = std::fs::create_dir_all(dir) {
         return LibrarySummary::failed(format!("creating {}: {e}", dir.display()));
     }
-    let dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+    let dir = signex_altium_convert::paths::canonical(dir).unwrap_or_else(|_| dir.clone());
     let (json, _md) = match doc.write(&dir) {
         Ok(p) => p,
         Err(e) => return LibrarySummary::failed(format!("{e:#}")),

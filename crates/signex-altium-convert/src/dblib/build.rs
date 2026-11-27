@@ -127,7 +127,7 @@ pub fn prepare(
                     sources: &mut Vec<SourceLib>,
                     files: &mut Vec<PathBuf>|
      -> Result<Slots, String> {
-        let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let key = crate::paths::canonical(path).unwrap_or_else(|_| path.to_path_buf());
         if !libs.contains_key(&key) {
             let res = load(&key).map(|bodies| {
                 let mut lib = Library {

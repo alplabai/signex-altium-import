@@ -110,15 +110,13 @@ fn main() {
 }
 
 fn run(cli: &Cli) -> Result<Summary> {
-    let input = cli
-        .input
-        .canonicalize()
+    let input = signex_altium_convert::paths::canonical(&cli.input)
         .with_context(|| format!("input not found: {}", cli.input.display()))?;
     let dir = match &cli.output {
         Some(o) => {
             std::fs::create_dir_all(o)
                 .with_context(|| format!("creating output directory {}", o.display()))?;
-            o.canonicalize()?
+            signex_altium_convert::paths::canonical(o)?
         }
         None => input.parent().map(Path::to_path_buf).unwrap_or_default(),
     };

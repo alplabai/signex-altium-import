@@ -14,6 +14,7 @@ pub mod dblib;
 mod keepouts;
 pub mod library;
 pub mod libset;
+pub mod paths;
 pub mod pcb;
 pub mod report;
 pub mod sch;
