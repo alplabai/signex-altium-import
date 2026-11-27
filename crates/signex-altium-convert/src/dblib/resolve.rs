@@ -9,6 +9,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::paths::under;
+
 pub struct Resolver {
     dblib_dir: PathBuf,
     folders: Vec<PathBuf>,
@@ -27,8 +29,7 @@ impl Resolver {
     pub fn new(dblib_dir: &Path, extra: &[PathBuf], own: &[String], subdirs: bool) -> Self {
         let mut folders: Vec<PathBuf> = extra.to_vec();
         for o in own {
-            let o = o.replace('\\', "/");
-            folders.push(dblib_dir.join(o));
+            folders.push(under(dblib_dir, &o.replace('\\', "/")));
         }
         folders.push(dblib_dir.to_path_buf());
         Resolver {
@@ -84,11 +85,11 @@ impl Resolver {
         if norm.is_empty() {
             return None;
         }
-        let as_given = Path::new(&norm);
-        if as_given.is_absolute() && plain_file(as_given) {
-            return Some(as_given.to_path_buf());
+        let as_given = under(Path::new(""), &norm);
+        if as_given.is_absolute() && plain_file(&as_given) {
+            return Some(as_given);
         }
-        let beside = self.dblib_dir.join(&norm);
+        let beside = under(&self.dblib_dir, &norm);
         if as_given.is_relative() && plain_file(&beside) {
             return Some(beside);
         }

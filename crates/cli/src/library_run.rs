@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use signex_altium_convert::libset::{
     LibraryOptions, PreviousPrimitive, PreviousRow, SourceBody, SourceLib, build_library,
 };
+use signex_altium_convert::paths::under;
 use signex_altium_convert::report::{Item, ItemKind, Severity};
 use signex_library::primitive::symbol::SymbolFile;
 use signex_library::{FootprintFile, LibraryFile, LifecycleState};
@@ -516,7 +517,7 @@ pub fn run(args: &LibraryArgs, progress: &Progress) -> LibrarySummary {
         if ledger_files.contains_key(rel) || !crate::ledger::expected_path(rel) {
             continue;
         }
-        let path = dir.join(rel);
+        let path = under(&dir, rel);
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
@@ -612,7 +613,7 @@ fn avoid_user_files(
 ) -> Result<(), String> {
     let owned = |rel: &str| ledger.is_some_and(|l| l.files.contains_key(rel));
     let clashes = |rel: &str, text: &str| -> bool {
-        let p = dir.join(rel);
+        let p = under(dir, rel);
         std::fs::symlink_metadata(&p).is_ok()
             && !owned(rel)
             && std::fs::read_to_string(&p).map_or(true, |old| old != text)
@@ -650,7 +651,7 @@ fn names_a_written_file(path: &Path, rel: &str, files: &[(String, String)], dir:
         use std::os::unix::fs::MetadataExt;
         if let Ok(m) = std::fs::metadata(path) {
             return files.iter().any(|(p, _)| {
-                std::fs::metadata(dir.join(p))
+                std::fs::metadata(under(dir, p))
                     .is_ok_and(|w| w.dev() == m.dev() && w.ino() == m.ino())
             });
         }
@@ -693,7 +694,7 @@ fn write_files(
 ) -> anyhow::Result<()> {
     for (i, (rel, text)) in files.iter().enumerate() {
         progress.progress(i, Some(files.len()), Some(rel));
-        let path = dir.join(rel);
+        let path = under(dir, rel);
         guard.write(&path, text.as_bytes())?;
         written.push(path);
     }

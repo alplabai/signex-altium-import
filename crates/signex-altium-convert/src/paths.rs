@@ -5,6 +5,11 @@
 //! report, where it reads as noise, and a verbatim path takes no `/`, so
 //! a join onto it would not open. [`canonical`] gives the ordinary form
 //! whenever it means the same file.
+//!
+//! Library-internal paths (`footprints/<uuid>.snxfpt`, the ledger's file
+//! keys) are `/`-separated by contract. [`under`] turns one into a file
+//! path below a folder, in the platform's own separators, so a written or
+//! shown path never mixes `\` and `/`.
 
 use std::path::{Path, PathBuf};
 
@@ -13,6 +18,18 @@ use std::path::{Path, PathBuf};
 /// the plain form names the same file.
 pub fn canonical(path: &Path) -> std::io::Result<PathBuf> {
     path.canonicalize().map(plain)
+}
+
+/// `rel`, a `/`-separated path, below `dir` in the platform's separators.
+/// An absolute `rel` (a drive path from a `.DbLib`) replaces `dir`, as
+/// [`Path::join`] does.
+pub fn under(dir: &Path, rel: &str) -> PathBuf {
+    dir.join(with_separator(rel, std::path::MAIN_SEPARATOR))
+}
+
+/// `rel` with each `/` turned into `sep`.
+fn with_separator(rel: &str, sep: char) -> String {
+    rel.replace('/', sep.encode_utf8(&mut [0; 4]))
 }
 
 /// `path` without the `\\?\` prefix, when dropping it keeps the meaning:
@@ -106,6 +123,23 @@ mod tests {
         let (root, file) = (root.to_str().unwrap(), file.to_str().unwrap());
         assert_eq!(root, r"C:\Users\me\AppData\Local\Temp\out");
         assert!(file.starts_with(&format!("{root}\\")), "{file}");
+    }
+
+    #[test]
+    fn a_library_path_takes_the_platform_separator() {
+        assert_eq!(
+            with_separator("footprints/0cb7388f-0000-4000-8000-000000000001.snxfpt", '\\'),
+            r"footprints\0cb7388f-0000-4000-8000-000000000001.snxfpt"
+        );
+        assert_eq!(with_separator("a.snxlib", '\\'), "a.snxlib");
+        assert_eq!(with_separator("symbols/x.snxsym", '/'), "symbols/x.snxsym");
+        let dir = Path::new("out");
+        let want = dir.join("symbols").join("x.snxsym");
+        assert_eq!(under(dir, "symbols/x.snxsym").to_str(), want.to_str());
+        if cfg!(windows) {
+            let p = under(Path::new(r"C:\out"), "footprints/a.snxfpt");
+            assert_eq!(p.to_str().unwrap(), r"C:\out\footprints\a.snxfpt");
+        }
     }
 
     #[test]
