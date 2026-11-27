@@ -1,6 +1,6 @@
 `library-converter-v1.json` is a verbatim copy of
 `docs/schemas/library-converter-v1.json` from the Signex repository
-(alplabai/signex), commit 9a3fdc1cb. It is the machine-checkable part of the
+(alplabai/signex), commit 9a3fdc1cb (unchanged at 1c88f4450). It is the machine-checkable part of the
 library converter contract (`docs/LIBRARY_CONVERTER_CONTRACT.md` there). Do not
 edit it here; refresh it from Signex when the contract changes.
 
